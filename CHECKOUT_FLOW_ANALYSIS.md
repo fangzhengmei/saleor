@@ -1,6 +1,6 @@
-# Saleor 客户结账全链路分析报告（可审计版）
+# Saleor 客户结账全链路分析报告（最终审计版）
 
-**文档状态**：可审计  
+**文档状态**：最终审计版  
 **分析范围**：客户结账从购物车快照到订单生成与库存扣减的完整链路  
 **重点关注**：事务边界、数据快照固化、异常回滚机制  
 **事实核对**：已对照源码逐行验证，所有口径与实现完全一致
@@ -45,7 +45,7 @@ def transaction_with_commit_on_errors():
 **行为**：
 - 内部使用 `traced_atomic_transaction()` 开启数据库事务
 - **DatabaseError**：立即向外抛出，事务自动回滚
-- **其他异常**：先捕获暂存，待事务正常提交后再向外抛出
+- **其他异常（业务异常）：先捕获暂存，待事务正常提交后再向外抛出
 - 即：业务异常（如 PaymentError、ValidationError）不会触发事务回滚，只有数据库错误才会回滚
 
 ### 2.2 @traced_atomic_transaction
@@ -64,7 +64,7 @@ def transaction_with_commit_on_errors():
 **入口点**：`CheckoutComplete` GraphQL Mutation (`checkout_complete.py:49`)
 
 **执行步骤**：
-1. **Checkout 定位与幂等性检查**
+1. **Checkout 定位与幂等性检查
    - 验证 checkout ID/token
    - 若 checkout 已不存在，通过 `Order.objects.get_by_checkout_token()` 查找已创建的订单
    - 若找到已创建订单，直接返回成功（幂等性保障）
@@ -108,12 +108,13 @@ def transaction_with_commit_on_errors():
 
 **核心函数**：`complete_checkout_with_payment()` (`complete_checkout.py:1823`)
 
-此流程采用**三事务分段**设计。需要特别注意：由于使用了 `transaction_with_commit_on_errors`，业务异常不会回滚已提交的事务。
+此流程采用**三事务分段**设计。由于使用了 `transaction_with_commit_on_errors`，业务异常不会回滚已提交的事务。
 
 #### 事务 1：锁定 Checkout、准备数据、创建临时库存预留
 
 **代码位置**：`complete_checkout.py:1842-1872`
 
+**执行顺序**：
 ```
 [transaction_with_commit_on_errors]  # L1842
     ↓
@@ -125,12 +126,32 @@ checkout.save(update_fields=["completing_started_at"])
 lines, _ = fetch_checkout_lines(checkout)
 checkout_info = fetch_checkout_info(checkout, lines, manager)
     ↓
-complete_checkout_pre_payment_part()
+complete_checkout_pre_payment_part()  # L1088
     ├─ fetch_checkout_data() 计算最新价格
     ├─ check_stock_and_preorder_quantity_bulk() 库存可用性检查
-    └─ _get_order_data() 构建订单快照数据
+    ├─ _prepare_checkout_with_payment()  # L991
+    │   ├─ clean_checkout_payment() 清理无效支付
+    │   └─ _prepare_checkout() 基础验证
+    └─ _get_order_data() 构建订单快照数据  # L1013
+    │   └─ _prepare_order_data()  # L656
+    │   │   ├─ 计算各类价格
+    │   │   ├─ _create_lines_for_order() 构建订单行快照
+    │   │   ├─ _validate_gift_cards() 验证礼品卡
+    │   │   └─ _process_voucher_data_for_order()  # L110
+    │   │   │   └─ _increase_checkout_voucher_usage()  # L138
+    │   │   │       └─ 检查 checkout.is_voucher_usage_increased
+    │   │   │       └─ increase_voucher_usage() 增加凭证使用量
+    │   │   │       └─ checkout.is_voucher_usage_increased = True
+    │   │   │       └─ checkout.save()
+    │   │   └─ manager.preprocess_order_creation()
+    │   │       └─ TaxError → _release_checkout_voucher_usage() 回滚凭证
+    │   └─ 异常捕获（InsufficientStock / NotApplicable / GiftCardNotApplicable / TaxError)
+    │       └─ 抛出 ValidationError
+    └─ 异常捕获（Checkout.DoesNotExist / ValidationError)
+        └─ _complete_checkout_fail_handler(..., payment=payment)
+        └─ 向外抛出异常
     ↓
-_reserve_stocks_without_availability_check()
+_reserve_stocks_without_availability_check()  # L1868
     ├─ 查询相关 Stock 记录
     ├─ 创建 Reservation 记录
     │   └─ reserved_until = now + RESERVE_DURATION（默认 15 分钟）
@@ -140,15 +161,23 @@ _reserve_stocks_without_availability_check()
 ```
 
 **事务1异常处理**：
-- 若抛出 DatabaseError：事务回滚，无残留
-- 若抛出其他异常（如库存检查失败）：**事务仍提交**，Reservation 持久化，异常向外抛出
-- `complete_checkout_pre_payment_part()` 内部捕获 ValidationError 时会调用 `_complete_checkout_fail_handler()`
+
+| 异常类型 | 触发点 | 事务行为 | Reservation 状态 | 凭证状态 | 补偿动作 |
+|---------|--------|---------|-------------|---------|---------|
+| DatabaseError | 任何点 | 回滚 | 未持久化 | 未增加 | 无 |
+| ValidationError（库存检查失败） | L1122 | **提交** | **已持久化 | 已增加（在 _prepare_order_data 中） | 传 payment → 退款 + 释放凭证 |
+| ValidationError（订单数据构建失败） | L1128 | **提交** | **已持久化** | 已增加（在 _prepare_order_data 中） | 传 payment → 退款 + 释放凭证 |
+| TaxError | manager.preprocess_order_creation | **提交** | **已持久化** | 已增加后又被释放（在异常处理中） | 释放凭证（不退款） |
+
+> **关键事实 1**：_reserve_stocks_without_availability_check() 在 complete_checkout_pre_payment_part() **之后**执行。如果在 pre_payment 阶段抛出异常，Reservation **不会被创建，不会被持久化。
+
+> **关键事实 2**：凭证使用量增加发生在 _prepare_order_data() → _process_voucher_data_for_order() 调用链中，在 _reserve_stocks 之前。如果凭证使用量在 pre_payment 阶段已被增加，异常时通过 _complete_checkout_fail_handler 释放。
 
 #### 事务 2：支付处理与有效性验证
 
 **代码位置**：`complete_checkout.py:1880-1918`
 
-> **事实说明**：代码注释第1874-1875行写着 "Process payments out of transaction"，但**实际实现中支付处理完全包裹在 `transaction_with_commit_on_errors()` 事务内**（第1881行）。
+> **事实说明**：代码注释第1874-1875行写着 "Process payments out of transaction"，但**实际实现中支付处理完全包裹在 transaction_with_commit_on_errors() 事务内**（第1881行）。
 
 ```
 [transaction_with_commit_on_errors]  # L1881
@@ -157,38 +186,30 @@ Checkout.objects.select_for_update().filter(pk=checkout_pk).first()
     ↓
 Payment.objects.select_for_update().get(id=payment.id)
     ↓
-txn = _process_payment(...)
+txn = _process_payment(...)  # L1048
     ├─ gateway.process_payment() 或 gateway.confirm()
     └─ 支付失败 → 抛出 PaymentError
+    └─ 内部捕获 → _complete_checkout_fail_handler(checkout_info, manager)  # 不传 payment！
+    └─ 向外抛出 ValidationError
     ↓
 payment.refresh_from_db()
     ↓
 if not payment.is_active:
-    _complete_checkout_fail_handler(...)
+    _complete_checkout_fail_handler(..., payment=payment)  # 传 payment
     raise ValidationError(...)
     ↓
 提交事务
 ```
 
-**支付处理内部逻辑** (`_process_payment`, L1048-1085)：
-```python
-try:
-    if payment.to_confirm:
-        txn = gateway.confirm(...)
-    else:
-        txn = gateway.process_payment(...)
-    payment.refresh_from_db()
-    if not txn.is_success:
-        raise PaymentError(txn.error)
-except PaymentError as e:
-    _complete_checkout_fail_handler(checkout_info, manager)  # 注意：未传 payment
-    raise ValidationError(...) from e
-```
-
 **事务2异常处理**：
-- `PaymentError` 在 `_process_payment` 内部被捕获，调用 `_complete_checkout_fail_handler(checkout_info, manager)`（**未传 payment 参数，不退款**）
-- 由于 `transaction_with_commit_on_errors` 的特性，业务异常**不回滚事务**，已创建的 Transaction 记录会持久化
-- 异常向外抛出后，由最外层 `CheckoutComplete` mutation 统一处理
+
+| 异常类型 | 触发点 | 事务行为 | 补偿动作 | 持久化数据 |
+|---------|--------|---------|---------|-----------|
+| PaymentError | _process_payment 内部 | **提交** | 不传 payment → 不退款，只释放凭证 | Reservation、Transaction |
+| ValidationError | payment.is_active 检查失败 | **提交** | 传 payment → 退款 + 释放凭证 | Reservation、Transaction |
+| DatabaseError | 任何点 | 回滚 | - | - |
+
+> **关键事实 3**：_process_payment() 内部捕获 PaymentError 时调用 `_complete_checkout_fail_handler(checkout_info, manager)` **未传 payment 参数**，因此**不会执行退款**。虽然支付未成功，失败的 Transaction 记录仍会持久化。
 
 #### 事务 3：创建订单与清理
 
@@ -201,24 +222,24 @@ Checkout.objects.select_for_update().filter(pk=checkout_pk).first()
     ↓
 lines, _ = fetch_checkout_lines(checkout, skip_recalculation=True)
     ↓
-complete_checkout_post_payment_part()
+complete_checkout_post_payment_part()  # L1138
     ├─ 检查 action_required（如 3D Secure）
-    ├─ 无需额外验证 → 调用 _create_order()
-    │   ├─ @traced_atomic_transaction()  # 嵌套事务
+    ├─ 无需额外验证 → 调用 _create_order()  # L764
+    │   ├─ @traced_atomic_transaction() 嵌套事务
     │   ├─ 幂等性检查：Order.objects.filter(checkout_token=...)
     │   ├─ Order.objects.create()
     │   ├─ OrderLine.objects.bulk_create()
     │   ├─ OrderLineDiscount.objects.bulk_create()
-    │   ├─ allocate_stocks()  # 独立事务
-    │   │   └─ 失败 → 抛出 InsufficientStock → 外层捕获
-    │   ├─ allocate_preorders()  # 独立事务
-    │   │   └─ 失败 → 抛出异常 → 外层捕获
+    │   ├─ allocate_stocks() 独立事务
+    │   │   └─ 失败 → 抛出 InsufficientStock
+    │   ├─ allocate_preorders() 独立事务
+    │   │   └─ 失败 → 抛出异常
     │   ├─ add_gift_cards_to_order()
     │   ├─ checkout.payments.update(order=order)
     │   ├─ 复制 metadata
     │   ├─ order.save()
     │   └─ transaction.on_commit() 注册事件
-    ├─ 异常捕获（InsufficientStock / GiftCardNotApplicable）
+    ├─ 异常捕获（InsufficientStock / GiftCardNotApplicable)
     │   └─ _complete_checkout_fail_handler(..., payment=payment)
     ├─ delete_checkouts([checkout.pk])
     └─ checkout.completing_started_at = None
@@ -227,11 +248,12 @@ complete_checkout_post_payment_part()
 ```
 
 **事务3异常处理**：
-- `allocate_stocks()` 或 `allocate_preorders()` 抛出异常 → 其独立事务回滚
-- 异常被 `complete_checkout_post_payment_part()` 捕获 → 调用 `_complete_checkout_fail_handler(..., payment=payment)`（**传 payment，执行退款**）
-- `_create_order()` 的嵌套事务回滚 → Order、OrderLine 不持久化
-- 由于外层是 `transaction_with_commit_on_errors`，**checkout.completing_started_at 的清空不会被回滚**
-- 异常继续向外抛出
+
+| 异常类型 | 触发点 | 事务行为 | 补偿动作 | 持久化数据 |
+|---------|--------|---------|---------|-----------|
+| InsufficientStock | allocate_stocks() | 独立事务回滚，外层**提交** | 传 payment → 退款 + 释放凭证 | Reservation、支付已完成 |
+| GiftCardNotApplicable | _create_order() | 嵌套事务回滚，外层**提交** | 传 payment → 退款 + 释放凭证 | Reservation、支付已完成 |
+| DatabaseError | 任何点 | 回滚 | - | - |
 
 ---
 
@@ -241,7 +263,7 @@ complete_checkout_post_payment_part()
 
 #### 3.5.1 地址快照固化
 
-**机制**：`Address.get_copy()` (`account/models.py:122-124`)
+**机制**：`Address.get_copy()` (`account/models.py:122-124`)：
 ```python
 def get_copy(self):
     """Return a new instance of the same address."""
@@ -406,7 +428,10 @@ complete_checkout_with_payment() [L1823]
 │   ├─ select_for_update(checkout)
 │   ├─ 设置 completing_started_at
 │   ├─ complete_checkout_pre_payment_part()
-│   └─ _reserve_stocks_without_availability_check()
+│   │   └─ _prepare_order_data()
+│   │       └─ _process_voucher_data_for_order()
+│   │           └─ _increase_checkout_voucher_usage()  # 凭证使用量增加
+│   └─ _reserve_stocks_without_availability_check()  # Reservation 创建
 │   └─ 事务提交 → Reservation 持久化，行锁释放
 │   └─ 业务异常 → 已提交的数据不回滚，异常向外抛出
 │
@@ -414,9 +439,9 @@ complete_checkout_with_payment() [L1823]
 │   ├─ select_for_update(checkout)
 │   ├─ select_for_update(payment)
 │   ├─ _process_payment() → 调用外部支付网关
-│   │   └─ PaymentError → _complete_checkout_fail_handler(manager) （不退款）
+│   │   └─ PaymentError → _complete_checkout_fail_handler(manager)  # 不退款
 │   └─ 验证支付活跃性
-│   │   └─ 不活跃 → _complete_checkout_fail_handler(..., payment=payment) （退款）
+│       └─ 不活跃 → _complete_checkout_fail_handler(..., payment=payment)  # 退款
 │   └─ 事务提交 → Transaction 持久化
 │   └─ 业务异常 → 已提交的数据不回滚，异常向外抛出
 │
@@ -449,7 +474,7 @@ complete_checkout_with_payment() [L1823]
                 └─ transaction.on_commit() 注册事件
             └─ 嵌套事务提交 或 回滚
         ├─ 捕获 InsufficientStock / GiftCardNotApplicable
-        │   └─ _complete_checkout_fail_handler(..., payment=payment) （退款）
+        │   └─ _complete_checkout_fail_handler(..., payment=payment)  # 退款
         ├─ delete_checkouts([checkout.pk])
         └─ checkout.completing_started_at = None
     └─ 事务提交 → 即使上层抛出异常，completing_started_at 的清空已持久化
@@ -459,8 +484,10 @@ complete_checkout_with_payment() [L1823]
 
 | 操作 | 事务归属 | 异常类型 | 数据状态 | 补偿动作 |
 |-----|---------|---------|---------|---------|
+| 凭证使用量增加 | 事务1 | 业务异常 | **已提交** | _complete_checkout_fail_handler() 释放 |
 | 库存预留（Reservation） | 事务1 | DatabaseError | 回滚 | - |
-| 库存预留（Reservation） | 事务1 | 业务异常 | **已提交** | _complete_checkout_fail_handler() |
+| 库存预留（Reservation） | 事务1 | 业务异常 | **已提交**（如果异常发生在 _reserve_stocks 之后） | _complete_checkout_fail_handler() |
+| 库存预留（Reservation） | 事务1 | 业务异常 | **未持久化**（如果异常发生在 _reserve_stocks 之前） | _complete_checkout_fail_handler() |
 | 支付处理 | 事务2 | DatabaseError | 回滚 | - |
 | 支付处理（_process_payment 内） | 事务2 | PaymentError | **已提交**（Transaction 持久化） | _complete_checkout_fail_handler() 不退款 |
 | 支付不活跃 | 事务2 | ValidationError | **已提交** | _complete_checkout_fail_handler() 退款 |
@@ -543,37 +570,55 @@ def _complete_checkout_fail_handler(
 
 ### 5.3 部分失败场景详细分析
 
-#### 场景 1：事务1 库存检查失败
+#### 场景 1：事务1 库存检查失败（在 _reserve_stocks 之前）
 - **触发**：`check_stock_and_preorder_quantity_bulk()` 抛出 `InsufficientStock`
-- **事务行为**：`transaction_with_commit_on_errors` 提交事务，Reservation 持久化
+- **事务行为**：`transaction_with_commit_on_errors` 提交事务
 - **补偿**：`_complete_checkout_fail_handler(..., payment=payment)` 清空标记、释放凭证、退款
-- **最终状态**：checkout 可重试，Reservation 在 15 分钟后自动失效
+- **最终状态**：checkout 可重试
+- **残留**：无（Reservation 尚未创建）
 
-#### 场景 2：事务2 支付网关失败（PaymentError）
+#### 场景 2：事务1 订单数据构建失败（在 _reserve_stocks 之前）
+- **触发**：`_prepare_order_data()` 抛出异常（如凭证无效、礼品卡无效）
+- **事务行为**：`transaction_with_commit_on_errors` 提交事务
+- **补偿**：`_complete_checkout_fail_handler(..., payment=payment)` 清空标记、释放凭证、退款
+- **最终状态**：checkout 可重试
+- **残留**：无（Reservation 尚未创建）
+
+#### 场景 3：事务1 _reserve_stocks 之后失败（极小概率）
+- **触发**：`_reserve_stocks_without_availability_check()` 抛出 DatabaseError
+- **事务行为**：DatabaseError → 事务回滚
+- **补偿**：无
+- **最终状态**：checkout 可重试
+- **残留**：无
+
+#### 场景 4：事务2 支付网关失败（PaymentError）
 - **触发**：支付网关返回失败，`_process_payment()` 抛出 `PaymentError`
 - **事务行为**：
   - 内部捕获异常，调用 `_complete_checkout_fail_handler(checkout_info, manager)`（**不传 payment**）
   - 事务提交，已创建的失败 Transaction 记录持久化
   - 异常向外抛出
 - **补偿**：清空标记、释放凭证，**不退款**（支付未成功）
-- **最终状态**：checkout 可重试，Reservation 在 15 分钟后自动失效
+- **最终状态**：checkout 可重试
+- **残留**：Reservation 已持久化（会过期）、失败 Transaction 记录
 
-#### 场景 3：事务2 支付不活跃
+#### 场景 5：事务2 支付不活跃
 - **触发**：支付处理完成后，`payment.is_active` 为 False
 - **事务行为**：事务提交，Transaction 已持久化
 - **补偿**：`_complete_checkout_fail_handler(..., payment=payment)` 清空标记、释放凭证、**退款**
-- **最终状态**：checkout 可重试，支付已退款，Reservation 在 15 分钟后自动失效
+- **最终状态**：checkout 可重试，支付已退款
+- **残留**：Reservation 已持久化（会过期）
 
-#### 场景 4：事务3 库存分配失败
+#### 场景 6：事务3 库存分配失败
 - **触发**：`allocate_stocks()` 抛出 `InsufficientStock`（极小概率，因事务1已预留）
 - **事务行为**：
   - `allocate_stocks()` 独立事务回滚
   - `_create_order()` 嵌套事务回滚，Order/OrderLine 不持久化
   - 外层 `transaction_with_commit_on_errors` 提交，checkout.completing_started_at 已清空
 - **补偿**：`_complete_checkout_fail_handler(..., payment=payment)` 释放凭证、**退款**
-- **最终状态**：订单未创建，支付已退款，Reservation 在 15 分钟后自动失效
+- **最终状态**：订单未创建，支付已退款
+- **残留**：Reservation 已持久化（会过期）
 
-#### 场景 5：订单创建成功但 webhook 通知失败
+#### 场景 7：订单创建成功但 webhook 通知失败
 - **触发**：通知服务不可用
 - **处理**：所有通知通过 `transaction.on_commit()` 注册，事务提交后才触发
 - **影响**：通知失败不影响订单状态，依赖异步重试机制
@@ -688,14 +733,17 @@ Stock.objects.filter(pk=stock_pk).update(
 
 ## 8. 审计总结
 
-### 8.1 关键事实结论
+### 8.1 关键事实结论（最终校正版）
 
 | 事项 | 结论 | 依据 |
 |-----|------|-----|
-| 支付处理事务边界 | **在事务内执行** | `complete_checkout.py:1881`，`_process_payment()` 在 `transaction_with_commit_on_errors()` 内 |
+| 支付处理事务边界 | **在事务内执行 | `complete_checkout.py:1881`，`_process_payment()` 在 `transaction_with_commit_on_errors()` 内 |
 | 业务异常事务行为 | **先提交再抛出** | `transaction_with_commit_on_errors()` 定义，业务异常不回滚 |
 | 支付失败是否退款 | **视调用点而定** | `_process_payment` 内调用时不传 payment 不退款；事务2/3中调用时传 payment 退款 |
 | 库存分配事务边界 | **独立事务** | `allocate_stocks()` 和 `allocate_preorders()` 各有 `@traced_atomic_transaction()` |
+| 凭证释放触发条件 | **fail_handler 中根据 voucher 参数触发** | `_complete_checkout_fail_handler()` 中判断 voucher 是否存在 |
+| 事务1早期失败 Reservation 状态 | **未持久化**（如果异常在 _reserve_stocks 之前抛出） | `complete_checkout.py:1868`，_reserve_stocks 在 pre_payment 之后执行 |
+| 事务1后期失败 Reservation 状态 | **已持久化**（如果异常在 _reserve_stocks 之后抛出） | `complete_checkout.py:1868` |
 | Reservation 清理 | **依赖过期机制** | 失败处理器不删除 Reservation，`reserved_until` 字段控制过期 |
 | checkout_token 约束 | **普通 BTree 索引，无唯一约束** | `saleor/order/models.py:403`，仅 `BTreeIndex(fields=["checkout_token"])` |
 
@@ -708,6 +756,8 @@ Stock.objects.filter(pk=stock_pk).update(
 3. **部分失败数据一致性**：事务分段设计意味着存在部分成功的中间状态。虽然有补偿机制，但补偿操作（如退款）本身可能失败。
 
 4. **幂等性依赖应用层**：checkout_token 无数据库唯一约束，极端并发场景下理论上存在重复创建订单的可能（尽管概率极低）。
+
+5. **凭证使用量增加与 Reservation 创建顺序**：凭证使用量在 `_prepare_order_data()` 中增加，Reservation 在其后创建。如果凭证增加成功但 Reservation 创建失败（DatabaseError），凭证使用量会被回滚。
 
 ### 8.3 设计评价
 
@@ -728,5 +778,7 @@ Saleor 结账流程采用**三事务分段 + 悲观锁 + 临时库存预留 + �
 | 失败处理器 | `saleor/checkout/complete_checkout.py:1996-2033` |
 | 支付处理 | `saleor/checkout/complete_checkout.py:1048-1085` |
 | 订单创建后异常捕获 | `saleor/checkout/complete_checkout.py:1188-1206` |
+| 凭证使用量增加 | `saleor/checkout/complete_checkout.py:137-152` |
+| 凭证使用量释放 | `saleor/checkout/complete_checkout.py:156-177` |
 | 地址复制 | `saleor/account/models.py:122-124` |
 | Order 模型索引定义 | `saleor/order/models.py:373-414` |

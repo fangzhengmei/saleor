@@ -102,9 +102,16 @@ if order_info.channel.automatically_fulfill_non_shippable_gift_card:
 
 ### 2.3 与产品库存的关系
 
-礼品卡本身**不依赖物理库存**，但可以关联到产品（`GiftCard.product` 外键）。这意味着：
+礼品卡商品**完全在库存体系内**，与普通商品一样受库存管控：
+
+1. **库存分配 (Allocate)**: 结账完成时调用 `allocate_stocks()` 为礼品卡商品分配库存
+2. **库存扣减 (Decrease)**: 履约时调用 `decrease_stock()` 实际扣减库存
+3. **库存检查失败**: 如果库存不足，会在履约创建阶段抛出 `InsufficientStock` 异常
+
+礼品卡通过 `GiftCard.product` 外键关联到产品，这意味着：
 - 可以通过购买"礼品卡商品"来获得礼品卡
 - 购买后系统自动生成礼品卡实例并发放给客户
+- 礼品卡商品的库存限制了可销售的礼品卡数量
 
 ---
 
@@ -553,7 +560,7 @@ def _create_fulfillment_lines(...):
         if order_line.is_gift_card:
             gift_card_lines_info.append(
                 GiftCardLineData(
-                    quantity=fulfillment_line.quantity,  # 订单行数量 = 礼品卡张数
+                    quantity=fulfillment_line.quantity,  # 本次履约数量 → 本次签发张数
                     order_line=order_line,
                     variant=variant,
                     fulfillment_line=fulfillment_line,
@@ -581,11 +588,11 @@ def gift_cards_create(order, gift_card_lines_info, settings, requestor_user, app
                 current_balance=price,
                 created_by=customer_user,
                 created_by_email=user_email,
-                product=line_data.variant.product,
+                product=line_data.variant.product if line_data.variant else None,
                 fulfillment_line=line_data.fulfillment_line,
                 expiry_date=expiry_date,
             )
-            for _ in range(line_data.quantity)  # 订单行数量 → 礼品卡张数
+            for _ in range(line_data.quantity)  # 本次履约数量 → 本次签发张数
         ]
         gift_cards.extend(line_gift_cards)
     
@@ -610,7 +617,162 @@ def gift_cards_create(order, gift_card_lines_info, settings, requestor_user, app
 > **重要**: 礼品卡的签发发生在**库存扣减之后**。这意味着：
 > 1. 如果库存不足，会在 `_create_fulfillment_lines` 阶段抛出 `InsufficientStock` 异常
 > 2. 只有库存扣减成功后，才会生成礼品卡
-> 3. 订单行的 `quantity` 字段直接决定了生成多少张礼品卡
+> 3. **履约行的 `quantity` 字段**决定了本次生成多少张礼品卡（支持分批履约分批签发）
+
+### 库存不足的失败场景
+
+礼品卡商品的库存检查发生在两个关键节点：
+
+**节点 1：结账完成时的库存分配**
+
+**文件**: `saleor/warehouse/management.py:91-190`
+
+```python
+def allocate_stocks(...):
+    # 对所有需要追踪库存的订单行（包括礼品卡商品）执行库存分配
+    order_lines_info = get_order_lines_with_track_inventory(order_lines_info)
+    
+    # 加行锁查询可用库存
+    stocks = list(
+        stock_select_for_update_for_existing_qs(stocks)
+        .filter(**filter_lookup)
+        .values("id", "product_variant", "pk", "quantity", "warehouse_id")
+    )
+    
+    # 计算已分配数量
+    quantity_allocation_for_stocks = ...
+    
+    # 创建分配记录
+    insufficient_stock, allocation_items = _create_allocations(
+        line_info, stock_allocations, ...
+    )
+    
+    if insufficient_stock:
+        raise InsufficientStock(insufficient_stock)  # 库存不足，结账失败
+```
+
+**节点 2：履约创建时的库存扣减**
+
+**文件**: `saleor/warehouse/management.py:586-641`
+
+```python
+def decrease_stock(...):
+    # 先释放分配
+    decrease_allocations(order_lines_info, site_settings, requestor)
+    
+    # 加行锁查询库存
+    stocks = (
+        stock_qs_select_for_update()
+        .filter(product_variant__in=variants)
+        .filter(warehouse_id__in=warehouse_pks)
+        .select_related("product_variant", "warehouse")
+    )
+    
+    # 检查并扣减库存
+    _decrease_stocks_quantity(
+        order_lines_info, variant_and_warehouse_to_stock, ...
+    )
+```
+
+**文件**: `saleor/order/actions.py:888-920`
+
+```python
+if stock is None:
+    warehouse_pk = None
+    if not allow_stock_to_be_exceeded:
+        error_data = InsufficientStockData(
+            variant=variant,
+            order_line=order_line,
+            warehouse_pk=warehouse_pk,
+            available_quantity=0,
+        )
+        insufficient_stocks.append(error_data)
+
+if insufficient_stocks:
+    raise InsufficientStock(insufficient_stocks)  # 库存不足，履约失败
+```
+
+### 分批履约、分批签发
+
+礼品卡签发是按**履约行数量**而非订单行数量执行的，支持分批履约：
+
+**示例场景**：订单行购买了 5 张礼品卡，分两次履约
+
+| 履约批次 | 履约行数量 | 操作 | 结果 |
+|---------|-----------|------|------|
+| 第一次履约 | 3 | `gift_cards_create(quantity=3)` | 生成 3 张礼品卡，扣减 3 件库存 |
+| 第二次履约 | 2 | `gift_cards_create(quantity=2)` | 生成 2 张礼品卡，扣减 2 件库存 |
+| **累计** | **5** | | **共生成 5 张礼品卡** |
+
+**关键代码证据**：
+
+**文件**: `saleor/order/actions.py:882-917`
+
+```python
+# 履约时遍历本次履约的所有履约行
+for fulfillment_line in fulfillment_lines:
+    order_line = fulfillment_line.order_line
+    variant = fulfillment_line.order_line.variant
+    stock = fulfillment_line.stock
+    
+    # ... 库存检查 ...
+    
+    if order_line.is_gift_card:
+        gift_card_lines_info.append(
+            GiftCardLineData(
+                quantity=fulfillment_line.quantity,  # 本次履约的数量
+                order_line=order_line,
+                variant=variant,
+                fulfillment_line=fulfillment_line,
+            )
+        )
+```
+
+**文件**: `saleor/giftcard/utils.py:177-192`
+
+```python
+for line_data in gift_card_lines_info:
+    order_line = line_data.order_line
+    price = order_line.unit_price_gross
+    line_gift_cards = [
+        GiftCard(
+            code=generate_promo_code(),
+            initial_balance=price,
+            current_balance=price,
+            fulfillment_line=line_data.fulfillment_line,  # 关联到具体履约行
+            ...
+        )
+        for _ in range(line_data.quantity)  # 按本次履约数量生成
+    ]
+```
+
+**测试用例验证**：`saleor/giftcard/tests/test_utils.py:372-400`
+
+```python
+def test_gift_cards_create_multiple_quantity(...):
+    # given
+    quantity = 3
+    gift_card_non_shippable_order_line.quantity = quantity
+    fulfillment_line = fulfillment.lines.create(
+        order_line=gift_card_non_shippable_order_line, 
+        quantity=quantity,  # 履约行数量 = 3
+        stock=stock
+    )
+    lines_data = [
+        GiftCardLineData(
+            quantity=quantity,  # 传入履约行数量
+            order_line=gift_card_non_shippable_order_line,
+            variant=gift_card_non_shippable_order_line.variant,
+            fulfillment_line=fulfillment_line,
+        )
+    ]
+    
+    # when
+    gift_cards = gift_cards_create(order, lines_data, ...)
+    
+    # then
+    assert len(gift_cards) == quantity  # 生成 3 张礼品卡
+```
 
 ---
 
@@ -801,3 +963,236 @@ Saleor 没有显式的"冻结余额"字段，所谓的"冻结"是通过以下方
 这种设计避免了维护单独的"冻结余额"字段带来的一致性问题，但也意味着：
 - 如果 checkout 长期不完成，礼品卡余额不会被真正扣除
 - 如果用户在多个浏览器标签页尝试使用同一张礼品卡，后一个会自动取消前一个的授权
+
+---
+
+## 补充细节三：Checkout 授权转 Order 交易的占用关系变化
+
+### 交易关联迁移
+
+当 checkout 完成并生成订单时，所有关联的支付交易（包括礼品卡支付）会从 checkout 迁移到 order：
+
+**文件**: `saleor/checkout/complete_checkout.py:1534`
+
+```python
+# 将 checkout 的支付交易迁移到 order
+checkout_info.checkout.payment_transactions.update(order=order, checkout_id=None)
+```
+
+**迁移前**：
+- `TransactionItem.checkout_id = checkout.token`
+- `TransactionItem.order_id = None`
+
+**迁移后**：
+- `TransactionItem.checkout_id = None`
+- `TransactionItem.order_id = order.id`
+
+### 占用关系的变化
+
+| 阶段 | 关联关系 | 占用状态 |
+|------|---------|---------|
+| **授权阶段** | `TransactionItem.checkout_id = X`, `gift_card = Y` | 礼品卡 Y 被 checkout X 占用 |
+| **订单创建后** | `TransactionItem.order_id = Z`, `checkout_id = None` | 礼品卡 Y 被订单 Z 占用 |
+
+### Detach 逻辑的生效边界
+
+`detach_gift_card_from_previous_checkout_transactions()` 函数只会分离**尚未关联到订单**的交易：
+
+**文件**: `saleor/giftcard/gateway.py:190-200`
+
+```python
+transactions_to_cancel_qs = TransactionItem.objects.filter(
+    Q(app_identifier=GIFT_CARD_PAYMENT_GATEWAY_ID),
+    Q(gift_card=gift_card),
+    Q(checkout_id__isnull=False),  # 仍关联到 checkout
+    Q(order_id__isnull=True),      # 尚未关联到订单
+)
+```
+
+**这意味着**：
+
+1. **交易已关联到订单后**：`order_id__isnull=True` 条件不满足，detach 逻辑**不会分离已关联订单的交易，但余额校验仍然生效
+2. **订单确认扣款前**：礼品卡仍与交易绑定，新的授权请求无法通过 detach 分离，但会在 `validate_and_get_gift_card()` 中进行余额校验
+3. **订单确认扣款后**：礼品卡余额已扣除，占用关系结束
+
+### Detach 过滤条件 vs 余额校验的分工
+
+| 机制 | 约束内容 | 代码位置 | 作用域 |
+|------|---------|---------|-------|
+| **Detach 过滤条件** | `checkout_id__isnull=False` AND `order_id__isnull=True` | `gateway.py:196-199` | 仅分离 checkout 阶段的授权，不影响已生成订单的交易 |
+| **余额校验** | `action.amount <= gift_card.current_balance_amount` | `gateway.py:145-149` | 所有授权请求都要检查，无论交易是否关联订单 |
+
+**核心差异**：
+- **Detach 是**抢占式分离**：把礼品卡从旧 checkout 抢过来给新 checkout 使用，但只对 checkout 阶段的交易有效
+- **余额校验是**最终防线**：即使 detach 没分离成功（比如已关联订单），余额校验仍会拦截超扣请求
+
+### 完整的占用生命周期
+
+```
+[礼品卡授权]
+    ↓
+TransactionItem.gift_card = gift_card
+TransactionItem.checkout_id = checkout.token
+TransactionItem.order_id = None
+    ↓
+[礼品卡被此 checkout 独占，其他 checkout 授权会触发 detach]
+    ↓
+[Checkout 完成 → 生成订单]
+    ↓
+TransactionItem.order_id = order.id
+TransactionItem.checkout_id = None  ← 关键变化
+    ↓
+[礼品卡被此订单独占，新的 checkout 授权不会触发 detach]
+    ↓
+[订单确认 → 扣款]
+    ↓
+charge_gift_card_transactions()
+    ↓
+GiftCard.current_balance_amount -= authorized_value
+    ↓
+[占用结束，礼品卡余额已实际扣除]
+```
+
+### 关键边界条件
+
+**场景 1：同一礼品卡在两个 checkout 中授权**
+- Checkout A 授权 → 礼品卡绑定 Transaction A
+- Checkout B 授权 → 触发 detach，取消 Transaction A，礼品卡绑定 Transaction B
+- Checkout A 完成 → Transaction A 已被取消，无法扣款
+
+**场景 2：礼品卡授权后生成订单，但尚未扣款**
+- Checkout A 授权 → 礼品卡绑定 Transaction A
+- Checkout A 完成 → Transaction A.order_id = Order Z.id
+- Checkout B 授权 → 不会触发 detach（因为 Transaction A.order_id 不为空），但**余额校验仍会检查礼品卡剩余余额
+- Checkout B 授权成功 → 如果礼品卡余额仍足够，Transaction B 也能授权成功（两张订单共享同一张礼品卡余额）
+- Order Z 先扣款 → 礼品卡余额减少
+- Checkout B 完成 → 尝试扣款时发现礼品卡余额不足（被 Order Z 先扣走了）
+
+> **重要**：detach 不分离已关联订单的交易，意味着**同一张礼品卡可以被多个订单授权，最终由扣款时的余额校验决定谁能成功
+
+**场景 3：订单取消但礼品卡未扣款**
+- 需要手动调用 CANCEL 操作释放礼品卡占用
+- 或通过订单取消流程自动处理（需检查具体实现）
+
+---
+
+## 补充细节四：礼品卡履约路径的库存失败分支对照
+
+礼品卡商品的库存检查有两个独立的失败分支，分别抛出不同的异常：
+
+### 两种库存异常的触发位置和场景
+
+| 异常类型 | 触发阶段 | 代码位置 | 触发条件 |
+|---------|---------|---------|---------|
+| **GiftCardNotApplicable** | 自动履约前的库存检查 | `saleor/giftcard/utils.py:140-144` | 订单行无分配记录且渠道下无可用库存 |
+| **InsufficientStock** | 履约创建时的库存扣减 | `saleor/order/actions.py:888-920` | 有库存记录但数量不足 |
+
+### GiftCardNotApplicable 异常分析
+
+**触发时机**：自动履约流程开始时，在 `fulfill_gift_card_lines()` 中检查库存配置
+
+**文件**: `saleor/giftcard/utils.py:139-144`
+
+```python
+for line in gift_card_lines.prefetch_related("allocations__stock", "variant__stocks"):
+    if allocations := line.allocations.all():
+        # 有分配记录，正常处理
+        for allocation in allocations:
+            ...
+    else:
+        # 无分配记录，检查渠道下是否有库存
+        stock = line.variant.stocks.for_channel(channel_slug).first()
+        if not stock:
+            raise GiftCardNotApplicable(
+                message="Lack of gift card stock for checkout channel.",
+            )
+```
+
+**触发场景**：
+1. 订单行在结账时跳过了库存分配（例如库存追踪被禁用）
+2. 分配记录被意外删除
+3. 商品在该销售渠道下根本没有配置库存
+
+**测试用例验证**：`saleor/giftcard/tests/test_utils.py:705-725`
+
+```python
+def test_fulfill_gift_card_lines_lack_of_stock(...):
+    # given
+    # 删除该礼品卡商品的所有库存
+    gift_card_non_shippable_order_line.variant.stocks.all().delete()
+    
+    lines = OrderLine.objects.filter(...)
+    
+    # when & then
+    with pytest.raises(GiftCardNotApplicable):
+        fulfill_gift_card_lines(lines, staff_user, None, order, site_settings, manager)
+```
+
+### InsufficientStock 异常分析
+
+**触发时机**：履约创建过程中，在 `_create_fulfillment_lines()` 中执行实际扣减前
+
+**文件**: `saleor/order/actions.py:888-920`
+
+```python
+stock = fulfillment_line.stock
+
+if stock is None:
+    warehouse_pk = None
+    if not allow_stock_to_be_exceeded:
+        error_data = InsufficientStockData(
+            variant=variant,
+            order_line=order_line,
+            warehouse_pk=warehouse_pk,
+            available_quantity=0,
+        )
+        insufficient_stocks.append(error_data)
+else:
+    warehouse_pk = stock.warehouse_id
+
+if insufficient_stocks:
+    raise InsufficientStock(insufficient_stocks)
+```
+
+**触发场景**：
+1. 结账时分配了库存，但在履约前库存被其他订单占用
+2. 库存数量在分配和履约之间发生了变化
+3. 手动履约时指定了无货的仓库
+
+### 异常发生时序对照
+
+```
+[结账完成]
+    ↓
+allocate_stocks() → 库存分配
+    ↓
+[订单创建]
+    ↓
+[订单支付确认 → 触发自动履约]
+    ↓
+fulfill_gift_card_lines()
+    ├─ 检查 allocations
+    └─ 无 allocations 时检查渠道库存
+        └─ 无库存 → GiftCardNotApplicable ← 分支 1
+    ↓
+create_fulfillments()
+    ↓
+_create_fulfillment_lines()
+    ├─ 检查 stock 是否存在
+    └─ stock 不存在或不足 → InsufficientStock ← 分支 2
+    ↓
+decrease_stock() → 实际扣减
+    ↓
+order_fulfilled()
+    ↓
+gift_cards_create() → 签发礼品卡
+```
+
+### 异常处理策略
+
+| 异常 | 处理方式 | 业务含义 |
+|------|---------|---------|
+| **GiftCardNotApplicable** | 阻止履约，需人工介入 | 商品配置问题，该渠道根本无法销售此礼品卡 |
+| **InsufficientStock** | 阻止履约，等待补货或超售 | 临时缺货，补货后可继续履约 |
+
+> **关键区别**：GiftCardNotApplicable 是**配置级错误**（渠道无库存），InsufficientStock 是**库存数量错误**（有库存但不够）。前者需要检查商品配置，后者需要检查库存数量。

@@ -354,22 +354,175 @@ def handle_transaction_request_task(self, delivery_id, request_event_id):
 - **重试机制**：**无任何重试**，一次发送失败即返回 None
 - **时效性**：直接影响当前请求响应时间
 - **持久化**：
-  - Subscription 模式：根据 `with_save` 参数决定是否保存（默认 `True`）
-  - Legacy 模式：EventDelivery 仅为内存对象，不持久化到数据库
-  - 失败时调用 `save_unsuccessful_delivery_attempt()` 保存失败记录
+  - Subscription 模式：`with_save=False`，创建时不保存，失败时通过 `save_unsuccessful_delivery_attempt()` 补写
+  - Legacy 模式：EventDelivery 仅为内存对象，失败时通过 `save_unsuccessful_delivery_attempt()` 补写
+  - 成功时：调用 `clear_successful_delivery()`，如未保存则不做任何操作
 
-### 7.2 两类同步事件的核心差异对比
+### 7.2 普通同步事件的持久化机制详解
+
+普通同步事件的持久化策略与异步和交易类事件显著不同，其核心设计是**"默认不落库，失败才补写"**。
+
+#### 7.2.1 Subscription 模式持久化流程
+
+**创建阶段** [synchronous/transport.py:423-432]：
+```python
+if webhook.subscription_query:
+    delivery_promise = create_promise_delivery_for_subscription_sync_event(
+        ...
+        with_save=False,  # 关键：创建时不保存
+    )
+```
+
+`create_promise_delivery_for_subscription_sync_event()` 中 [synchronous/transport.py:374-388]：
+```python
+def create_delivery(data):
+    if not data:
+        return None  # payload 为空，短路，不创建任何对象
+    event_payload = EventPayload(payload=json.dumps({**data}))
+    event_delivery = EventDelivery(
+        status=EventDeliveryStatus.PENDING,
+        event_type=event_type,
+        payload=event_payload,
+        webhook=webhook,
+    )
+    if with_save:  # with_save=False，所以这里不执行 save
+        event_payload.save_as_file()
+        event_delivery.save()
+    return event_delivery
+```
+
+**发送后处理** [synchronous/transport.py:187-191]：
+```python
+attempt_update(attempt, response)
+delivery_update(delivery, response.status)  # 仅更新内存对象状态
+observability.report_event_delivery_attempt(attempt)
+save_unsuccessful_delivery_attempt(attempt)  # 关键：失败时补写
+clear_successful_delivery(delivery)  # 成功时尝试清理
+```
+
+#### 7.2.2 Legacy 模式持久化流程
+
+**创建阶段** [synchronous/transport.py:433-441]：
+```python
+else:
+    delivery_promise = Promise.resolve(
+        EventDelivery(
+            status=EventDeliveryStatus.PENDING,
+            event_type=event_type,
+            payload=EventPayload(payload=static_payload),
+            webhook=webhook,
+        )
+    )
+```
+- EventDelivery 和 EventPayload 均为内存对象，未调用 `save()`
+- 无任何数据库操作
+
+**发送后处理**：与 Subscription 模式相同，通过 `save_unsuccessful_delivery_attempt()` 失败补写。
+
+#### 7.2.3 `save_unsuccessful_delivery_attempt()` 补写机制
+
+**核心实现** [utils.py:706-717]：
+```python
+def save_unsuccessful_delivery_attempt(attempt: "EventDeliveryAttempt"):
+    delivery = attempt.delivery
+    if not delivery or delivery.status == EventDeliveryStatus.SUCCESS:
+        return  # 成功时不做任何操作
+    
+    event_payload = delivery.payload
+    if event_payload:
+        event_payload.save_as_file()  # 补写 EventPayload：清空 payload 字段，写入文件
+    
+    delivery.save()  # 补写 EventDelivery
+    if not attempt.id:
+        attempt.save()  # 补写 EventDeliveryAttempt
+```
+
+**补写行为分析**：
+| 对象 | 补写前状态 | 补写操作 |
+|------|-----------|---------|
+| **EventPayload** | 内存对象，`payload` 字段包含完整 JSON | 1. `payload` 字段置空字符串<br>2. 调用 `save()` 插入数据库<br>3. 将原始 payload 写入文件存储 |
+| **EventDelivery** | 内存对象，`status` 已更新为 FAILED | 调用 `save()` 插入数据库 |
+| **EventDeliveryAttempt** | 内存对象，包含响应详情 | 如无 ID 则调用 `save()` 插入数据库 |
+
+**关键设计意图**：
+- **成功时零数据库操作**：普通同步事件调用频率高（如税费计算、配送方式过滤），成功时不落库避免数据库压力
+- **失败时完整留痕**：失败时补写所有对象，便于问题排查和对账
+- **payload 文件存储**：失败时将 payload 从数据库字段迁移到文件存储，避免大 JSON 占用数据库空间
+
+#### 7.2.4 成功时的清理行为
+
+`clear_successful_delivery()` [utils.py:607-608]：
+```python
+def clear_successful_delivery(delivery: "EventDelivery"):
+    clear_successful_deliveries([delivery])
+```
+
+`clear_successful_deliveries()` [utils.py:612-643]：
+```python
+def clear_successful_deliveries(deliveries):
+    for delivery in deliveries:
+        if not delivery.id or delivery.status != EventDeliveryStatus.SUCCESS:
+            continue  # 普通同步事件成功时 delivery 无 id，直接跳过
+        # ... 有 id 的才会执行删除操作
+```
+
+**结果**：普通同步事件成功时，由于 delivery 没有 `id`（未保存），`clear_successful_delivery()` 直接返回，不执行任何数据库操作。
+
+### 7.3 Payload 为空时的短路行为与持久化的关系
+
+#### 7.3.1 异步 Subscription 模式
+```python
+for (subscribable_object, webhook), data in zip(...):
+    if not data:
+        continue  # 短路，不创建任何对象
+```
+- **结果**：无 EventDelivery、无 EventPayload、无数据库操作
+- **对账影响**：完全无记录，无法追溯
+
+#### 7.3.2 交易类同步事件 - Subscription 模式
+```python
+delivery = create_delivery_for_subscription_sync_event(...)
+if not delivery:
+    create_failed_transaction_event(...)  # 创建失败交易事件作为对账记录
+```
+- **结果**：无 EventDelivery、无 EventPayload，但会创建失败交易事件
+- **对账影响**：通过失败交易事件可以追溯
+
+#### 7.3.3 普通同步事件 - Subscription 模式
+```python
+def create_delivery(data):
+    if not data:
+        return None  # 短路，返回 None
+    # ... 创建内存对象
+
+delivery_promise.then(trigger_sync_for_delivery)
+```
+- **结果**：返回 `None`，`trigger_sync_for_delivery` 接收到 `None` 直接返回 `None`
+- **后续流程**：
+  - 不调用 `_send_webhook_request_sync()`
+  - 不调用 `save_unsuccessful_delivery_attempt()`
+  - 无任何数据库操作
+- **对账影响**：完全无记录，无法追溯
+
+#### 7.3.4 普通同步事件 - Legacy 模式
+- 不存在 payload 为空的情况，因为使用预生成的 `static_payload`
+
+### 7.4 两类同步事件的核心差异对比（修正版）
 
 | 维度 | 交易类同步事件 | 普通同步事件 |
 |------|--------------|------------|
 | **执行方式** | Celery 任务异步执行 | 当前线程同步执行 |
 | **重试机制** | 5 次指数退避（仅 5xx） | 无重试 |
 | **是否阻塞请求** | 否 | 是 |
-| **Delivery 持久化** | 总是持久化 | Subscription 可选，Legacy 不持久化 |
+| **创建时持久化** | 总是持久化 | 从不持久化（内存对象） |
+| **失败时补写** | 不需要（已持久化） | 通过 `save_unsuccessful_delivery_attempt()` 补写 |
+| **成功时处理** | `clear_successful_delivery()` 删除 | 无操作（无 id 跳过） |
+| **payload 存储** | 数据库字段 | 失败时迁移到文件存储 |
 | **调用方处理** | 触发后立即返回，无需等待 | 等待响应结果，直接用于业务逻辑 |
-| **失败处理** | 重试耗尽后创建失败交易事件 | 返回 None，调用方自行处理 |
+| **payload 为空短路** | 创建失败交易事件 | 完全无记录 |
+| **对账完整性** | 完整（成功/失败均有记录） | 仅失败有记录，成功和 payload 为空无记录 |
 
-### 7.3 同步链路跳过的订阅载荷渲染步骤
+### 7.5 同步链路跳过的订阅载荷渲染步骤
 
 同步 webhook 虽然也支持 `subscription_query`，但其执行链路与异步有显著差异：
 
@@ -401,91 +554,6 @@ def trigger_webhook_sync_promise(*, event_type, webhook, ...):
 6. **跳过 Celery 任务队列**：普通同步事件在当前线程直接执行，不经过任务队列
 7. **跳过自动清理**：失败的 delivery 会调用 `save_unsuccessful_delivery_attempt()` 保留记录用于排查
 
-### 7.4 Payload 生成失败/为空的处理策略
-
-**异步 subscription webhook** [asynchronous/transport.py:156-179]：
-```python
-for (subscribable_object, webhook), data in zip(...):
-    if not data:
-        logger.info("No payload was generated with subscription for event: %s", event_type)
-        continue  # 静默跳过，不创建 EventDelivery
-```
-- **行为**：payload 为空时直接 `continue`，不创建 EventDelivery 和 EventPayload
-- **重试**：无重试，因为根本没有创建 delivery
-- **日志**：仅记录 info 级别日志，不视为错误
-
-**同步 subscription webhook** [synchronous/transport.py:263-326]：
-```python
-def create_delivery_for_subscription_sync_event(...):
-    data = generate_payload_from_subscription(...)
-    if not data:
-        logger.info("No payload was generated with subscription for event: %s", event_type)
-        return None  # 返回 None，短路后续流程
-```
-- **行为**：payload 为空时返回 `None`，不创建 EventDelivery
-- **短路时机**：
-  - 在 `trigger_webhook_sync_promise` 中，`delivery` 为 `None` 时直接返回 `None` [synchronous/transport.py:413-415]
-  - 交易类事件：调用方收到 `None` 后创建失败交易事件 `create_failed_transaction_event()`
-  - 普通同步事件：调用方收到 `None` 后按业务逻辑处理（如税费计算失败返回错误）
-- **重试**：无论交易类还是普通同步事件，payload 生成都不重试
-
-**同步 legacy webhook**：
-- **行为**：使用预先生成的 `static_payload`，不会出现 payload 为空的情况
-- **短路时机**：仅在 HTTP 请求失败时短路
-
-### 7.5 缓存哨兵（SYNC_WEBHOOK_FAILURE_SENTINEL）的作用范围
-
-**定义** [const.py]：
-```python
-SYNC_WEBHOOK_FAILURE_SENTINEL = object()  # 标记失败的缓存值
-SYNC_WEBHOOK_FAILURE_CACHE_TTL = 30  # 失败缓存 30 秒
-```
-
-**仅作用于 `trigger_webhook_sync_promise_if_not_cached()`** [synchronous/transport.py:202-260]：
-
-```python
-def trigger_webhook_sync_promise_if_not_cached(...):
-    cache_key = generate_cache_key_for_webhook(...)
-    response_data = cache.get(cache_key)
-    
-    # 关键：如果缓存中是失败哨兵，直接跳过
-    if response_data == const.SYNC_WEBHOOK_FAILURE_SENTINEL:
-        logger.warning("Skipping request to %s for event %s due to previous failure.", ...)
-        return Promise.resolve(None)
-    
-    if response_data is not None:
-        return Promise.resolve(response_data)  # 命中成功缓存
-    
-    # 未命中缓存，实际发送请求
-    return trigger_webhook_sync_promise(...).then(process_response_data)
-
-def process_response_data(response_data):
-    if response_data is not None:
-        cache.set(cache_key, response_data, timeout=cache_timeout)  # 成功缓存
-    else:
-        cache.set(cache_key, const.SYNC_WEBHOOK_FAILURE_SENTINEL, 
-                  timeout=const.SYNC_WEBHOOK_FAILURE_CACHE_TTL)  # 失败缓存
-    return response_data
-```
-
-**实际使用场景**：
-1. **配送方式过滤** [shipping/webhooks/shared.py:106]：
-   - `CHECKOUT_FILTER_SHIPPING_METHODS`
-   - `ORDER_FILTER_SHIPPING_METHODS`
-   - 缓存 3 分钟（`CACHE_EXCLUDED_SHIPPING_TIME = 60 * 3`）
-
-2. **列出已保存支付方式** [plugins/webhook/plugin.py:2800]：
-   - `LIST_STORED_PAYMENT_METHODS`
-   - 缓存默认 TTL（`WEBHOOK_CACHE_DEFAULT_TTL`）
-
-**不使用缓存哨兵的场景**：
-- 所有异步事件
-- 交易类同步事件（`TRANSACTION_*_REQUESTED`）
-- 税费计算（`CHECKOUT_CALCULATE_TAXES`, `ORDER_CALCULATE_TAXES`）
-- 支付会话初始化/处理（`TRANSACTION_INITIALIZE_SESSION`, `TRANSACTION_PROCESS_SESSION`）
-- 旧支付 API（`PAYMENT_AUTHORIZE`, `PAYMENT_CAPTURE` 等）
-- 支付令牌化相关事件
-
 ### 7.6 完整分流流程（修正版）
 
 ```
@@ -514,7 +582,7 @@ def process_response_data(response_data):
     │    │         │    ├─ 是 → 同步 Subscription 模式
     │    │         │    │    ├─ 调用 generate_payload_from_subscription()
     │    │         │    │    ├─ 如 payload 为空 → return None → 短路
-    │    │         │    │    └─ 创建 EventDelivery（可选保存）
+    │    │         │    │    └─ 创建 EventDelivery（内存对象，不保存）
     │    │         │    └─ 否 → 同步 Legacy 模式
     │    │         │         ├─ 使用预生成 static_payload
     │    │         │         └─ 创建 EventDelivery（内存对象，不持久化）

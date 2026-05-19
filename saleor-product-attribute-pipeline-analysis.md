@@ -285,9 +285,141 @@ ProductQuerySet
 
 ---
 
-## 6. 关键数据流时序
+## 6. 属性定义变更的兼容处理
 
-### 6.1 产品创建时的属性链路
+### 6.1 输入类型切换的兼容策略
+
+**核心发现**: Saleor 的 `AttributeUpdate` 突变 (`saleor/graphql/attribute/mutations/attribute_update.py`) **不允许直接修改 `input_type` 字段**。在 `AttributeUpdateInput` 中只暴露了以下可编辑字段：
+- `name` / `slug` / `unit`
+- `value_required` / `is_variant_only`
+- `visible_in_storefront` / `filterable_in_storefront` / `filterable_in_dashboard`
+- `storefront_search_position` / `available_in_grid`
+- `add_values` / `remove_values`
+- `reference_types`
+
+**设计取舍分析**:
+1. **禁止输入类型切换的原因**:
+   - 不同输入类型使用 `AttributeValue` 的不同字段存储数据（`numeric`/`plain_text`/`rich_text`/`boolean`/`date_time`/`reference_*`）
+   - 直接切换会导致历史数据无法被正确读取和过滤
+   - 避免破坏已有的产品/变体属性赋值
+
+2. **历史数据迁移模式**（以 NUMERIC 类型引入为例）:
+   - **Step 1**: 添加新字段 `numeric` (`saleor/attribute/migrations/0051_attributevalue_numeric.py`)
+   - **Step 2**: 添加数据库索引 (`saleor/attribute/migrations/0052_attributevalue_attribute_value_numeric_idx.py`)
+   - **Step 3**: 异步数据迁移任务 (`saleor/attribute/migrations/tasks/saleor3_22.py`):
+     ```python
+     # 将 name 字段的字符串转换为 numeric 字段的浮点数
+     AttributeValue.objects.filter(...).update(
+         numeric=Cast(F("name"), FloatField())
+     )
+     ```
+   - **Step 4**: 触发 `post_migrate` 信号启动异步任务 (`saleor/attribute/migrations/0053_fulfill_numeric_attribute_value.py`)
+
+3. **迁移任务的安全保证**:
+   - 使用 `BATCH_SIZE = 500` 分批处理，避免长事务
+   - 每个批次使用 `select_for_update()` 锁定行
+   - 任务自驱动链式调用（`delay()`）直到处理完成
+   - 使用专用队列 `settings.DATA_MIGRATIONS_TASKS_QUEUE_NAME`
+
+### 6.2 变体可选属性（variant_selection）调整
+
+**模型定义**: `AttributeVariant.variant_selection` 字段 (`saleor/attribute/models/product_variant.py:69`) 标记该属性是否可用于变体选择。
+
+**允许的输入类型** (`AttributeInputType.ALLOWED_IN_VARIANT_SELECTION`):
+- `DROPDOWN`, `BOOLEAN`, `SWATCH`, `NUMERIC`
+
+**调整流程** (`ProductAttributeAssignmentUpdate.perform_mutation()`):
+
+1. **验证阶段** (`clean_operations`):
+   - 检查属性是否已分配给该产品类型的变体
+   - 检查输入类型是否在 `ALLOWED_IN_VARIANT_SELECTION` 列表中
+   - 检查产品类型是否启用了变体（`has_variants`）
+   - 检查是否有重复操作
+
+2. **执行阶段** (`update_field_values`):
+   - 批量更新 `AttributeVariant.variant_selection` 字段
+   - 分别处理设置为 `true` 和 `false` 的属性 ID 列表
+
+**对变体名称的影响**:
+- `generate_and_set_variant_name()` (`saleor/product/utils/variants.py:16`) 仅使用 `variant_selection=True` 的属性生成变体名称
+- 当属性从 `variant_selection=true` 改为 `false` 时，已生成的变体名称**不会自动更新**
+- 只有当变体名称为空（`name=""`）且属性值发生变化时，才会触发重新生成
+- 相关任务: `update_variants_names()` (`saleor/product/tasks.py:78`) 处理属性值名称变更后的变体名称更新
+
+### 6.3 属性解绑（Unassign）的遗留值处理
+
+**解绑入口**: `ProductAttributeUnassign.perform_mutation()` (`saleor/graphql/product/mutations/attributes.py:328`)
+
+**解绑流程**:
+```python
+# 仅解除 AttributeProduct/AttributeVariant 的关联
+product_type.product_attributes.remove(*attribute_pks)
+product_type.variant_attributes.remove(*attribute_pks)
+
+# 标记所有相关产品需要重建索引
+product_ids = Product.objects.filter(product_type=product_type).values_list("id", flat=True)
+mark_products_search_vector_as_dirty_in_batches(product_ids)
+```
+
+**关键设计取舍 — 遗留值保留策略**:
+
+1. **不级联删除 AssignedProductAttributeValue**
+   - 解绑仅删除 `AttributeProduct` 关联表记录
+   - `AssignedProductAttributeValue` 记录仍然存在于数据库中
+   - 原因：避免意外数据丢失，允许重新绑定后恢复
+
+2. **查询时的过滤机制**:
+   - 产品属性查询通过 `ProductType` → `AttributeProduct` → `Attribute` 路径获取可用属性
+   - 已解绑属性的 `AssignedProductAttributeValue` 不会出现在查询结果中
+   - 但数据库中存在"僵尸"记录，需要定期清理
+
+3. **索引重建策略**:
+   - 解绑后标记该产品类型下**所有产品**为 `search_index_dirty`
+   - 重建索引时，`generate_attributes_search_vector_value()` 只处理 `product_type.attributeproduct` 中仍存在的属性
+   - 已解绑属性的值会被自然排除在新的搜索向量之外
+
+4. **页面属性的一致性**:
+   - `PageAttributeUnassign` (`saleor/graphql/page/mutations/page_attribute_unassign.py`) 采用相同策略
+   - 仅解除关联，保留 `AssignedPageAttributeValue` 记录
+
+### 6.4 属性配置变更对过滤行为的影响
+
+**配置字段**: `filterable_in_storefront` / `filterable_in_dashboard` / `available_in_grid`
+
+**验证逻辑** (`AttributeMixin._clean_attribute_settings()`):
+```python
+for field in ATTRIBUTE_PROPERTIES_CONFIGURATION.keys():
+    allowed_input_type = ATTRIBUTE_PROPERTIES_CONFIGURATION[field]
+    if attribute_input_type not in allowed_input_type and cleaned_input.get(field):
+        raise ValidationError(...)
+```
+
+**对过滤行为的影响**:
+1. **这些配置字段仅作为元数据标记**，不强制限制实际的过滤操作
+2. 过滤逻辑 (`filter_products_by_attributes()`) 不检查 `filterable_in_storefront` 标志
+3. 前端/客户端负责根据这些标记决定是否在 UI 中显示过滤选项
+4. **设计取舍**: 后端保持宽松，将过滤权限控制交给应用层
+
+### 6.5 索引重建的触发粒度对比
+
+| 变更场景 | 触发范围 | 触发位置 |
+|----------|----------|----------|
+| 属性值删除 | 仅使用该值的产品 | `get_product_ids_to_search_index_update_for_attribute_values()` |
+| 属性值更新（名称等） | 仅使用该值的产品 | `AttributeValueUpdate._mark_products_search_index_dirty()` |
+| 从产品类型解绑属性 | 该类型下**所有**产品 | `ProductAttributeUnassign.perform_mutation()` |
+| 属性删除 | 关联产品类型下**所有**产品 | `AttributeDelete.get_product_ids_to_search_index_update()` |
+| 产品/变体 CRUD | 单个产品 | 各 mutation 中直接设置 |
+
+**设计取舍分析**:
+- **属性值级变更**: 精确查找受影响产品，最小化重建范围
+- **属性/绑定级变更**: 采用"全量标记"策略，因为精确追踪成本过高
+- 权衡：可能标记了不需要重建的产品，但保证了正确性
+
+---
+
+## 7. 关键数据流时序
+
+### 7.1 产品创建时的属性链路
 
 ```
 GraphQL productCreate 突变
@@ -311,7 +443,7 @@ Celery 定时任务 update_products_search_vector_task
     └── 构建 search_vector 并清除 dirty 标记
 ```
 
-### 6.2 属性删除时的索引更新链路
+### 7.2 属性删除时的索引更新链路
 
 ```
 GraphQL attributeDelete 突变
@@ -329,9 +461,23 @@ mark_products_search_vector_as_dirty_in_batches()
 Celery 定时任务处理 dirty 产品，重建索引
 ```
 
+### 7.3 属性解绑时的数据流
+
+```
+GraphQL productAttributeUnassign 突变
+    ↓
+解除 AttributeProduct/AttributeVariant 关联
+    ↓
+收集该 ProductType 下所有 Product ID
+    ↓
+mark_products_search_vector_as_dirty_in_batches()
+    ↓
+索引重建时自然排除已解绑的属性
+```
+
 ---
 
-## 7. 核心代码位置速查表
+## 8. 核心代码位置速查表
 
 | 功能 | 文件位置 |
 |------|----------|
@@ -348,3 +494,10 @@ Celery 定时任务处理 dirty 产品，重建索引
 | 属性值删除突变 | `saleor/graphql/attribute/mutations/attribute_value_delete.py` |
 | 索引更新辅助函数 | `saleor/graphql/attribute/mutations/utils.py` |
 | 批量标记 dirty | `saleor/product/utils/search_helpers.py` |
+| **属性更新突变** | `saleor/graphql/attribute/mutations/attribute_update.py` |
+| **属性值更新突变** | `saleor/graphql/attribute/mutations/attribute_value_update.py` |
+| **属性绑定/解绑** | `saleor/graphql/product/mutations/attributes.py` |
+| **属性验证 Mixin** | `saleor/graphql/attribute/mutations/mixins.py` |
+| **变体名称生成** | `saleor/product/utils/variants.py` |
+| **共享过滤逻辑** | `saleor/graphql/attribute/shared_filters.py` |
+| **NUMERIC 字段迁移任务** | `saleor/attribute/migrations/tasks/saleor3_22.py` |

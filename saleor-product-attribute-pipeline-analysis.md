@@ -417,9 +417,189 @@ for field in ATTRIBUTE_PROPERTIES_CONFIGURATION.keys():
 
 ---
 
-## 7. 关键数据流时序
+## 7. 三条核心路径的逐段对账
 
-### 7.1 产品创建时的属性链路
+### 7.1 路径对比总览
+
+| 路径 | 数据来源 | 是否检查 AttributeProduct 关联 | 对已解绑属性的行为 |
+|------|----------|------------------------------|------------------|
+| **GraphQL 属性查询** | `productType → AttributeProduct → Attribute` | ✅ 检查 | ❌ 不返回已解绑属性 |
+| **属性值过滤查询** | 直接查 `AssignedProductAttributeValue` | ❌ 不检查 | ✅ 仍会命中遗留绑定值 |
+| **搜索向量重建** | `productType → AttributeProduct → Attribute` | ✅ 检查 | ❌ 排除已解绑属性的值 |
+| **属性解绑 mutation** | 只删 `AttributeProduct` 记录 | —— | 保留 `Assigned*` 记录 |
+
+### 7.2 路径一：GraphQL 属性查询（resolve_product_attributes）
+
+**代码位置**: `saleor/graphql/product/resolvers.py:281` → `saleor/graphql/attribute/dataloaders/assigned_attributes.py:39`
+
+**执行流程**:
+```
+Product.attributes 查询
+    ↓
+AttributesByProductIdAndLimitLoader.batch_load()
+    ├── ProductByIdLoader 获取产品
+    ├── 从 Product 取 product_type_id
+    ├── AttributeProduct.objects.filter(product_type__in=...)
+    │   └── ⚠️  只返回仍在 AttributeProduct 关联中的属性
+    ├── 构建 product_type_id → attribute_ids 映射
+    └── AttributesByAttributeId 批量加载属性详情
+```
+
+**关键代码** (`assigned_attributes.py:59-63`):
+```python
+attribute_products = (
+    self.get_attribute_product_qs(product_type_ids)
+    .using(self.database_connection_name)
+    .values_list("attribute_id", "product_type_id")
+)
+```
+
+**行为**: 已解绑属性不会出现在查询结果中。
+
+### 7.3 路径二：属性值过滤查询（filter_products_by_attributes）
+
+**代码位置**: `saleor/graphql/product/filters/product_attributes.py:851` → `saleor/graphql/product/filters/product_attributes.py:200`
+
+**执行流程**（新版过滤）:
+```
+products(filter: {attributes: [...]}) 查询
+    ↓
+_filter_products_by_attributes()
+    ├── 验证属性 slug 是否存在
+    ├── 根据 value 类型选择过滤函数
+    └── filter_by_slug_or_name() / filter_by_numeric_attribute() / ...
+        └── _get_assigned_product_attribute_for_attribute_value()
+            └── AssignedProductAttributeValue.objects.filter(
+                    Exists(attribute_values.filter(id=OuterRef("value_id"))),
+                    product_id=OuterRef("id")
+                )
+                └── ⚠️  直接查 AssignedProductAttributeValue，不检查 AttributeProduct
+```
+
+**关键代码** (`product_attributes.py:325-336`):
+```python
+def _get_assigned_product_attribute_for_attribute_value(
+    attribute_values: QuerySet[AttributeValue],
+    db_connection_name: str,
+):
+    return Q(
+        Exists(
+            AssignedProductAttributeValue.objects.using(db_connection_name).filter(
+                Exists(attribute_values.filter(id=OuterRef("value_id"))),
+                product_id=OuterRef("id"),
+            )
+        )
+    )
+```
+
+**⚠️ 关键发现**: 过滤查询**不检查** `AttributeProduct` 关联。只要 `AssignedProductAttributeValue` 记录存在，即使属性已从产品类型解绑，也会被过滤命中！
+
+### 7.4 路径三：搜索向量重建（generate_attributes_search_vector_value）
+
+**代码位置**: `saleor/product/search.py:121`
+
+**执行流程**:
+```
+update_products_search_vector_task 定时任务
+    ↓
+update_products_search_vector()
+    ↓
+_prep_product_search_vector_index()
+    ↓
+prepare_product_search_vector_value()
+    ↓
+generate_attributes_search_vector_value()
+    ├── product_attributes = product.product_type.attributeproduct.all()
+    │   └── ⚠️  只取仍在 AttributeProduct 关联中的属性
+    ├── attributes = [pa.attribute for pa in product_attributes][:MAX]
+    ├── assigned_values = product.attributevalues.all()
+    ├── 构建 attribute_id → values 映射
+    └── 只对 attributes 列表中的属性生成搜索向量
+```
+
+**关键代码** (`search.py:130-134`):
+```python
+product_attributes = product.product_type.attributeproduct.all()
+attributes = [
+    product_attribute.attribute for product_attribute in product_attributes
+][: settings.PRODUCT_MAX_INDEXED_ATTRIBUTES]
+```
+
+**行为**: 已解绑属性的值会被自然排除在新的搜索向量之外。
+
+### 7.5 路径四：属性解绑 mutation（ProductAttributeUnassign）
+
+**代码位置**: `saleor/graphql/product/mutations/attributes.py:328`
+
+**执行流程**:
+```
+productAttributeUnassign 突变
+    ↓
+ProductAttributeUnassign.perform_mutation()
+    ├── 解析 attribute_ids 为 PK
+    ├── product_type.product_attributes.remove(*attribute_pks)
+    │   └── ⚠️  只删除 AttributeProduct 关联表记录
+    ├── product_type.variant_attributes.remove(*attribute_pks)
+    │   └── ⚠️  只删除 AttributeVariant 关联表记录
+    ├── 收集该 ProductType 下所有 Product ID
+    └── mark_products_search_vector_as_dirty_in_batches(product_ids)
+```
+
+**关键代码** (`attributes.py:345-346`):
+```python
+cls.save_field_values(product_type, "product_attributes", attribute_pks)
+cls.save_field_values(product_type, "variant_attributes", attribute_pks)
+```
+
+**⚠️ 关键发现**: 解绑**不删除** `AssignedProductAttributeValue` 或 `AssignedVariantAttributeValue` 记录。这些"僵尸"记录仍然存在于数据库中。
+
+### 7.6 不一致性场景矩阵
+
+| 时间点 | 操作 | GraphQL 属性查询 | 属性值过滤查询 | 全文搜索（旧索引） | 全文搜索（新索引） |
+|--------|------|----------------|--------------|-----------------|-----------------|
+| T0 | 属性正常绑定 | ✅ 返回属性 | ✅ 命中 | ✅ 命中 | ✅ 命中 |
+| T1 | 执行解绑 mutation | ❌ 不返回 | ✅ **仍命中** | ✅ 命中 | —— |
+| T2 | 索引重建完成 | ❌ 不返回 | ✅ **仍命中** | —— | ❌ 不命中 |
+
+**风险说明**:
+- **T1 到 T2 之间**: 属性过滤查询与全文搜索结果不一致
+- **T2 之后**: 属性过滤查询仍能命中，但全文搜索不命中
+- **永久不一致**: 只要不清空 `Assigned*` 表中的遗留记录，过滤查询始终能命中
+
+### 7.7 遗留值的生命周期
+
+**遗留值产生路径**:
+```
+属性绑定到产品类型
+    ↓
+产品/变体赋值该属性 → AssignedProductAttributeValue 记录创建
+    ↓
+执行 productAttributeUnassign → 删除 AttributeProduct 记录
+    ↓
+⚠️  AssignedProductAttributeValue 记录保留
+```
+
+**遗留值清理方式**:
+1. **重新绑定属性并更新产品**: 赋值时会先删除旧的绑定记录
+2. **删除产品/变体**: 级联删除 `Assigned*` 记录
+3. **删除属性本身**: 级联删除所有 `AttributeValue` 和 `Assigned*` 记录
+4. **手动清理**: 需要自定义数据迁移或管理命令
+
+**设计取舍分析**:
+- **保留遗留值的理由**:
+  - 避免意外数据丢失
+  - 重新绑定属性后可以恢复之前的赋值
+  - 解绑操作性能更高（只需删除关联表）
+- **保留遗留值的代价**:
+  - 数据库存在"僵尸"记录
+  - 属性过滤查询与其他路径行为不一致
+  - 需要额外的清理机制
+
+---
+
+## 8. 关键数据流时序
+
+### 8.1 产品创建时的属性链路
 
 ```
 GraphQL productCreate 突变
@@ -443,7 +623,7 @@ Celery 定时任务 update_products_search_vector_task
     └── 构建 search_vector 并清除 dirty 标记
 ```
 
-### 7.2 属性删除时的索引更新链路
+### 8.2 属性删除时的索引更新链路
 
 ```
 GraphQL attributeDelete 突变
@@ -461,7 +641,7 @@ mark_products_search_vector_as_dirty_in_batches()
 Celery 定时任务处理 dirty 产品，重建索引
 ```
 
-### 7.3 属性解绑时的数据流
+### 8.3 属性解绑时的数据流
 
 ```
 GraphQL productAttributeUnassign 突变
@@ -477,7 +657,7 @@ mark_products_search_vector_as_dirty_in_batches()
 
 ---
 
-## 8. 核心代码位置速查表
+## 9. 核心代码位置速查表
 
 | 功能 | 文件位置 |
 |------|----------|
@@ -501,3 +681,6 @@ mark_products_search_vector_as_dirty_in_batches()
 | **变体名称生成** | `saleor/product/utils/variants.py` |
 | **共享过滤逻辑** | `saleor/graphql/attribute/shared_filters.py` |
 | **NUMERIC 字段迁移任务** | `saleor/attribute/migrations/tasks/saleor3_22.py` |
+| **产品属性 resolver** | `saleor/graphql/product/resolvers.py` |
+| **属性 Dataloader** | `saleor/graphql/attribute/dataloaders/assigned_attributes.py` |
+| **过滤查询核心函数** | `saleor/graphql/product/filters/product_attributes.py:325` |

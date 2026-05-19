@@ -1169,3 +1169,216 @@ fetch_shipping_methods_for_checkout()
 12. **已选方式保护**：`_refresh_checkout_deliveries` 始终保留已选配送方式，即使它不再可用
 13. **价格失效标记**：通过 `price_expiration` 标记价格过期，而非立即重算，实现懒加载重算
 14. **折扣联动**：运费变化时自动重新计算折扣（如运费优惠）
+
+---
+
+## 十、严格对照实现的纠错分析
+
+本章节通过逐行对照源码，纠正常见的理解偏差，明确真实执行顺序和数据流向。
+
+### 10.1 本地与外部候选的获取时序：真实执行顺序
+
+#### 10.1.1 重新获取路径（`fetch_shipping_methods_for_checkout`）
+
+**源码位置**：`saleor/checkout/delivery_context.py:587-709`
+
+```python
+# 行 607-612: 第一步 - 同步获取本地内置方式（阻塞执行）
+built_in_shipping_methods_dict: dict[int, ShippingMethodData] = {
+    int(shipping_method.id): shipping_method
+    for shipping_method in get_available_built_in_shipping_methods_for_checkout_info(
+        checkout_info=checkout_info
+    )
+}
+
+# 行 705-709: 第二步 - 异步获取外部方式（非阻塞，返回 Promise）
+return fetch_external_shipping_methods_for_checkout_info(
+    checkout_info=checkout_info,
+    available_built_in_methods=list(built_in_shipping_methods_dict.values()),
+    requestor=requestor,
+).then(with_external_methods)  # 外部方式返回后执行 with_external_methods
+```
+
+**真实时序（严格按源码）**：
+
+```
+调用 fetch_shipping_methods_for_checkout()
+    ↓
+[同步阻塞] 行 607-612: 调用 get_available_built_in_shipping_methods_for_checkout_info()
+    ↓
+    ↓ 内部调用 get_valid_internal_shipping_methods_for_checkout_info()
+    ↓ 基于订单金额、配送区域、商品类型等过滤本地方式
+    ↓ 返回 list[ShippingMethodData]
+    ↓
+[异步非阻塞] 行 705: 调用 fetch_external_shipping_methods_for_checkout_info()
+    ↓
+    ↓ 内部调用 list_shipping_methods_for_checkout()
+    ↓ 查询 SHIPPING_LIST_METHODS_FOR_CHECKOUT 事件的 webhook
+    ↓   ├─ 无 webhook → 立即返回空列表
+    ↓   └─ 有 webhook → 同步调用外部承运商（HTTP 请求，阻塞）
+    ↓ 返回 Promise[list[ShippingMethodData]]
+    ↓
+[Promise 回调] 外部方式返回后执行 with_external_methods()
+    ↓
+    ↓ 行 614-621: 合并 built_in + external
+    ↓ 行 698-703: 调用 CHECKOUT_FILTER_SHIPPING_METHODS 过滤
+    ↓ 行 633-696: 转换为 CheckoutDelivery 并存储
+    ↓
+最终返回 Promise[list[CheckoutDelivery]]
+```
+
+**关键纠正**：
+- ❌ 错误说法："本地和外部并行获取"
+- ✅ 正确理解：**先同步获取本地，再异步获取外部，外部返回后才合并**
+- 本地获取是完全同步阻塞的，外部获取是 Promise 异步但内部 HTTP 调用是同步阻塞的
+
+#### 10.1.2 缓存命中路径（`get_or_fetch_checkout_deliveries`）
+
+**源码位置**：`saleor/checkout/delivery_context.py:732-757`
+
+```python
+def get_or_fetch_checkout_deliveries(...):
+    checkout = checkout_info.checkout
+    # 行 743-747: 判断是否需要重新获取
+    if (
+        checkout.delivery_methods_stale_at is None
+        or checkout.delivery_methods_stale_at <= timezone.now()
+    ) and allow_sync_webhooks:
+        return fetch_shipping_methods_for_checkout(...)
+    # 行 748-757: 缓存命中，直接查询数据库
+    return Promise.resolve(
+        list(
+            CheckoutDelivery.objects.using(
+                checkout_info.database_connection_name
+            ).filter(
+                checkout_id=checkout.pk,
+                is_valid=True,  # 只返回有效的
+            )
+        )
+    )
+```
+
+**关键纠正**：
+- ❌ 错误说法："缓存命中时重新计算本地配送方式"
+- ✅ 正确理解：**缓存命中时，直接返回 CheckoutDelivery 表中 is_valid=True 的记录**
+- 不会调用 `get_available_built_in_shipping_methods_for_checkout_info`
+- 不会调用外部承运商 webhook
+- 返回的是之前 `fetch_shipping_methods_for_checkout` 成功执行后持久化的快照
+
+### 10.2 价格影响判断：源码对照
+
+**源码位置**：`saleor/checkout/delivery_context.py:562-584`
+
+```python
+def _refreshed_assigned_delivery_has_impact_on_prices(
+    assigned_delivery: CheckoutDelivery,
+    refreshed_delivery: CheckoutDelivery | None,
+) -> bool:
+    # 行 573-574: 刷新后方式消失 → 一定影响价格
+    if not refreshed_delivery:
+        return True
+
+    # 行 577-578: 税类变化 → 影响价格
+    if refreshed_delivery.tax_class_id != assigned_delivery.tax_class_id:
+        return True
+
+    # 行 581-582: 价格变化 → 影响价格
+    if refreshed_delivery.price != assigned_delivery.price:
+        return True
+
+    # 行 584: 其他变化不影响价格
+    return False
+```
+
+**影响价格的判断条件（严格按源码）**：
+
+| 条件 | 触发 `invalidate_checkout` | 源码依据 |
+|------|--------------------------|---------|
+| 刷新后已选方式消失（`refreshed_delivery is None`） | ✅ 是 | 行 573-574 |
+| 税类 ID 变化（`tax_class_id` 不同） | ✅ 是 | 行 577-578 |
+| 价格变化（`price` 不同） | ✅ 是 | 行 581-582 |
+| 名称变化（`name` 不同） | ❌ 否 | 未在函数中判断 |
+| 配送天数变化 | ❌ 否 | 未在函数中判断 |
+| 描述变化 | ❌ 否 | 未在函数中判断 |
+
+**关键纠正**：
+- ❌ 错误说法："配送方式任何变化都会触发总价重算"
+- ✅ 正确理解：**只有价格、税类变化，或方式消失时才触发总价重算**
+- 名称、配送天数等变化不会触发 `invalidate_checkout`
+
+### 10.3 总价关系公式：源码对照
+
+**源码位置**：`saleor/checkout/calculations.py:826-840`（以不含税场景为例）
+
+```python
+# 行 827-829: 计算运费（基础价格，含运费优惠抵扣）
+shipping_price = base_calculations.base_checkout_delivery_price(
+    checkout_info, lines
+)
+
+# 行 830-832: 设置 checkout.shipping_price
+checkout.shipping_price = quantize_price(
+    TaxedMoney(shipping_price, shipping_price), currency
+)
+
+# 行 836: 设置 subtotal（商品小计，已含商品级优惠）
+checkout.subtotal = TaxedMoney(net=subtotal, gross=subtotal)
+
+# 行 839-840: 计算总价 = 商品小计 + 运费
+total = subtotal + shipping_price
+checkout.total = quantize_price(TaxedMoney(net=total, gross=total), currency)
+```
+
+**`base_checkout_delivery_price` 内部逻辑**：`saleor/checkout/base_calculations.py:89-112`
+
+```python
+def base_checkout_delivery_price(...):
+    # 行 97: 获取未折扣的运费
+    shipping_price = base_checkout_undiscounted_delivery_price(checkout_info, lines)
+    
+    # 行 99-107: 如果是运费类优惠券，抵扣运费
+    is_shipping_voucher = ...
+    if is_shipping_voucher:
+        discount = checkout_info.checkout.discount
+        shipping_price = max(zero_money(currency), shipping_price - discount)
+    
+    return shipping_price
+```
+
+**真实总价公式（严格按源码）**：
+
+```
+基础运费 = CheckoutDelivery.price_amount （来自 assign 时赋值）
+
+运费优惠抵扣（如果是运费类优惠券）:
+  shipping_price = max(0, 基础运费 - checkout.discount)
+
+商品小计 subtotal = sum(商品行总价) （已含商品级优惠）
+
+总价 total = subtotal + shipping_price
+```
+
+**关键纠正**：
+- ❌ 错误说法："总价 = 商品原价 + 运费 - 所有优惠"
+- ✅ 正确理解：**商品小计已含商品级优惠，运费单独计算并可能抵扣运费类优惠，总价 = 商品小计 + 抵扣后运费**
+- 运费类优惠券只抵扣运费，不影响商品小计
+- checkout.discount 在运费类优惠券场景下才用于抵扣运费
+
+### 10.4 易错点对照表
+
+| 编号 | 错误说法 | 正确理解 | 源码依据 |
+|------|---------|---------|---------|
+| 1 | 本地和外部配送方式并行获取 | 先同步获取本地，再异步获取外部，外部返回后才合并 | `delivery_context.py:607-612, 705-709` |
+| 2 | 缓存命中时重新计算本地配送方式 | 缓存命中时直接返回 CheckoutDelivery 表中 `is_valid=True` 的记录 | `delivery_context.py:748-757` |
+| 3 | 缓存命中时本地和外部方式都会重新校验可用性 | 缓存命中时不做任何校验，直接返回数据库快照 | `delivery_context.py:748-757` |
+| 4 | 配送方式任何变化都会触发总价重算 | 只有价格、税类变化，或方式消失时才触发 | `delivery_context.py:562-584` |
+| 5 | 配送天数变化会触发总价重算 | 配送天数变化不影响价格，不会触发重算 | `delivery_context.py:562-584` |
+| 6 | `allow_sync_webhooks=False` 时只跳过外部 webhook | `allow_sync_webhooks=False` 时完全跳过 `fetch_shipping_methods_for_checkout`，包括本地方式的重新获取 | `delivery_context.py:743-747` |
+| 7 | 总价 = 商品原价 + 运费 - 所有优惠 | 总价 = 商品小计（已含商品级优惠） + 抵扣后运费（已含运费类优惠） | `calculations.py:826-840`, `base_calculations.py:89-112` |
+| 8 | 所有优惠券都可以抵扣运费 | 只有类型为 `VoucherType.SHIPPING` 的优惠券才能抵扣运费 | `base_calculations.py:99-107` |
+| 9 | `overwrite_assigned_delivery=False` 时会保留原方式的价格 | 原方式被标记为 `is_valid=False`，新方式作为独立记录插入，用户需重新选择 | `delivery_context.py:432-463` |
+| 10 | 刷新配送方式时会删除已选但不可用的方式 | `_refresh_checkout_deliveries` 始终保留已选方式，即使它不再可用 | `delivery_context.py:480-490` |
+| 11 | `active=False` 的方式会被删除 | `active=False` 只表示被过滤 webhook 排除，不会被删除，仍存在于 CheckoutDelivery 表 | `delivery_context.py:634` |
+| 12 | 外部承运商返回的 ID 直接存储 | 外部 ID 会被 base64 编码为 `app:<app_identifier>:<method_id>` 格式后存储 | `shipping_helpers.py:7-11` |
+| 13 | 缓存时间从用户最后选择配送方式开始计算 | 缓存时间从 `fetch_shipping_methods_for_checkout` 成功执行后开始计算，不管用户是否选择 | `delivery_context.py:659-662` |
+| 14 | `invalidate_checkout` 会立即重新计算价格 | `invalidate_checkout` 只设置 `price_expiration = now()`，价格在下次查询时才懒加载重算 | `utils.py:106-121` |

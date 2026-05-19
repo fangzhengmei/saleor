@@ -417,30 +417,36 @@ for field in ATTRIBUTE_PROPERTIES_CONFIGURATION.keys():
 
 ---
 
-## 7. 三条核心路径的逐段对账
+## 7. 解绑后过滤与索引一致性：逐段对账
 
-### 7.1 路径对比总览
+### 7.1 一致口径总览
 
-| 路径 | 数据来源 | 是否检查 AttributeProduct 关联 | 对已解绑属性的行为 |
-|------|----------|------------------------------|------------------|
+经过逐条代码核对，以下为四条核心路径的一致行为结论：
+
+| 路径 | 数据来源 | 是否检查 `AttributeProduct` 关联 | 对已解绑属性的行为 |
+|------|----------|--------------------------------|------------------|
 | **GraphQL 属性查询** | `productType → AttributeProduct → Attribute` | ✅ 检查 | ❌ 不返回已解绑属性 |
-| **属性值过滤查询** | 直接查 `AssignedProductAttributeValue` | ❌ 不检查 | ✅ 仍会命中遗留绑定值 |
+| **属性值过滤查询** | 直接查 `AssignedProductAttributeValue` | ❌ **不检查** | ✅ **仍会命中遗留绑定值** |
 | **搜索向量重建** | `productType → AttributeProduct → Attribute` | ✅ 检查 | ❌ 排除已解绑属性的值 |
 | **属性解绑 mutation** | 只删 `AttributeProduct` 记录 | —— | 保留 `Assigned*` 记录 |
 
-### 7.2 路径一：GraphQL 属性查询（resolve_product_attributes）
+**核心矛盾点**: 属性过滤查询与其他三条路径采用不同的数据源，导致行为不一致。
+
+---
+
+### 7.2 路径一：GraphQL 属性查询
 
 **代码位置**: `saleor/graphql/product/resolvers.py:281` → `saleor/graphql/attribute/dataloaders/assigned_attributes.py:39`
 
 **执行流程**:
 ```
-Product.attributes 查询
+Product { attributes { ... } } 查询
     ↓
 AttributesByProductIdAndLimitLoader.batch_load()
-    ├── ProductByIdLoader 获取产品
-    ├── 从 Product 取 product_type_id
-    ├── AttributeProduct.objects.filter(product_type__in=...)
-    │   └── ⚠️  只返回仍在 AttributeProduct 关联中的属性
+    ├── ProductByIdLoader 批量获取产品
+    ├── 提取 product_type_id 列表
+    ├── AttributeProduct.objects.filter(product_type__in=product_type_ids)
+    │   └── ✅  只返回仍在 AttributeProduct 关联中的属性
     ├── 构建 product_type_id → attribute_ids 映射
     └── AttributesByAttributeId 批量加载属性详情
 ```
@@ -454,18 +460,20 @@ attribute_products = (
 )
 ```
 
-**行为**: 已解绑属性不会出现在查询结果中。
+**一致结论**: 已解绑属性不会出现在 GraphQL 查询结果中。
 
-### 7.3 路径二：属性值过滤查询（filter_products_by_attributes）
+---
 
-**代码位置**: `saleor/graphql/product/filters/product_attributes.py:851` → `saleor/graphql/product/filters/product_attributes.py:200`
+### 7.3 路径二：属性值过滤查询（核心不一致路径）
 
-**执行流程**（新版过滤）:
+**代码位置**: `saleor/graphql/product/filters/product_attributes.py:851` → `saleor/graphql/product/filters/product_attributes.py:325`
+
+**执行流程**（新版过滤语法）:
 ```
-products(filter: {attributes: [...]}) 查询
+products(filter: {attributes: [{slug: "color", value: {slug: "red"}}]})
     ↓
 _filter_products_by_attributes()
-    ├── 验证属性 slug 是否存在
+    ├── 验证属性 slug 是否存在（只查 Attribute 表，不查关联）
     ├── 根据 value 类型选择过滤函数
     └── filter_by_slug_or_name() / filter_by_numeric_attribute() / ...
         └── _get_assigned_product_attribute_for_attribute_value()
@@ -473,7 +481,7 @@ _filter_products_by_attributes()
                     Exists(attribute_values.filter(id=OuterRef("value_id"))),
                     product_id=OuterRef("id")
                 )
-                └── ⚠️  直接查 AssignedProductAttributeValue，不检查 AttributeProduct
+                └── ❌  直接查 AssignedProductAttributeValue，不检查 AttributeProduct
 ```
 
 **关键代码** (`product_attributes.py:325-336`):
@@ -492,9 +500,16 @@ def _get_assigned_product_attribute_for_attribute_value(
     )
 ```
 
-**⚠️ 关键发现**: 过滤查询**不检查** `AttributeProduct` 关联。只要 `AssignedProductAttributeValue` 记录存在，即使属性已从产品类型解绑，也会被过滤命中！
+**一致结论**: 过滤查询不检查 `AttributeProduct` 关联。只要 `AssignedProductAttributeValue` 记录存在，即使属性已从产品类型解绑，也会被过滤命中！
 
-### 7.4 路径三：搜索向量重建（generate_attributes_search_vector_value）
+**验证链**:
+1. 所有 7 种过滤函数（slug_or_name、numeric、boolean、date、date_time、reference_page、reference_product）最终都调用 `_get_assigned_product_attribute_for_attribute_value()`
+2. 该函数只查询 `AssignedProductAttributeValue` 表，没有任何 `AttributeProduct` 关联检查
+3. 属性 slug 验证阶段也只检查 `Attribute` 表，不检查关联
+
+---
+
+### 7.4 路径三：搜索向量重建
 
 **代码位置**: `saleor/product/search.py:121`
 
@@ -503,18 +518,17 @@ def _get_assigned_product_attribute_for_attribute_value(
 update_products_search_vector_task 定时任务
     ↓
 update_products_search_vector()
-    ↓
+    └── 批量处理 search_index_dirty=True 的产品
+        ↓
 _prep_product_search_vector_index()
-    ↓
-prepare_product_search_vector_value()
-    ↓
-generate_attributes_search_vector_value()
-    ├── product_attributes = product.product_type.attributeproduct.all()
-    │   └── ⚠️  只取仍在 AttributeProduct 关联中的属性
-    ├── attributes = [pa.attribute for pa in product_attributes][:MAX]
-    ├── assigned_values = product.attributevalues.all()
-    ├── 构建 attribute_id → values 映射
-    └── 只对 attributes 列表中的属性生成搜索向量
+    └── prepare_product_search_vector_value()
+        └── generate_attributes_search_vector_value()
+            ├── product_attributes = product.product_type.attributeproduct.all()
+            │   └── ✅  只取仍在 AttributeProduct 关联中的属性
+            ├── attributes = [pa.attribute for pa in product_attributes][:MAX]
+            ├── assigned_values = product.attributevalues.all()
+            ├── 构建 attribute_id → values 映射
+            └── 只对 attributes 列表中的属性生成搜索向量
 ```
 
 **关键代码** (`search.py:130-134`):
@@ -525,9 +539,11 @@ attributes = [
 ][: settings.PRODUCT_MAX_INDEXED_ATTRIBUTES]
 ```
 
-**行为**: 已解绑属性的值会被自然排除在新的搜索向量之外。
+**一致结论**: 已解绑属性的值会被自然排除在新的搜索向量之外。
 
-### 7.5 路径四：属性解绑 mutation（ProductAttributeUnassign）
+---
+
+### 7.5 路径四：属性解绑 mutation
 
 **代码位置**: `saleor/graphql/product/mutations/attributes.py:328`
 
@@ -538,22 +554,28 @@ productAttributeUnassign 突变
 ProductAttributeUnassign.perform_mutation()
     ├── 解析 attribute_ids 为 PK
     ├── product_type.product_attributes.remove(*attribute_pks)
-    │   └── ⚠️  只删除 AttributeProduct 关联表记录
+    │   └── ❌  只删除 AttributeProduct 关联表记录
     ├── product_type.variant_attributes.remove(*attribute_pks)
-    │   └── ⚠️  只删除 AttributeVariant 关联表记录
+    │   └── ❌  只删除 AttributeVariant 关联表记录
     ├── 收集该 ProductType 下所有 Product ID
     └── mark_products_search_vector_as_dirty_in_batches(product_ids)
 ```
 
-**关键代码** (`attributes.py:345-346`):
+**关键代码** (`attributes.py:323-325`):
 ```python
-cls.save_field_values(product_type, "product_attributes", attribute_pks)
-cls.save_field_values(product_type, "variant_attributes", attribute_pks)
+@classmethod
+def save_field_values(cls, product_type, field, pks):
+    """Add in bulk the PKs to assign to a given product type."""
+    getattr(product_type, field).remove(*pks)
 ```
 
-**⚠️ 关键发现**: 解绑**不删除** `AssignedProductAttributeValue` 或 `AssignedVariantAttributeValue` 记录。这些"僵尸"记录仍然存在于数据库中。
+**一致结论**: 解绑**不删除** `AssignedProductAttributeValue` 或 `AssignedVariantAttributeValue` 记录。这些记录仍然存在于数据库中。
 
-### 7.6 不一致性场景矩阵
+---
+
+### 7.6 不一致性场景与时间窗口
+
+#### 场景矩阵
 
 | 时间点 | 操作 | GraphQL 属性查询 | 属性值过滤查询 | 全文搜索（旧索引） | 全文搜索（新索引） |
 |--------|------|----------------|--------------|-----------------|-----------------|
@@ -561,39 +583,135 @@ cls.save_field_values(product_type, "variant_attributes", attribute_pks)
 | T1 | 执行解绑 mutation | ❌ 不返回 | ✅ **仍命中** | ✅ 命中 | —— |
 | T2 | 索引重建完成 | ❌ 不返回 | ✅ **仍命中** | —— | ❌ 不命中 |
 
-**风险说明**:
-- **T1 到 T2 之间**: 属性过滤查询与全文搜索结果不一致
-- **T2 之后**: 属性过滤查询仍能命中，但全文搜索不命中
-- **永久不一致**: 只要不清空 `Assigned*` 表中的遗留记录，过滤查询始终能命中
+#### 时间窗口说明
 
-### 7.7 遗留值的生命周期
+**窗口 1：T1 → T2（索引重建前的不一致）**
+- 时长：取决于 `update_products_search_vector_task` 的执行频率（默认每分钟）
+- 表现：
+  - GraphQL 查询：属性已不显示
+  - 属性过滤：仍能按该属性筛选产品
+  - 全文搜索：仍能通过属性值搜索到产品
+- 原因：索引重建是异步过程
 
-**遗留值产生路径**:
+**窗口 2：T2 之后（永久不一致）**
+- 时长：直到 `Assigned*` 记录被清理
+- 表现：
+  - GraphQL 查询：属性不显示
+  - 属性过滤：**仍能按该属性筛选产品**
+  - 全文搜索：不能通过属性值搜索到产品
+- 原因：过滤查询不检查 `AttributeProduct` 关联
+
+---
+
+### 7.7 不一致性产生的根本原因
+
+#### 原因 1：解耦设计导致数据源分叉
+
 ```
-属性绑定到产品类型
-    ↓
-产品/变体赋值该属性 → AssignedProductAttributeValue 记录创建
-    ↓
-执行 productAttributeUnassign → 删除 AttributeProduct 记录
-    ↓
-⚠️  AssignedProductAttributeValue 记录保留
+AttributeProduct（属性-类型关联）
+    ├── GraphQL 查询 ◄─── 读这里
+    ├── 搜索向量重建 ◄─── 读这里
+    └── 解绑操作 ◄─────── 删这里
+
+AssignedProductAttributeValue（产品-属性值绑定）
+    └── 属性过滤查询 ◄─── 只读这里，不关联 AttributeProduct
 ```
 
-**遗留值清理方式**:
-1. **重新绑定属性并更新产品**: 赋值时会先删除旧的绑定记录
-2. **删除产品/变体**: 级联删除 `Assigned*` 记录
-3. **删除属性本身**: 级联删除所有 `AttributeValue` 和 `Assigned*` 记录
-4. **手动清理**: 需要自定义数据迁移或管理命令
+- 解绑操作只删除 `AttributeProduct`，不影响 `AssignedProductAttributeValue`
+- 过滤查询直接从 `AssignedProductAttributeValue` 读取，不检查 `AttributeProduct`
+- 两条路径完全解耦，没有一致性保证
 
-**设计取舍分析**:
-- **保留遗留值的理由**:
-  - 避免意外数据丢失
-  - 重新绑定属性后可以恢复之前的赋值
-  - 解绑操作性能更高（只需删除关联表）
-- **保留遗留值的代价**:
-  - 数据库存在"僵尸"记录
-  - 属性过滤查询与其他路径行为不一致
-  - 需要额外的清理机制
+#### 原因 2：性能优先的设计取舍
+
+过滤查询采用直接查询 `AssignedProductAttributeValue` 的方式，而不是通过 `AttributeProduct` 关联，主要考虑：
+1. **查询性能**：少一次 JOIN 操作，查询更快
+2. **过滤准确性**：只要产品有该属性值，就应该能被筛选到，无论属性是否仍绑定到类型
+3. **历史数据保留**：保留用户之前的筛选能力
+
+#### 原因 3：缺少级联清理机制
+
+`AssignedProductAttributeValue` 的外键定义：
+```python
+class AssignedProductAttributeValue(SortableModel):
+    value = models.ForeignKey("AttributeValue", on_delete=models.CASCADE, ...)
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, ...)
+```
+
+- 只对 `AttributeValue` 和 `Product` 有级联删除
+- 对 `AttributeProduct` 没有任何外键关联或级联逻辑
+- 这是有意的设计选择，不是遗漏
+
+---
+
+### 7.8 风险提示与应对方案
+
+#### 风险 1：过滤结果与搜索结果不一致
+
+**表现**: 用户在搜索框输入属性值搜不到产品，但在属性筛选器中能筛选出来（或反之）。
+
+**影响**: 用户体验不一致，可能导致用户困惑。
+
+**应对方案**:
+- 如果业务需要强一致性，建议在解绑属性后，手动清理 `AssignedProductAttributeValue` 记录
+- 示例清理 SQL：
+  ```sql
+  DELETE FROM assigned_product_attribute_value
+  WHERE product_id IN (
+      SELECT id FROM product WHERE product_type_id = ?
+  ) AND value_id IN (
+      SELECT id FROM attribute_value WHERE attribute_id = ?
+  );
+  ```
+
+#### 风险 2：遗留数据膨胀
+
+**表现**: 频繁绑定/解绑属性会导致 `AssignedProductAttributeValue` 表中存在大量"僵尸"记录。
+
+**影响**: 表体积增大，查询性能下降，备份时间变长。
+
+**应对方案**:
+- 定期运行清理任务，删除没有对应 `AttributeProduct` 关联的 `AssignedProductAttributeValue` 记录
+- 示例查询（找出需要清理的记录）：
+  ```sql
+  SELECT apav.*
+  FROM assigned_product_attribute_value apav
+  JOIN attribute_value av ON apav.value_id = av.id
+  JOIN product p ON apav.product_id = p.id
+  LEFT JOIN attribute_product ap ON av.attribute_id = ap.attribute_id AND p.product_type_id = ap.product_type_id
+  WHERE ap.id IS NULL;
+  ```
+
+#### 风险 3：重新绑定后数据自动"恢复"
+
+**表现**: 解绑属性后重新绑定，之前的属性值会自动"回来"。
+
+**影响**: 可能不符合用户预期（用户可能希望解绑后数据被清除）。
+
+**应对方案**:
+- 在 UI 中明确提示用户：解绑不会删除已有的属性值，重新绑定后会恢复
+- 提供"解绑并清除数据"的选项
+
+#### 风险 4：过滤验证绕过
+
+**表现**: 已解绑的属性 slug 仍然可以用于过滤。
+
+**影响**: 可能被用于绕过某些业务逻辑。
+
+**应对方案**:
+- 如果需要严格控制，可以在过滤查询前增加检查，确保属性确实绑定到产品类型
+- 但这会增加一次 JOIN，影响过滤性能
+
+---
+
+### 7.9 设计取舍总结
+
+| 设计决策 | 优点 | 代价 |
+|---------|------|------|
+| 解绑只删 `AttributeProduct`，不删 `Assigned*` | 1. 解绑操作快<br>2. 数据可恢复<br>3. 避免意外数据丢失 | 1. 产生"僵尸"记录<br>2. 过滤与搜索不一致 |
+| 过滤查询直接查 `Assigned*`，不检查关联 | 1. 查询性能好<br>2. 保留历史筛选能力 | 1. 与 GraphQL 查询行为不一致<br>2. 已解绑属性仍可过滤 |
+| 搜索向量通过 `AttributeProduct` 获取属性 | 1. 索引内容准确反映当前配置<br>2. 已解绑属性自然排除 | 1. 需要异步重建索引<br>2. 存在 T1-T2 不一致窗口 |
+
+**核心取舍原则**: Saleor 选择了**性能和数据保留优先**，将一致性保证交给业务层处理。
 
 ---
 

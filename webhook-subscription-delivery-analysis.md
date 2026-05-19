@@ -516,11 +516,11 @@ delivery_promise.then(trigger_sync_for_delivery)
 | **是否阻塞请求** | 否 | 是 |
 | **创建时持久化** | 总是持久化 | 从不持久化（内存对象） |
 | **失败时补写** | 不需要（已持久化） | 通过 `save_unsuccessful_delivery_attempt()` 补写 |
-| **成功时处理** | `clear_successful_delivery()` 删除 | 无操作（无 id 跳过） |
+| **成功时处理** | `clear_successful_delivery()` 删除 delivery 和 payload | 无操作（无 id 跳过） |
 | **payload 存储** | 数据库字段 | 失败时迁移到文件存储 |
 | **调用方处理** | 触发后立即返回，无需等待 | 等待响应结果，直接用于业务逻辑 |
-| **payload 为空短路** | 创建失败交易事件 | 完全无记录 |
-| **对账完整性** | 完整（成功/失败均有记录） | 仅失败有记录，成功和 payload 为空无记录 |
+| **payload 为空短路** | 创建失败交易事件作为对账记录 | 完全无记录 |
+| **对账完整性** | 通过 TransactionEvent 完整追溯（成功/失败均有记录） | 仅失败有记录，成功和 payload 为空无记录 |
 
 ### 7.5 同步链路跳过的订阅载荷渲染步骤
 
@@ -603,6 +603,111 @@ def trigger_webhook_sync_promise(*, event_type, webhook, ...):
                    ├─ 创建 EventDelivery + EventPayload
                    └─ 触发 send_webhook_request_async Celery 任务
 ```
+
+### 7.7 交易类同步事件的对账口径与排查路径
+
+#### 7.7.1 对账口径统一说明
+
+交易类同步事件（`TRANSACTION_CHARGE_REQUESTED` / `TRANSACTION_REFUND_REQUESTED` / `TRANSACTION_CANCELATION_REQUESTED`）的对账**始终以 `TransactionEvent` 为唯一可信源**，而不是 `EventDelivery`。
+
+**原因**：交易类同步事件的 `EventDelivery` 在发送成功后会被 `clear_successful_delivery()` 删除，无法通过 delivery 表追溯成功的交易请求。
+
+**各场景下的证据留存对象**：
+
+| 场景 | TransactionEvent | EventDelivery | EventDeliveryAttempt | EventPayload |
+|------|-----------------|---------------|---------------------|-------------|
+| **payload 生成失败** | ✅ 失败交易事件（含失败原因） | ❌ 已删除 | ❌ 未创建 | ❌ 未创建 |
+| **webhook 未找到** | ✅ 失败交易事件（含失败原因） | ❌ 已删除 | ❌ 未创建 | ❌ 未创建 |
+| **发送中（重试阶段）** | ✅ 请求事件（未修改） | ✅ 存在（PENDING/FAILED） | ✅ 每次重试生成 1 条 | ✅ 存在 |
+| **发送成功** | ✅ 结果事件（或更新原事件 psp_reference） | ❌ 已删除 | ❌ 已级联删除 | ❌ 已删除 |
+| **发送失败（重试耗尽）** | ✅ 失败交易事件（含失败原因） | ✅ 存在（FAILED） | ✅ 所有重试 attempt 均存在 | ✅ 存在（文件存储） |
+
+**关键说明**：
+- `TransactionEvent` 是唯一不会被清理的对象，始终保留完整的交易生命周期记录
+- `EventDelivery` 和关联对象仅在失败或重试阶段存在，成功后立即清理
+- `EventDeliveryAttempt` 记录了每次发送的详细信息（请求时间、响应状态、错误信息），是排查发送问题的核心证据
+
+#### 7.7.2 最小化排查路径
+
+**场景 1：用户反馈交易请求未收到响应**
+
+```
+排查路径（按优先级）：
+
+1. 查 TransactionEvent（唯一可信源）
+   SELECT * FROM transaction_event 
+   WHERE transaction_id = <transaction_id> 
+   ORDER BY created_at DESC;
+   
+   → 如果存在 CHARGE_FAILURE / REFUND_FAILURE 等失败事件：
+     • 查看 message 字段获取失败原因
+     • 如果原因是 "Cannot generate a payload"：检查 subscription query
+     • 如果原因是 "Cannot find a webhook"：检查 webhook 配置
+   
+   → 如果只有 CHARGE_REQUESTED / REFUND_REQUESTED，无后续事件：
+     • 进入步骤 2 检查 delivery
+
+2. 查 EventDelivery（仅失败/重试中存在）
+   SELECT * FROM event_delivery 
+   WHERE event_type IN ('TRANSACTION_CHARGE_REQUESTED', ...)
+     AND webhook_id = <webhook_id>
+   ORDER BY created_at DESC LIMIT 10;
+   
+   → 如果 delivery 存在且 status = FAILED：
+     • 进入步骤 3 查看 attempt 详情
+   
+   → 如果 delivery 不存在：
+     • 说明发送成功已被清理，或任务尚未执行
+     • 检查 Celery 队列是否有积压
+
+3. 查 EventDeliveryAttempt（发送详情）
+   SELECT * FROM event_delivery_attempt 
+   WHERE delivery_id = <delivery_id>
+   ORDER BY created_at DESC;
+   
+   • 查看 response_status_code 确认 HTTP 状态码
+   • 查看 response_content 获取响应内容
+   • 查看 created_at 时间线确认重试次数和间隔
+
+4. 查 EventPayload（请求内容）
+   SELECT * FROM event_payload WHERE id = <payload_id>;
+   
+   • 如果 payload 字段为空，调用 get_payload() 从文件读取
+   • 验证 payload 内容是否符合预期
+```
+
+**场景 2：对账时发现交易请求缺失**
+
+```
+排查路径：
+
+1. 按时间范围查 TransactionEvent
+   SELECT * FROM transaction_event 
+   WHERE type IN ('CHARGE_REQUESTED', 'REFUND_REQUESTED', 'CANCELATION_REQUESTED')
+     AND created_at BETWEEN '<start_time>' AND '<end_time>'
+   ORDER BY created_at;
+
+2. 对每个请求事件，检查是否有对应的结果事件：
+   • CHARGE_REQUESTED → 应有 CHARGE_SUCCESS 或 CHARGE_FAILURE
+   • REFUND_REQUESTED → 应有 REFUND_SUCCESS 或 REFUND_FAILURE
+   • CANCELATION_REQUESTED → 应有 CANCELATION_SUCCESS 或 CANCELATION_FAILURE
+
+3. 对缺失结果事件的请求，检查 EventDelivery：
+   SELECT ed.* FROM event_delivery ed
+   JOIN webhook w ON ed.webhook_id = w.id
+   WHERE ed.event_type = 'TRANSACTION_CHARGE_REQUESTED'
+     AND w.app_id = <app_id>
+     AND ed.created_at BETWEEN '<start_time>' AND '<end_time>';
+
+4. 如 delivery 不存在，检查日志：
+   搜索 "handle_transaction_request_task" 和相关 transaction_id
+```
+
+**排查防坑指南**：
+- ❌ 不要通过 `EventDelivery` 是否存在判断交易请求是否发生（成功的已被删除）
+- ❌ 不要通过 `EventDelivery.created_at` 排序交易时序（成功的已被删除，排序不完整）
+- ✅ 始终通过 `TransactionEvent` 作为对账和时序的唯一依据
+- ✅ 查找发送失败原因时，先查 `TransactionEvent.message`，再查 `EventDeliveryAttempt`
 
 ---
 

@@ -288,26 +288,88 @@ EventPayload 和 EventDelivery 的创建在同一事务中 [transport.py:195-204
 
 ## 七、同步 Webhook 与 Subscription Webhook 协作差异
 
-### 7.1 事件类型分流机制
+### 7.1 同步事件的两类执行路径
 
-Saleor 从事件类型层面就将 webhook 分为两条独立链路，通过 `WebhookEventAsyncType` 和 `WebhookEventSyncType` 两个枚举类 [event_types.py] 进行分流：
+Saleor 的同步事件（`WebhookEventSyncType`）并非统一执行路径，而是根据事件类型分为**交易类同步事件**和**普通同步事件**两类，二者在重试机制、执行线程、payload 处理上存在显著差异。
 
-**异步事件类型**（`WebhookEventAsyncType`）：
-- 用于通知类场景，如 `ORDER_CREATED`, `PRODUCT_UPDATED`, `CUSTOMER_CREATED` 等
-- 触发后立即返回，不等待 webhook 响应
-- 支持指数退避重试机制
+#### 7.1.1 交易类同步事件（走 Celery 队列重试）
 
-**同步事件类型**（`WebhookEventSyncType`）：
-- 用于需要响应结果的场景，如：
-  - 支付类：`PAYMENT_AUTHORIZE`, `PAYMENT_CAPTURE`, `PAYMENT_REFUND`
-  - 税费计算：`CHECKOUT_CALCULATE_TAXES`, `ORDER_CALCULATE_TAXES`
-  - 交易类：`TRANSACTION_CHARGE_REQUESTED`, `TRANSACTION_REFUND_REQUESTED`
-  - 配送方式：`SHIPPING_LIST_METHODS_FOR_CHECKOUT`, `CHECKOUT_FILTER_SHIPPING_METHODS`
-  - 支付会话：`TRANSACTION_INITIALIZE_SESSION`, `TRANSACTION_PROCESS_SESSION`
-- 触发后阻塞等待 webhook 响应，响应结果直接影响业务流程
-- 仅支持 HTTP/HTTPS scheme，不支持 SQS/PubSub
+**事件类型**：
+- `TRANSACTION_CHARGE_REQUESTED`
+- `TRANSACTION_REFUND_REQUESTED`
+- `TRANSACTION_CANCELATION_REQUESTED`
 
-### 7.2 同步链路跳过的订阅载荷渲染步骤
+**执行入口**：`trigger_transaction_request()` [synchronous/transport.py:451-516]
+
+```python
+def trigger_transaction_request(transaction_data, event_type, requestor):
+    # 1. 创建 delivery（同步生成 payload）
+    if webhook.subscription_query:
+        delivery = create_delivery_for_subscription_sync_event(...)
+    else:
+        payload = generate_transaction_action_request_payload(...)
+        delivery = EventDelivery.objects.create(...)
+    
+    # 2. 关键：投递到 Celery 队列，异步执行
+    call_event(
+        handle_transaction_request_task.delay,
+        delivery.id,
+        transaction_data.event.id,
+    )
+```
+
+**关键特征**：
+- **执行线程**：创建 delivery 后立即返回，实际发送由 `handle_transaction_request_task` Celery 任务执行
+- **重试机制**：Celery 任务配置 `max_retries=5` + `retry_backoff=10`，5xx 错误指数退避重试
+- **时效性**：不阻塞当前请求线程，异步完成
+- **持久化**：EventDelivery 和 EventPayload 均持久化到数据库
+
+**Celery 任务执行流程** [synchronous/transport.py:69-100]：
+```python
+@app.task(bind=True, retry_backoff=10, retry_kwargs={"max_retries": 5})
+def handle_transaction_request_task(self, delivery_id, request_event_id):
+    delivery, _ = get_delivery_for_webhook(delivery_id)
+    attempt = create_attempt(delivery, self.request.id)
+    response, response_data = _send_webhook_request_sync(delivery, attempt=attempt)
+    
+    # 仅 5xx 错误重试
+    if response.response_status_code and response.response_status_code >= 500:
+        handle_webhook_retry(self, delivery.webhook, response, delivery, attempt)
+```
+
+#### 7.1.2 普通同步事件（请求线程内直接发送，无重试）
+
+**事件类型**：
+- **支付类（旧API）**：`PAYMENT_AUTHORIZE`, `PAYMENT_CAPTURE`, `PAYMENT_REFUND`, `PAYMENT_VOID`, `PAYMENT_CONFIRM`, `PAYMENT_PROCESS`
+- **税费计算**：`CHECKOUT_CALCULATE_TAXES`, `ORDER_CALCULATE_TAXES`
+- **配送方式**：`SHIPPING_LIST_METHODS_FOR_CHECKOUT`, `CHECKOUT_FILTER_SHIPPING_METHODS`, `ORDER_FILTER_SHIPPING_METHODS`
+- **支付会话**：`TRANSACTION_INITIALIZE_SESSION`, `TRANSACTION_PROCESS_SESSION`, `PAYMENT_GATEWAY_INITIALIZE_SESSION`
+- **支付方式管理**：`LIST_STORED_PAYMENT_METHODS`, `STORED_PAYMENT_METHOD_DELETE_REQUESTED`
+- **支付令牌化**：`PAYMENT_GATEWAY_INITIALIZE_TOKENIZATION_SESSION`, `PAYMENT_METHOD_INITIALIZE_TOKENIZATION_SESSION`, `PAYMENT_METHOD_PROCESS_TOKENIZATION_SESSION`
+
+**执行入口**：`trigger_webhook_sync_promise()` [synchronous/transport.py:398-442]
+
+**关键特征**：
+- **执行线程**：在当前请求线程内同步执行，阻塞等待响应
+- **重试机制**：**无任何重试**，一次发送失败即返回 None
+- **时效性**：直接影响当前请求响应时间
+- **持久化**：
+  - Subscription 模式：根据 `with_save` 参数决定是否保存（默认 `True`）
+  - Legacy 模式：EventDelivery 仅为内存对象，不持久化到数据库
+  - 失败时调用 `save_unsuccessful_delivery_attempt()` 保存失败记录
+
+### 7.2 两类同步事件的核心差异对比
+
+| 维度 | 交易类同步事件 | 普通同步事件 |
+|------|--------------|------------|
+| **执行方式** | Celery 任务异步执行 | 当前线程同步执行 |
+| **重试机制** | 5 次指数退避（仅 5xx） | 无重试 |
+| **是否阻塞请求** | 否 | 是 |
+| **Delivery 持久化** | 总是持久化 | Subscription 可选，Legacy 不持久化 |
+| **调用方处理** | 触发后立即返回，无需等待 | 等待响应结果，直接用于业务逻辑 |
+| **失败处理** | 重试耗尽后创建失败交易事件 | 返回 None，调用方自行处理 |
+
+### 7.3 同步链路跳过的订阅载荷渲染步骤
 
 同步 webhook 虽然也支持 `subscription_query`，但其执行链路与异步有显著差异：
 
@@ -330,16 +392,16 @@ def trigger_webhook_sync_promise(*, event_type, webhook, ...):
     return delivery_promise.then(trigger_sync_for_delivery)
 ```
 
-**同步 subscription 模式跳过的步骤**：
+**同步 subscription 模式跳过的步骤**（普通同步事件）：
 1. **跳过 Webhook 分组**：同步事件在触发时已确定是同步链路，不经过 `group_webhooks_by_subscription()`
 2. **跳过批量处理**：同步事件单次只处理一个 webhook，不进行批量创建
 3. **跳过预保存 payload 比较**：同步事件无 `pre_save_payloads` 机制
 4. **跳过延迟载荷模式**：同步事件必须即时生成 payload，不支持 deferred payload
 5. **跳过 dataloader 跨 webhook 共享**：同步事件通常只有一个 webhook，无共享优化
-6. **跳过 Celery 任务队列**：同步事件在当前线程直接执行，不经过任务队列
+6. **跳过 Celery 任务队列**：普通同步事件在当前线程直接执行，不经过任务队列
 7. **跳过自动清理**：失败的 delivery 会调用 `save_unsuccessful_delivery_attempt()` 保留记录用于排查
 
-### 7.3 Payload 生成失败/为空的处理策略
+### 7.4 Payload 生成失败/为空的处理策略
 
 **异步 subscription webhook** [asynchronous/transport.py:156-179]：
 ```python
@@ -363,41 +425,100 @@ def create_delivery_for_subscription_sync_event(...):
 - **行为**：payload 为空时返回 `None`，不创建 EventDelivery
 - **短路时机**：
   - 在 `trigger_webhook_sync_promise` 中，`delivery` 为 `None` 时直接返回 `None` [synchronous/transport.py:413-415]
-  - 调用方收到 `None` 后通常会创建失败事件，如 `create_failed_transaction_event()`
-- **重试**：无重试，同步事件失败直接影响业务流程
+  - 交易类事件：调用方收到 `None` 后创建失败交易事件 `create_failed_transaction_event()`
+  - 普通同步事件：调用方收到 `None` 后按业务逻辑处理（如税费计算失败返回错误）
+- **重试**：无论交易类还是普通同步事件，payload 生成都不重试
 
 **同步 legacy webhook**：
 - **行为**：使用预先生成的 `static_payload`，不会出现 payload 为空的情况
 - **短路时机**：仅在 HTTP 请求失败时短路
 
-### 7.4 重试机制差异对比
+### 7.5 缓存哨兵（SYNC_WEBHOOK_FAILURE_SENTINEL）的作用范围
 
-| 维度 | 异步 Subscription | 同步 Subscription | 同步 Legacy |
-|------|------------------|------------------|------------|
-| **重试触发** | 5xx 错误、网络超时 | 5xx 错误（仅交易类任务） | 5xx 错误（仅交易类任务） |
-| **最大重试** | 5 次 | 5 次（仅 `handle_transaction_request_task`） | 5 次（仅 `handle_transaction_request_task`） |
-| **退避策略** | 指数退避（10s * 2^n） | 指数退避（10s * 2^n） | 指数退避（10s * 2^n） |
-| **3xx/4xx 重试** | 不重试 | 不重试 | 不重试 |
-| **payload 失败重试** | 不重试（根本不创建 delivery） | 不重试（返回 None 短路） | 不存在此场景 |
-| **缓存机制** | 无 | 有（`SYNC_WEBHOOK_FAILURE_SENTINEL` 防止重复失败请求） | 有 |
+**定义** [const.py]：
+```python
+SYNC_WEBHOOK_FAILURE_SENTINEL = object()  # 标记失败的缓存值
+SYNC_WEBHOOK_FAILURE_CACHE_TTL = 30  # 失败缓存 30 秒
+```
 
-### 7.5 两条链路的完整分流流程
+**仅作用于 `trigger_webhook_sync_promise_if_not_cached()`** [synchronous/transport.py:202-260]：
+
+```python
+def trigger_webhook_sync_promise_if_not_cached(...):
+    cache_key = generate_cache_key_for_webhook(...)
+    response_data = cache.get(cache_key)
+    
+    # 关键：如果缓存中是失败哨兵，直接跳过
+    if response_data == const.SYNC_WEBHOOK_FAILURE_SENTINEL:
+        logger.warning("Skipping request to %s for event %s due to previous failure.", ...)
+        return Promise.resolve(None)
+    
+    if response_data is not None:
+        return Promise.resolve(response_data)  # 命中成功缓存
+    
+    # 未命中缓存，实际发送请求
+    return trigger_webhook_sync_promise(...).then(process_response_data)
+
+def process_response_data(response_data):
+    if response_data is not None:
+        cache.set(cache_key, response_data, timeout=cache_timeout)  # 成功缓存
+    else:
+        cache.set(cache_key, const.SYNC_WEBHOOK_FAILURE_SENTINEL, 
+                  timeout=const.SYNC_WEBHOOK_FAILURE_CACHE_TTL)  # 失败缓存
+    return response_data
+```
+
+**实际使用场景**：
+1. **配送方式过滤** [shipping/webhooks/shared.py:106]：
+   - `CHECKOUT_FILTER_SHIPPING_METHODS`
+   - `ORDER_FILTER_SHIPPING_METHODS`
+   - 缓存 3 分钟（`CACHE_EXCLUDED_SHIPPING_TIME = 60 * 3`）
+
+2. **列出已保存支付方式** [plugins/webhook/plugin.py:2800]：
+   - `LIST_STORED_PAYMENT_METHODS`
+   - 缓存默认 TTL（`WEBHOOK_CACHE_DEFAULT_TTL`）
+
+**不使用缓存哨兵的场景**：
+- 所有异步事件
+- 交易类同步事件（`TRANSACTION_*_REQUESTED`）
+- 税费计算（`CHECKOUT_CALCULATE_TAXES`, `ORDER_CALCULATE_TAXES`）
+- 支付会话初始化/处理（`TRANSACTION_INITIALIZE_SESSION`, `TRANSACTION_PROCESS_SESSION`）
+- 旧支付 API（`PAYMENT_AUTHORIZE`, `PAYMENT_CAPTURE` 等）
+- 支付令牌化相关事件
+
+### 7.6 完整分流流程（修正版）
 
 ```
 事件触发
     ↓
 判断事件类型 ∈ WebhookEventSyncType.ALL ?
     ├─ 是 → 同步链路
-    │    └─ 判断 webhook.subscription_query ?
-    │         ├─ 是 → 同步 Subscription 模式
-    │         │    ├─ 调用 generate_payload_from_subscription()
-    │         │    ├─ 如 payload 为空 → return None → 短路
-    │         │    ├─ 创建 EventDelivery（可选保存）
-    │         │    └─ 同步发送 HTTP 请求 → 等待响应 → 返回结果
-    │         └─ 否 → 同步 Legacy 模式
-    │              ├─ 使用预生成 static_payload
-    │              ├─ 创建 EventDelivery（内存对象）
-    │              └─ 同步发送 HTTP 请求 → 等待响应 → 返回结果
+    │    ├─ 判断是否为交易类事件（TRANSACTION_*_REQUESTED）?
+    │    │    ├─ 是 → 交易类同步事件路径
+    │    │    │    ├─ 判断 webhook.subscription_query ?
+    │    │    │    │    ├─ 是 → 调用 create_delivery_for_subscription_sync_event()
+    │    │    │    │    │    ├─ 生成 payload
+    │    │    │    │    │    ├─ 如 payload 为空 → return None → 短路 → 创建失败交易事件
+    │    │    │    │    │    └─ 创建并持久化 EventDelivery + EventPayload
+    │    │    │    │    └─ 否 → 使用预生成 payload，创建并持久化 EventDelivery
+    │    │    │    └─ 触发 handle_transaction_request_task.delay() → 进入 Celery 队列
+    │    │    │         └─ 任务执行：发送请求 → 5xx 错误指数退避重试（最多 5 次）
+    │    │    └─ 否 → 普通同步事件路径（请求线程内执行）
+    │    │         ├─ 判断是否使用缓存（trigger_webhook_sync_promise_if_not_cached）?
+    │    │         │    ├─ 是 → 检查缓存
+    │    │         │    │    ├─ 命中失败哨兵 → 直接返回 None（短路 30 秒）
+    │    │         │    │    ├─ 命中成功缓存 → 返回缓存数据
+    │    │         │    │    └─ 未命中 → 继续执行
+    │    │         │    └─ 否 → 直接执行
+    │    │         ├─ 判断 webhook.subscription_query ?
+    │    │         │    ├─ 是 → 同步 Subscription 模式
+    │    │         │    │    ├─ 调用 generate_payload_from_subscription()
+    │    │         │    │    ├─ 如 payload 为空 → return None → 短路
+    │    │         │    │    └─ 创建 EventDelivery（可选保存）
+    │    │         │    └─ 否 → 同步 Legacy 模式
+    │    │         │         ├─ 使用预生成 static_payload
+    │    │         │         └─ 创建 EventDelivery（内存对象，不持久化）
+    │    │         └─ 当前线程同步发送 HTTP 请求 → 等待响应 → 返回结果（无重试）
     └─ 否 → 异步链路
          └─ 调用 group_webhooks_by_subscription()
               ├─ subscription webhook → 异步 Subscription 模式

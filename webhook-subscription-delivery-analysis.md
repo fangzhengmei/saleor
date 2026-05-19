@@ -286,11 +286,144 @@ EventPayload 和 EventDelivery 的创建在同一事务中 [transport.py:195-204
 
 ---
 
-## 六、文件索引
+## 七、同步 Webhook 与 Subscription Webhook 协作差异
+
+### 7.1 事件类型分流机制
+
+Saleor 从事件类型层面就将 webhook 分为两条独立链路，通过 `WebhookEventAsyncType` 和 `WebhookEventSyncType` 两个枚举类 [event_types.py] 进行分流：
+
+**异步事件类型**（`WebhookEventAsyncType`）：
+- 用于通知类场景，如 `ORDER_CREATED`, `PRODUCT_UPDATED`, `CUSTOMER_CREATED` 等
+- 触发后立即返回，不等待 webhook 响应
+- 支持指数退避重试机制
+
+**同步事件类型**（`WebhookEventSyncType`）：
+- 用于需要响应结果的场景，如：
+  - 支付类：`PAYMENT_AUTHORIZE`, `PAYMENT_CAPTURE`, `PAYMENT_REFUND`
+  - 税费计算：`CHECKOUT_CALCULATE_TAXES`, `ORDER_CALCULATE_TAXES`
+  - 交易类：`TRANSACTION_CHARGE_REQUESTED`, `TRANSACTION_REFUND_REQUESTED`
+  - 配送方式：`SHIPPING_LIST_METHODS_FOR_CHECKOUT`, `CHECKOUT_FILTER_SHIPPING_METHODS`
+  - 支付会话：`TRANSACTION_INITIALIZE_SESSION`, `TRANSACTION_PROCESS_SESSION`
+- 触发后阻塞等待 webhook 响应，响应结果直接影响业务流程
+- 仅支持 HTTP/HTTPS scheme，不支持 SQS/PubSub
+
+### 7.2 同步链路跳过的订阅载荷渲染步骤
+
+同步 webhook 虽然也支持 `subscription_query`，但其执行链路与异步有显著差异：
+
+**触发入口分流** [synchronous/transport.py:398-442]：
+```python
+def trigger_webhook_sync_promise(*, event_type, webhook, ...):
+    if webhook.subscription_query:
+        # 同步 subscription 模式
+        delivery_promise = create_promise_delivery_for_subscription_sync_event(...)
+    else:
+        # 同步 legacy 模式 - 直接使用静态 payload
+        delivery_promise = Promise.resolve(
+            EventDelivery(
+                status=EventDeliveryStatus.PENDING,
+                event_type=event_type,
+                payload=EventPayload(payload=static_payload),
+                webhook=webhook,
+            )
+        )
+    return delivery_promise.then(trigger_sync_for_delivery)
+```
+
+**同步 subscription 模式跳过的步骤**：
+1. **跳过 Webhook 分组**：同步事件在触发时已确定是同步链路，不经过 `group_webhooks_by_subscription()`
+2. **跳过批量处理**：同步事件单次只处理一个 webhook，不进行批量创建
+3. **跳过预保存 payload 比较**：同步事件无 `pre_save_payloads` 机制
+4. **跳过延迟载荷模式**：同步事件必须即时生成 payload，不支持 deferred payload
+5. **跳过 dataloader 跨 webhook 共享**：同步事件通常只有一个 webhook，无共享优化
+6. **跳过 Celery 任务队列**：同步事件在当前线程直接执行，不经过任务队列
+7. **跳过自动清理**：失败的 delivery 会调用 `save_unsuccessful_delivery_attempt()` 保留记录用于排查
+
+### 7.3 Payload 生成失败/为空的处理策略
+
+**异步 subscription webhook** [asynchronous/transport.py:156-179]：
+```python
+for (subscribable_object, webhook), data in zip(...):
+    if not data:
+        logger.info("No payload was generated with subscription for event: %s", event_type)
+        continue  # 静默跳过，不创建 EventDelivery
+```
+- **行为**：payload 为空时直接 `continue`，不创建 EventDelivery 和 EventPayload
+- **重试**：无重试，因为根本没有创建 delivery
+- **日志**：仅记录 info 级别日志，不视为错误
+
+**同步 subscription webhook** [synchronous/transport.py:263-326]：
+```python
+def create_delivery_for_subscription_sync_event(...):
+    data = generate_payload_from_subscription(...)
+    if not data:
+        logger.info("No payload was generated with subscription for event: %s", event_type)
+        return None  # 返回 None，短路后续流程
+```
+- **行为**：payload 为空时返回 `None`，不创建 EventDelivery
+- **短路时机**：
+  - 在 `trigger_webhook_sync_promise` 中，`delivery` 为 `None` 时直接返回 `None` [synchronous/transport.py:413-415]
+  - 调用方收到 `None` 后通常会创建失败事件，如 `create_failed_transaction_event()`
+- **重试**：无重试，同步事件失败直接影响业务流程
+
+**同步 legacy webhook**：
+- **行为**：使用预先生成的 `static_payload`，不会出现 payload 为空的情况
+- **短路时机**：仅在 HTTP 请求失败时短路
+
+### 7.4 重试机制差异对比
+
+| 维度 | 异步 Subscription | 同步 Subscription | 同步 Legacy |
+|------|------------------|------------------|------------|
+| **重试触发** | 5xx 错误、网络超时 | 5xx 错误（仅交易类任务） | 5xx 错误（仅交易类任务） |
+| **最大重试** | 5 次 | 5 次（仅 `handle_transaction_request_task`） | 5 次（仅 `handle_transaction_request_task`） |
+| **退避策略** | 指数退避（10s * 2^n） | 指数退避（10s * 2^n） | 指数退避（10s * 2^n） |
+| **3xx/4xx 重试** | 不重试 | 不重试 | 不重试 |
+| **payload 失败重试** | 不重试（根本不创建 delivery） | 不重试（返回 None 短路） | 不存在此场景 |
+| **缓存机制** | 无 | 有（`SYNC_WEBHOOK_FAILURE_SENTINEL` 防止重复失败请求） | 有 |
+
+### 7.5 两条链路的完整分流流程
+
+```
+事件触发
+    ↓
+判断事件类型 ∈ WebhookEventSyncType.ALL ?
+    ├─ 是 → 同步链路
+    │    └─ 判断 webhook.subscription_query ?
+    │         ├─ 是 → 同步 Subscription 模式
+    │         │    ├─ 调用 generate_payload_from_subscription()
+    │         │    ├─ 如 payload 为空 → return None → 短路
+    │         │    ├─ 创建 EventDelivery（可选保存）
+    │         │    └─ 同步发送 HTTP 请求 → 等待响应 → 返回结果
+    │         └─ 否 → 同步 Legacy 模式
+    │              ├─ 使用预生成 static_payload
+    │              ├─ 创建 EventDelivery（内存对象）
+    │              └─ 同步发送 HTTP 请求 → 等待响应 → 返回结果
+    └─ 否 → 异步链路
+         └─ 调用 group_webhooks_by_subscription()
+              ├─ subscription webhook → 异步 Subscription 模式
+              │    ├─ 并行调用 generate_payload_promise_from_subscription()
+              │    ├─ 如 payload 为空 → continue → 不创建 delivery
+              │    ├─ 预保存 payload 比较（可选跳过）
+              │    ├─ 批量创建 EventDelivery + EventPayload
+              │    └─ 触发 send_webhook_request_async Celery 任务
+              │         ├─ 发送请求
+              │         ├─ 失败 → 指数退避重试（最多 5 次）
+              │         └─ 成功 → 清理 delivery 和 payload
+              └─ legacy webhook → 异步 Legacy 模式
+                   ├─ 使用预生成 payload
+                   ├─ 创建 EventDelivery + EventPayload
+                   └─ 触发 send_webhook_request_async Celery 任务
+```
+
+---
+
+## 八、文件索引
 
 | 模块 | 文件 | 核心职责 |
 |------|------|----------|
 | 异步传输 | `saleor/webhook/transport/asynchronous/transport.py` | 投递触发、任务定义、延迟 payload |
+| 同步传输 | `saleor/webhook/transport/synchronous/transport.py` | 同步 webhook 触发、交易请求处理 |
 | 传输工具 | `saleor/webhook/transport/utils.py` | HTTP/SQS/PubSub 发送、重试逻辑、状态管理 |
+| 事件类型 | `saleor/webhook/event_types.py` | 异步/同步事件类型定义、权限映射 |
 | 订阅载荷 | `saleor/graphql/webhook/subscription_payload.py` | GraphQL 查询执行、payload 生成 |
 | 订阅类型 | `saleor/graphql/webhook/subscription_types.py` | 订阅类型定义、字段解析 |

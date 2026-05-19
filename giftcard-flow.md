@@ -449,3 +449,355 @@ def refund_gift_card_transaction(transaction_item, request_event, user=None, app
 ```
 
 退款时使用 `F()` 表达式确保原子更新，符合 Saleor 并发安全规范。
+
+---
+
+## 补充细节一：礼品卡商品从订单行到签发张数的调用链
+
+### 完整调用链
+
+当客户购买"礼品卡商品"时，系统需要根据订单行的数量生成对应张数的礼品卡。完整调用链如下：
+
+```
+[Checkout Complete] 结账完成
+    ↓
+create_order() / create_order_from_checkout()
+    ↓
+Order.objects.create() 创建订单
+    ↓
+allocate_stocks() 分配库存（包括礼品卡商品的库存）
+    ↓
+add_gift_cards_to_order() 处理礼品卡抵扣（如果使用了礼品卡支付）
+    ↓
+order.save() 保存订单
+    ↓
+transaction.on_commit → order_created() 订单创建后事件
+    ↓
+检查订单支付状态
+    ↓
+如果已全额支付 → order_charged() → handle_fully_paid_order()
+    ↓
+[关键触发点] handle_fully_paid_order()
+    ├─ 如果 channel.automatically_fulfill_non_shippable_gift_card = True
+    └─ 调用 fulfill_non_shippable_gift_cards()
+        ↓
+        get_non_shippable_gift_card_lines() 筛选无需物流的礼品卡订单行
+        ↓
+        fulfill_gift_card_lines() 履约礼品卡行
+            ↓
+            create_fulfillments() 创建履约单
+                ↓
+                _create_fulfillment_lines() 创建履约行
+                    ├─ 检查库存充足性
+                    ├─ decrease_stock() 扣减库存
+                    └─ 收集 gift_card_lines_info（包含 quantity）
+                ↓
+                order_fulfilled() 履约完成
+                    ↓
+                    [核心签发] gift_cards_create(order, gift_card_lines_info, ...)
+                        ├─ 遍历每个 gift_card_lines_info
+                        ├─ 按 line_data.quantity 循环生成 GiftCard 实例
+                        ├─ GiftCard.objects.bulk_create() 批量创建
+                        ├─ BOUGHT 事件记录
+                        └─ 发送礼品卡邮件给客户
+```
+
+### 关键代码位置
+
+**1. 触发点：订单全额支付后**
+
+**文件**: `saleor/order/actions.py:382-405`
+
+```python
+def handle_fully_paid_order(...):
+    # ...
+    if order_info.channel.automatically_fulfill_non_shippable_gift_card:
+        order_lines = [line.line for line in order_info.lines_data]
+        fulfill_non_shippable_gift_cards(
+            order, order_lines, site_settings, user, app, manager
+        )
+```
+
+**2. 筛选礼品卡订单行**
+
+**文件**: `saleor/giftcard/utils.py:103-113`
+
+```python
+def get_non_shippable_gift_card_lines(lines: Iterable[OrderLine]) -> "QuerySet":
+    gift_card_lines = get_gift_card_lines(lines)  # is_gift_card = True
+    non_shippable_lines = OrderLine.objects.filter(
+        id__in=[line.pk for line in gift_card_lines], 
+        is_shipping_required=False  # 无需物流
+    )
+    return non_shippable_lines
+```
+
+**3. 履约创建与库存扣减顺序**
+
+**文件**: `saleor/order/actions.py:1094-1219` (`_create_fulfillment_lines`)
+
+```python
+def _create_fulfillment_lines(...):
+    # 1. 检查库存
+    for line in lines_data:
+        # ... 检查 stock 是否充足 ...
+        if stock is None and not allow_stock_to_be_exceeded:
+            raise InsufficientStock(...)
+    
+    # 2. 扣减库存（在履约创建时执行）
+    if lines_info and should_decrease_stock:
+        decrease_stock(lines_info, ...)
+    
+    # 3. 收集礼品卡行信息（包含 quantity）
+    for line in lines_data:
+        if order_line.is_gift_card:
+            gift_card_lines_info.append(
+                GiftCardLineData(
+                    quantity=fulfillment_line.quantity,  # 订单行数量 = 礼品卡张数
+                    order_line=order_line,
+                    variant=variant,
+                    fulfillment_line=fulfillment_line,
+                )
+            )
+```
+
+**4. 核心签发逻辑**
+
+**文件**: `saleor/giftcard/utils.py:162-216`
+
+```python
+@traced_atomic_transaction()
+def gift_cards_create(order, gift_card_lines_info, settings, requestor_user, app, manager):
+    expiry_date = calculate_expiry_date(settings)
+    gift_cards = []
+    for line_data in gift_card_lines_info:
+        order_line = line_data.order_line
+        price = order_line.unit_price_gross  # 礼品卡面值 = 订单行单价
+        # 关键：按 quantity 生成对应张数的礼品卡
+        line_gift_cards = [
+            GiftCard(
+                code=generate_promo_code(),
+                initial_balance=price,
+                current_balance=price,
+                created_by=customer_user,
+                created_by_email=user_email,
+                product=line_data.variant.product,
+                fulfillment_line=line_data.fulfillment_line,
+                expiry_date=expiry_date,
+            )
+            for _ in range(line_data.quantity)  # 订单行数量 → 礼品卡张数
+        ]
+        gift_cards.extend(line_gift_cards)
+    
+    # 批量创建礼品卡
+    gift_cards = GiftCard.objects.bulk_create(gift_cards)
+    events.gift_cards_bought_event(gift_cards, order, requestor_user, app)
+    # ... 发送邮件 ...
+    return gift_cards
+```
+
+### 库存扣减、履约、签发的先后关系
+
+| 步骤 | 操作 | 代码位置 | 说明 |
+|------|------|---------|------|
+| 1 | **库存分配 (Allocate)** | `complete_checkout.py:835` | 结账完成时，调用 `allocate_stocks()` 锁定库存 |
+| 2 | **订单创建** | `complete_checkout.py:807` | 创建 Order 和 OrderLine |
+| 3 | **订单支付确认** | `order/actions.py:334-345` | 检查 `charge_status`，如果已支付触发 `handle_fully_paid_order()` |
+| 4 | **自动履约** | `order/actions.py:401-405` | 调用 `fulfill_non_shippable_gift_cards()` |
+| 5 | **库存扣减 (Decrease)** | `order/actions.py:1210-1215` | `decrease_stock()` 实际扣减库存 |
+| 6 | **礼品卡签发** | `giftcard/utils.py:162-216` | `gift_cards_create()` 生成礼品卡实例 |
+
+> **重要**: 礼品卡的签发发生在**库存扣减之后**。这意味着：
+> 1. 如果库存不足，会在 `_create_fulfillment_lines` 阶段抛出 `InsufficientStock` 异常
+> 2. 只有库存扣减成功后，才会生成礼品卡
+> 3. 订单行的 `quantity` 字段直接决定了生成多少张礼品卡
+
+---
+
+## 补充细节二：新支付网关余额冻结的完整时序
+
+### 时序图
+
+```
+[transactionInitialize] 初始化支付会话
+    ↓
+payment/utils.py: handle_transaction_initialize_session()
+    ↓
+识别到 GIFT_CARD_PAYMENT_GATEWAY_ID
+    ↓
+giftcard/gateway.py: transaction_initialize_session_with_gift_card_payment_method()
+    ├─ try 块:
+    │   ├─ validate_transaction_session_data() 验证数据格式
+    │   └─ validate_and_get_gift_card()
+    │       ├─ GiftCard.objects.active().filter(code=...).select_for_update() 加行锁
+    │       └─ 检查余额 >= 请求金额
+    │
+    ├─ finally 块 (无论成功失败都执行):
+    │   ├─ detach_gift_card_from_previous_checkout_transactions()
+    │   │   ├─ 查找该礼品卡关联的其他未完成 checkout 交易
+    │   │   ├─ 对每个旧交易创建 CANCEL 事件
+    │   │   └─ 清除旧交易的 gift_card 关联
+    │   └─ attach_gift_card_to_transaction()
+    │       ├─ 设置 transaction.gift_card = gift_card
+    │       ├─ 设置 payment_method_type = GIFT_CARD
+    │       └─ 设置 gift_card_last_chars, gift_card_brand
+    │
+    └─ 返回 AUTHORIZATION_SUCCESS / AUTHORIZATION_FAILURE
+    ↓
+[交易已授权] 礼品卡通过 Transaction 与当前 Checkout 绑定
+    ↓
+[可选操作 1: 取消授权]
+    ↓
+graphql/payment/mutations/transaction/transaction_request_action.py
+    ↓
+action = TransactionAction.CANCEL
+    ↓
+cancel_gift_card_transaction()
+    ├─ 检查 checkout 是否存在、CANCEL 是否在 available_actions 中
+    ├─ 创建 CANCEL_SUCCESS 事件
+    └─ 注意：不修改礼品卡余额（因为从未扣款）
+    ↓
+[授权已取消] 礼品卡可被其他 checkout 使用
+
+[可选操作 2: 订单确认 → 扣款]
+    ↓
+order/actions.py: order_confirmed()
+    ↓
+charge_gift_card_transactions()
+    ├─ 筛选未扣款的礼品卡交易
+    ├─ 再次 select_for_update() 锁定礼品卡
+    ├─ charge_gift_card() 扣减余额
+    └─ 记录 USED_IN_ORDER 事件
+    ↓
+[扣款完成] 余额已实际扣除
+
+[可选操作 3: 退款]
+    ↓
+action = TransactionAction.REFUND
+    ↓
+refund_gift_card_transaction()
+    ├─ select_for_update() 锁定礼品卡
+    ├─ F("current_balance_amount") + amount 原子增加余额
+    └─ 记录 REFUNDED_IN_ORDER 事件
+    ↓
+[退款完成] 余额已恢复
+```
+
+### 避免重复占用的三重机制
+
+**机制 1：行级锁 (select_for_update)**
+
+**文件**: `saleor/giftcard/gateway.py:137, 303`
+
+```python
+# 授权时锁定
+gift_card = (
+    GiftCard.objects.active(date=timezone.now().date())
+    .filter(code=code, currency=currency)
+    .select_for_update()  # 行级锁，其他请求等待
+    .get()
+)
+
+# 扣款时再次锁定
+gift_card = (
+    GiftCard.objects.filter(id=gift_card_transaction.gift_card_id)
+    .select_for_update()
+    .get()
+)
+```
+
+**机制 2：自动分离旧交易 (detach_gift_card_from_previous_checkout_transactions)**
+
+**文件**: `saleor/giftcard/gateway.py:179-224`
+
+```python
+def detach_gift_card_from_previous_checkout_transactions(gift_card):
+    # 找出同一礼品卡关联的其他 checkout 交易
+    transactions_to_cancel_qs = TransactionItem.objects.filter(
+        Q(app_identifier=GIFT_CARD_PAYMENT_GATEWAY_ID),
+        Q(gift_card=gift_card),
+        Q(checkout_id__isnull=False),  # 关联到 checkout
+        Q(order_id__isnull=True),      # 尚未生成订单
+    )
+    
+    for transaction_item in transactions_to_cancel_qs:
+        # 创建 CANCEL 事件，通知旧 checkout 授权已失效
+        create_transaction_event_requested(
+            transaction_item,
+            transaction_item.amount_authorized.amount,
+            TransactionAction.CANCEL,
+            ...
+        )
+    
+    # 移除旧交易的礼品卡关联
+    transactions_to_cancel_qs.update(gift_card=None)
+```
+
+**机制 3：不重复扣款校验**
+
+**文件**: `saleor/giftcard/gateway.py:306-316`
+
+```python
+gift_card_transactions = order.payment_transactions.filter(
+    ~Exists(  # 确保没有 CHARGE_REQUEST 事件，即未扣款过
+        TransactionEvent.objects.filter(
+            transaction=OuterRef("pk"), 
+            type=TransactionEventType.CHARGE_REQUEST
+        )
+    ),
+    app_identifier=GIFT_CARD_PAYMENT_GATEWAY_ID,
+    gift_card__isnull=False,
+    authorized_value__gt=Decimal(0),
+    charged_value=Decimal(0),  # 已扣款金额为 0
+)
+```
+
+### 取消授权 vs 退款的区别
+
+| 操作 | 触发时机 | 余额变化 | 事件类型 |
+|------|---------|---------|---------|
+| **CANCEL (取消授权)** | 订单确认前，用户取消支付或礼品卡被其他 checkout 占用 | 余额不变（从未扣款） | `CANCEL_SUCCESS` |
+| **REFUND (退款)** | 订单确认并扣款后，需要退回资金 | 余额增加（使用 `F()` 表达式） | `REFUNDED_IN_ORDER` |
+
+**取消授权代码**: `saleor/giftcard/gateway.py:348-381`
+
+```python
+def cancel_gift_card_transaction(transaction_item, request_event):
+    # 不修改礼品卡余额，只记录事件
+    response = {
+        "result": TransactionEventType.CANCEL_SUCCESS.upper(),
+        "pspReference": str(uuid4()),
+        "amount": amount,
+    }
+    create_transaction_event_from_request_and_webhook_response(...)
+```
+
+**退款代码**: `saleor/giftcard/gateway.py:384-448`
+
+```python
+def refund_gift_card_transaction(transaction_item, request_event, user=None, app=None):
+    with transaction.atomic():
+        gift_card = (
+            GiftCard.objects.filter(id=transaction_item.gift_card_id)
+            .select_for_update()
+            .get()
+        )
+        # 使用 F() 表达式原子增加余额
+        gift_card.current_balance_amount = F("current_balance_amount") + amount
+        gift_card.save(update_fields=["current_balance_amount"])
+        # 记录退款事件
+        gift_card_refunded_in_order_event(...)
+```
+
+### 余额"冻结"的本质
+
+Saleor 没有显式的"冻结余额"字段，所谓的"冻结"是通过以下方式隐式实现的：
+
+1. **绑定关系锁定**: 礼品卡通过 `TransactionItem.gift_card` 外键与特定交易绑定
+2. **自动分离机制**: 新授权自动分离旧授权，确保同一时间只有一个 checkout 能使用
+3. **事务行锁**: `select_for_update()` 在关键操作时锁定行，防止并发修改
+4. **余额校验**: 每次操作前重新校验余额，确保不会超扣
+
+这种设计避免了维护单独的"冻结余额"字段带来的一致性问题，但也意味着：
+- 如果 checkout 长期不完成，礼品卡余额不会被真正扣除
+- 如果用户在多个浏览器标签页尝试使用同一张礼品卡，后一个会自动取消前一个的授权

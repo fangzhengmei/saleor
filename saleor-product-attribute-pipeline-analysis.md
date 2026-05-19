@@ -368,10 +368,16 @@ mark_products_search_vector_as_dirty_in_batches(product_ids)
    - `AssignedProductAttributeValue` 记录仍然存在于数据库中
    - 原因：避免意外数据丢失，允许重新绑定后恢复
 
-2. **查询时的过滤机制**:
-   - 产品属性查询通过 `ProductType` → `AttributeProduct` → `Attribute` 路径获取可用属性
-   - 已解绑属性的 `AssignedProductAttributeValue` 不会出现在查询结果中
-   - 但数据库中存在"僵尸"记录，需要定期清理
+2. **⚠️ 明确区分：属性字段查询 vs 按属性值过滤**
+
+   | 操作类型 | 行为 | 数据来源 |
+   |----------|------|----------|
+   | **属性字段查询**<br>`Product { attributes { ... } }` | ❌ 已解绑属性**不返回** | 通过 `ProductType → AttributeProduct → Attribute` 路径 |
+   | **按属性值过滤**<br>`products(filter: {attributes: [...]})` | ✅ 已解绑属性**仍命中** | 直接查询 `AssignedProductAttributeValue` 表 |
+
+   - GraphQL 属性查询通过 `AttributeProduct` 关联过滤，已解绑属性不会出现在查询结果中
+   - 属性值过滤**不检查** `AttributeProduct` 关联，只要 `AssignedProductAttributeValue` 记录存在就会命中
+   - 数据库中存在"僵尸"记录，需要定期清理（详见第7章）
 
 3. **索引重建策略**:
    - 解绑后标记该产品类型下**所有产品**为 `search_index_dirty`
@@ -712,6 +718,54 @@ class AssignedProductAttributeValue(SortableModel):
 | 搜索向量通过 `AttributeProduct` 获取属性 | 1. 索引内容准确反映当前配置<br>2. 已解绑属性自然排除 | 1. 需要异步重建索引<br>2. 存在 T1-T2 不一致窗口 |
 
 **核心取舍原则**: Saleor 选择了**性能和数据保留优先**，将一致性保证交给业务层处理。
+
+---
+
+### 7.10 最终结论：统一口径
+
+经过逐条代码核对，以下是关于"属性解绑后过滤是否命中遗留绑定值"的**最终、无冲突**结论：
+
+#### 1. 行为边界的本质区分
+
+| 维度 | 属性字段查询<br>`Product { attributes { ... } }` | 按属性值过滤<br>`products(filter: {attributes: [...]})` | 全文搜索<br>`products(search: "...")` |
+|------|-----------------------------------------------|-----------------------------------------------------|---------------------------------------|
+| **数据来源** | `AttributeProduct` 关联表 | `AssignedProductAttributeValue` 表 | `Product.search_vector` 字段 |
+| **是否检查关联** | ✅ 检查 | ❌ 不检查 | 取决于索引重建时机 |
+| **解绑后行为** | ❌ 不返回已解绑属性 | ✅ **仍命中**遗留绑定值 | 索引重建前：命中<br>索引重建后：不命中 |
+| **一致性保证** | 与解绑操作强一致 | 与解绑操作**不一致** | 最终一致（异步） |
+
+#### 2. 为什么会产生这种不一致？
+
+这不是 bug，而是**有意的架构设计**：
+
+1. **过滤查询的设计目标**：只要产品曾经被赋予过某个属性值，就应该能被筛选出来。解绑只是"从产品类型的属性定义中移除"，不是"删除产品上已有的属性值"。
+
+2. **属性查询的设计目标**：只显示当前产品类型定义中的属性。解绑后，该属性不再是产品类型的一部分，因此不显示。
+
+3. **搜索索引的设计目标**：反映**当前**产品配置的搜索权重。解绑后，该属性不再参与索引构建。
+
+#### 3. 对业务层的建议
+
+如果你的业务场景需要强一致，可以采用以下策略：
+
+| 需求 | 实现方案 | 代价 |
+|------|---------|------|
+| 解绑后立即不能过滤 | 解绑时级联删除 `AssignedProductAttributeValue` 记录 | 数据不可恢复，解绑操作变慢 |
+| 解绑后仍能过滤 | 使用默认行为 | 与属性查询/搜索结果不一致 |
+| 渐进式清理 | 定期运行清理任务删除"僵尸"记录 | 存在不一致窗口 |
+| 业务层校验 | 在前端隐藏已解绑属性的筛选器 | 需要维护业务逻辑 |
+
+#### 4. 代码验证清单
+
+以下是验证上述结论的关键代码位置，可自行核对：
+
+| 结论 | 验证代码位置 |
+|------|-------------|
+| 属性查询检查关联 | `saleor/graphql/attribute/dataloaders/assigned_attributes.py:59` |
+| 过滤查询不检查关联 | `saleor/graphql/product/filters/product_attributes.py:325-336` |
+| 搜索索引检查关联 | `saleor/product/search.py:130` |
+| 解绑只删关联表 | `saleor/graphql/product/mutations/attributes.py:323-325` |
+| 级联删除定义 | `saleor/attribute/models/product.py:9-22` |
 
 ---
 

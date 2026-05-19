@@ -164,7 +164,54 @@ def resolve_products(_root, info: ResolveInfo, *, channel=None, **kwargs):
 - 管理员用户不传 channel 时允许跨渠道查询
 - 注入默认渠道后，`limited_channel_access` 仍为 `False`（因为用户没传）
 
-### 2.3 Resolvers 层：可见性过滤 (`saleor/graphql/product/resolvers.py:116-139`)
+### 2.3 无效 channel slug 的退化路径 (`saleor/graphql/channel/utils.py:14-36`)
+
+当用户传入无效的 channel slug 时，系统有一套完整的退化路径：
+
+```
+用户传入 channel="invalid-slug"
+    │
+    ▼
+Schema 层：ChannelBySlugLoader.load("invalid-slug")
+    │
+    ▼
+DataLoader 批量查询：Channel.objects.in_bulk(["invalid-slug"], field_name="slug")
+    │
+    ▼
+返回 None（渠道不存在）
+    │
+    ▼
+_resolve_product(channel_obj=None) 被调用，channel_obj 为 None
+    │
+    ▼
+调用 resolvers.resolve_product(info, ..., channel=None, ...)
+    │
+    ▼
+visible_to_user(requestor, channel=None, limited_channel_access=True)
+    │
+    ├─ 管理员分支：
+    │   limited_channel_access=True + channel=None → 返回空
+    │
+    └─ 普通用户分支：
+        channel=None → 返回空
+    │
+    ▼
+product = None
+    │
+    ▼
+返回 None（GraphQL 中表现为 null）
+```
+
+**关键注意点：**
+- `ChannelBySlugLoader` 不会抛出异常，找不到时返回 `None`
+- `limited_channel_access=True` 但 `channel=None` 时，`visible_to_user` 始终返回空
+- 整个流程静默失败，不会返回错误信息，只是返回 `null`
+
+**与 mutation 的区别：**
+- Mutation 会调用 `validate_channel()`，不存在时抛出 `ValidationError`
+- Query 走 DataLoader 路径，不存在时静默返回 `null`
+
+### 2.4 Resolvers 层：可见性过滤 (`saleor/graphql/product/resolvers.py:116-139`)
 
 **重要：visible_to_user 只负责可见性过滤，不做价格、库存等其他判断。**
 
@@ -234,14 +281,68 @@ def visible_to_user(self, requestor, channel, limited_channel_access):
 
 | 请求者 | channel 参数 | limited_channel_access | 触发场景 | visible_to_user 返回 |
 |--------|-------------|------------------------|----------|---------------------|
-| 管理员 | 有值        | True                   | 管理员指定渠道查询 | 该渠道下有 listing 的产品 |
+| 管理员 | 有值（有效）| True                   | 管理员指定有效渠道查询 | 该渠道下有 listing 的产品 |
+| 管理员 | 有值（无效）| True                   | 管理员指定无效渠道查询（channel_obj=None） | 空 |
 | 管理员 | None        | False                  | 管理员跨渠道查询 | 所有产品 |
 | 管理员 | None        | True                   | 理论不会出现 | 空 |
-| 普通用户 | 有值      | True                   | 用户指定渠道查询 | 已发布 + 有变体检索到 |
+| 普通用户 | 有值（有效）| True                   | 用户指定有效渠道查询 | 已发布 + 有变体检索到 |
+| 普通用户 | 有值（无效）| True                   | 用户指定无效渠道查询（channel_obj=None） | 空 |
 | 普通用户 | None      | False                  | Schema 层注入默认渠道 | 已发布 + 有变体检索到 |
 | 普通用户 | None      | True                   | 理论不会出现 | 空 |
 
-### 2.5 `published_with_variants` 完整逻辑 (`saleor/product/managers.py:55-73`)
+### 2.5 详情可见与列表可见的判定差异
+
+`visible_to_user` 只负责基础可见性过滤，而列表页还有额外的 `visible_in_listings` 过滤。两者的差异在 **resolvers 层** 体现：
+
+**详情查询（resolve_product）- `saleor/graphql/product/resolvers.py:88-112`：**
+```python
+def resolve_product(info, ..., channel, limited_channel_access, requestor):
+    # 只调用 visible_to_user，不检查 visible_in_listings
+    qs = models.Product.objects.using(...).visible_to_user(
+        requestor, channel, limited_channel_access
+    )
+    # 按 ID/slug 过滤，直接返回单个产品
+    return qs.filter(id=id).first()
+```
+
+**列表查询（resolve_products）- `saleor/graphql/product/resolvers.py:116-139`：**
+```python
+def resolve_products(info, requestor, channel, limited_channel_access):
+    # 1. 先调用 visible_to_user 做基础可见性过滤
+    qs = models.Product.objects.using(...).visible_to_user(
+        requestor, channel, limited_channel_access
+    )
+
+    # 2. 普通用户额外过滤：只显示 visible_in_listings=True 的产品
+    if not has_one_of_permissions(requestor, ALL_PRODUCTS_PERMISSIONS):
+        if channel:
+            product_channel_listings = (
+                models.ProductChannelListing.objects.using(...)
+                .filter(channel_id=channel.id, visible_in_listings=True)
+                .values("id")
+            )
+            qs = qs.filter(
+                Exists(product_channel_listings.filter(product_id=OuterRef("pk")))
+            )
+
+    return ChannelQsContext(qs=qs, channel_slug=channel_slug)
+```
+
+**差异对比表：**
+
+| 判定维度 | 详情可见（resolve_product） | 列表可见（resolve_products） |
+|----------|-----------------------------|-----------------------------|
+| visible_to_user 过滤 | ✅ 是 | ✅ 是 |
+| visible_in_listings 过滤 | ❌ 否 | ✅ 是（仅普通用户） |
+| 管理员可见范围 | 所有已发布产品（跨渠道） | 所有已发布产品（跨渠道） |
+| 普通用户可见范围 | 已发布 + 有变体检索到 | 已发布 + 有变体检索到 + visible_in_listings=True |
+
+**设计意图：**
+- 产品可以在详情页可见，但不在列表中展示（用于预热、预售等场景）
+- 管理员可以看到所有产品，不受 `visible_in_listings` 限制
+- 普通用户在列表页只看到明确设置为"列表可见"的产品
+
+### 2.6 `published_with_variants` 完整逻辑 (`saleor/product/managers.py:55-73`)
 
 ```python
 def published_with_variants(self, channel: Channel):
@@ -578,17 +679,17 @@ def resolve_is_available(
     def check_variant_availability():
         # 根据权限选择不同的变体加载器
         if has_required_permissions and not channel_slug:
-            # 管理员跨渠道：加载所有变体
+            # 分支 1：管理员跨渠道：加载所有变体
             variants = ProductVariantsByProductIdLoader(info.context).load(
                 root.node.id
             )
         elif has_required_permissions and channel_slug:
-            # 管理员指定渠道：加载该渠道下的所有变体（含未定价的）
+            # 分支 2：管理员指定渠道：加载该渠道下的所有变体（含未定价的）
             variants = ProductVariantsByProductIdAndChannel(info.context).load(
                 (root.node.id, channel_slug)
             )
         else:
-            # 普通用户：只加载该渠道下有定价的可用变体
+            # 分支 3：普通用户：只加载该渠道下有定价的可用变体
             variants = AvailableProductVariantsByProductIdAndChannel(
                 info.context
             ).load((root.node.id, channel_slug))
@@ -628,6 +729,50 @@ def resolve_is_available(
         .then(check_is_available_for_purchase)  # 先过时间门槛
     )
 ```
+
+### 4.2.1 is_available 中保留但不可达的分支
+
+`check_variant_availability()` 函数中的三个分支，**分支 1 在当前代码路径下是不可达的**：
+
+```python
+def check_variant_availability():
+    if has_required_permissions and not channel_slug:
+        # 分支 1：管理员跨渠道
+        # ⚠️ 不可达！因为 resolve_is_available 开头已检查 root.channel_slug
+        variants = ProductVariantsByProductIdLoader(info.context).load(...)
+    elif has_required_permissions and channel_slug:
+        # 分支 2：管理员指定渠道 - 可达
+        variants = ProductVariantsByProductIdAndChannel(info.context).load(...)
+    else:
+        # 分支 3：普通用户 - 可达
+        variants = AvailableProductVariantsByProductIdAndChannel(...).load(...)
+```
+
+**为什么分支 1 不可达：**
+
+```python
+def resolve_is_available(root: ChannelContext[models.Product], ...):
+    # 函数开头的守卫条件
+    if not root.channel_slug:
+        return None  # ← 如果 channel_slug 为空，直接返回 None
+```
+
+由于函数开头就检查了 `root.channel_slug`，如果为空直接返回 `None`，所以执行到 `check_variant_availability()` 时，`channel_slug` 必然不为空。
+
+**对理解的影响：**
+
+1. **代码可读性困惑**：保留不可达分支会让读者疑惑"什么时候会走到这里？"
+2. **历史演化痕迹**：这个分支可能是早期设计的残留，当时 `resolve_is_available` 可能允许无 channel 查询
+3. **防御性编程**：保留分支是为了防止未来有人删除开头的守卫条件，导致逻辑错误
+4. **实际有效分支**：只有分支 2（管理员指定渠道）和分支 3（普通用户）是真正会执行的
+
+**分支可达性总结：**
+
+| 分支 | 条件 | 是否可达 | 说明 |
+|------|------|----------|------|
+| 1 | `has_required_permissions AND NOT channel_slug` | ❌ 不可达 | 开头守卫已过滤 channel_slug 为空的情况 |
+| 2 | `has_required_permissions AND channel_slug` | ✅ 可达 | 管理员指定渠道查询 |
+| 3 | 其他情况 | ✅ 可达 | 普通用户查询 |
 
 ### 4.3 is_available_for_purchase 的独立解析 (`saleor/graphql/product/types/products.py:1635-1666`)
 

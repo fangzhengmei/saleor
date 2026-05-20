@@ -1035,14 +1035,14 @@ TransactionItem.gift_card = gift_card
 TransactionItem.checkout_id = checkout.token
 TransactionItem.order_id = None
     ↓
-[礼品卡被此 checkout 独占，其他 checkout 授权会触发 detach]
+[Checkout 阶段：其他 checkout 授权会触发 detach，抢占礼品卡]
     ↓
 [Checkout 完成 → 生成订单]
     ↓
 TransactionItem.order_id = order.id
 TransactionItem.checkout_id = None  ← 关键变化
     ↓
-[礼品卡被此订单独占，新的 checkout 授权不会触发 detach]
+[订单阶段：detach 不再分离此交易，但余额校验仍拦截超扣]
     ↓
 [订单确认 → 扣款]
     ↓
@@ -1053,26 +1053,111 @@ GiftCard.current_balance_amount -= authorized_value
 [占用结束，礼品卡余额已实际扣除]
 ```
 
-### 关键边界条件
+### 关键边界条件与统一结论
 
-**场景 1：同一礼品卡在两个 checkout 中授权**
-- Checkout A 授权 → 礼品卡绑定 Transaction A
-- Checkout B 授权 → 触发 detach，取消 Transaction A，礼品卡绑定 Transaction B
-- Checkout A 完成 → Transaction A 已被取消，无法扣款
+#### 授权请求的拦截条件
 
-**场景 2：礼品卡授权后生成订单，但尚未扣款**
-- Checkout A 授权 → 礼品卡绑定 Transaction A
-- Checkout A 完成 → Transaction A.order_id = Order Z.id
-- Checkout B 授权 → 不会触发 detach（因为 Transaction A.order_id 不为空），但**余额校验仍会检查礼品卡剩余余额
-- Checkout B 授权成功 → 如果礼品卡余额仍足够，Transaction B 也能授权成功（两张订单共享同一张礼品卡余额）
-- Order Z 先扣款 → 礼品卡余额减少
-- Checkout B 完成 → 尝试扣款时发现礼品卡余额不足（被 Order Z 先扣走了）
+当礼品卡已关联到某个订单但尚未扣款时，新的授权请求是否被拦截取决于**两个独立检查**：
 
-> **重要**：detach 不分离已关联订单的交易，意味着**同一张礼品卡可以被多个订单授权，最终由扣款时的余额校验决定谁能成功
+| 检查点 | 触发条件 | 结果 | 代码位置 |
+|--------|---------|------|---------|
+| **1. Detach 检查** | 旧交易满足 `checkout_id__isnull=False` AND `order_id__isnull=True` | ✅ 旧交易被取消，新授权成功 | `gateway.py:196-199` |
+| **2. 余额校验** | `请求金额 > gift_card.current_balance_amount` | ❌ 授权失败，余额不足 | `gateway.py:145-149` |
+
+> **统一结论**：在"结账转订单但未扣款"阶段：
+> - ❌ **不会被 detach 拦截**：旧交易的 `checkout_id` 已清空，不满足 detach 条件
+> - ✅ **仍会被余额校验拦截**：只要余额足够，新授权可以成功
+> - ⚠️ **存在并发风险**：同一张礼品卡可能被多个订单授权，最终只有先扣款的订单能成功
+
+---
+
+**场景 1：同一礼品卡在两个 checkout 中授权（Checkout 阶段）**
+
+| 操作 | Detach 检查 | 余额校验 | 结果 |
+|------|------------|---------|------|
+| Checkout A 授权 | - | 通过 | 礼品卡绑定 Transaction A |
+| Checkout B 授权 | 触发 detach（Transaction A 仍在 checkout 阶段） | 通过 | Transaction A 被取消，礼品卡绑定 Transaction B |
+| Checkout A 完成 | - | - | Transaction A 已被取消，无法扣款 |
+
+**代码证据**：`gateway.py:196-199`
+```python
+transactions_to_cancel_qs = TransactionItem.objects.filter(
+    Q(app_identifier=GIFT_CARD_PAYMENT_GATEWAY_ID),
+    Q(gift_card=gift_card),
+    Q(checkout_id__isnull=False),  # Transaction A 满足
+    Q(order_id__isnull=True),       # Transaction A 满足
+)  # → Transaction A 被分离
+```
+
+---
+
+**场景 2：礼品卡授权后生成订单，但尚未扣款（订单阶段）**
+
+| 操作 | Detach 检查 | 余额校验 | 结果 |
+|------|------------|---------|------|
+| Checkout A 授权 | - | 通过 | 礼品卡绑定 Transaction A |
+| Checkout A 完成 → Order Z | - | - | Transaction A.order_id = Order Z.id, checkout_id = None |
+| Checkout B 授权 | ❌ 不触发（Transaction A.order_id 不为空） | ✅ 余额足够时通过 | Transaction B 也能授权成功 |
+| Order Z 先扣款 | - | - | 礼品卡余额减少 |
+| Checkout B 完成 → Order Y | - | ❌ 余额不足 | Order Y 扣款失败 |
+
+**代码证据 1：Detach 不分离已关联订单的交易**
+`gateway.py:196-199`
+```python
+transactions_to_cancel_qs = TransactionItem.objects.filter(
+    Q(app_identifier=GIFT_CARD_PAYMENT_GATEWAY_ID),
+    Q(gift_card=gift_card),
+    Q(checkout_id__isnull=False),  # Transaction A.checkout_id = None → 不满足
+    Q(order_id__isnull=True),       # Transaction A.order_id = Z → 不满足
+)  # → Transaction A 不被分离
+```
+
+**代码证据 2：余额校验始终生效**
+`gateway.py:145-149`
+```python
+if transaction_session_data.action.amount > gift_card.current_balance_amount:
+    raise GiftCardPaymentGatewayException(
+        msg=f"Gift card has insufficient amount ..."
+    )
+```
+
+**代码证据 3：扣款时二次校验**
+`gateway.py:307-314`
+```python
+if gift_card_transaction.authorized_value > gift_card.current_balance_amount:
+    response["message"] = (
+        f"Gift card has insufficient amount ..."
+    )
+else:
+    charge_gift_card(gift_card, authorized_value, order)
+```
+
+---
 
 **场景 3：订单取消但礼品卡未扣款**
 - 需要手动调用 CANCEL 操作释放礼品卡占用
 - 或通过订单取消流程自动处理（需检查具体实现）
+- 注意：即使不手动取消，新的 checkout 授权仍可能成功（只要余额足够）
+
+---
+
+### 授权入口的额外限制
+
+礼品卡授权只能在 Checkout 上发起，不能直接在 Order 上授权：
+
+**文件**: `saleor/giftcard/gateway.py:111-114`
+
+```python
+def validate_transaction_session_data(transaction_session_data, source_object):
+    if not isinstance(source_object, Checkout):
+        raise GiftCardPaymentGatewayException(
+            msg=f"Cannot initialize transaction for payment gateway: {GIFT_CARD_PAYMENT_GATEWAY_ID} and object type other than Checkout."
+        )
+```
+
+这意味着：
+- ✅ 可以在新的 Checkout 上授权已被其他 Order 占用的礼品卡（只要余额足够）
+- ❌ 不能直接在 Order 上追加礼品卡授权
 
 ---
 

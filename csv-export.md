@@ -122,9 +122,350 @@ def export_started_event(*, export_file: "ExportFile", user=None, app=None) -> N
     )
 ```
 
-## 三、第二阶段：后台执行编排
+## 三、关键细节深度剖析
 
-### 3.1 Celery 任务定义
+### 3.1 成功通知与任务状态回写的先后顺序
+
+这是一个非常容易混淆的执行顺序问题。让我们从代码层面精确核对：
+
+**执行时序（以 `export_products` 为例）：**
+
+```
+export_products_task 函数
+│
+├─► 读取 ExportFile
+├─► 调用 export_products(export_file, scope, ...)
+│   │
+│   ├─► 生成文件名
+│   ├─► 构建查询集
+│   ├─► 分批导出数据到临时文件
+│   ├─► 【步骤 1】save_csv_file_in_export_file()  # 保存文件到 content_file
+│   ├─► 关闭临时文件
+│   └─► 【步骤 2】send_export_download_link_notification()  # 触发通知
+│
+├─► export_products_task 函数返回
+│
+└─► Celery 框架自动调用 on_success() 回调
+    ├─► 【步骤 3】更新 ExportFile.status = SUCCESS
+    └─► 创建 ExportEvent (type=EXPORT_SUCCESS)
+```
+
+**关键代码证据**：
+
+1. **`export_products` 内部顺序**（`saleor/csv/utils/export.py:59-61`）：
+```python
+save_csv_file_in_export_file(export_file, temporary_file, file_name)  # 第59行
+temporary_file.close()                                                 # 第60行
+send_export_download_link_notification(export_file, "products")        # 第61行
+```
+
+2. **`on_success` 回调时机**（`saleor/csv/tasks.py:49-57`）：
+```python
+def on_success(self, retval, task_id, args, kwargs):
+    # 这个方法由 Celery 框架在任务函数返回后自动调用
+    export_file_id = args[0]
+    export_file = ExportFile.objects.get(pk=export_file_id)
+    export_file.status = JobStatus.SUCCESS  # 这里才更新状态
+    ...
+```
+
+**重要结论**：
+- ✅ **通知发送时，ExportFile.status 仍然是 PENDING**
+- ✅ 通知 payload 中的 `status` 字段值为 `PENDING`，而非 `SUCCESS`
+- ✅ `EXPORT_SUCCESS` 事件在通知之后才记录
+- ✅ 这是**设计使然**：通知负责投递下载链接，状态回写是框架层面的职责
+
+**通知 payload 生成时的状态**（`saleor/csv/notifications.py:13-26`）：
+```python
+def get_default_export_payload(export_file: "ExportFile") -> dict:
+    return {
+        ...
+        "status": export_file.status,  # 此时仍为 PENDING
+        ...
+    }
+```
+
+---
+
+### 3.2 失败路径为何仍触发完成类 webhook 方法
+
+这是一个有争议的设计，甚至存在潜在的 bug。让我们深入分析：
+
+**问题代码**（`saleor/csv/notifications.py:67-73`）：
+```python
+def send_export_failed_info(export_file: "ExportFile", data_type: str):
+    ...
+    manager.notify(NotifyEventType.CSV_EXPORT_FAILED, payload_func=handler.payload)
+    # 👇 即使失败，仍然调用 *export_completed 方法
+    if data_type == "gift cards":
+        manager.gift_card_export_completed(export_file)
+    if data_type == "products":
+        manager.product_export_completed(export_file)
+    if data_type == "voucher codes":
+        manager.voucher_code_export_completed(export_file)
+```
+
+**Webhook Plugin 的实现**（`saleor/plugins/webhook/plugin.py:739-755`）：
+```python
+def _trigger_export_event(self, event_type: str, export: "ExportFile"):
+    if webhooks := get_webhooks_for_event(event_type):
+        payload = self._serialize_payload({
+            "id": graphene.Node.to_global_id("ExportFile", export.id),
+            "export": get_default_export_payload(export),
+            "csv_link": build_absolute_uri(export.content_file.url),  # ⚠️ 危险！
+            "recipient_email": export.user.email if export.user else None,
+        })
+        self.trigger_webhooks_async(payload, event_type, webhooks, ...)
+```
+
+**问题分析**：
+
+1. **失败时 content_file 为 None**：
+   - 在 `on_failure` 回调中（`saleor/csv/tasks.py:32`）：`export_file.content_file = None`
+   - 但随后调用 `send_export_failed_info` 时，`content_file` 已经是 `None`
+
+2. **潜在的 AttributeError**：
+   - 如果外部系统订阅了 `PRODUCT_EXPORT_COMPLETED` webhook
+   - `export.content_file.url` 会抛出 `AttributeError: 'NoneType' object has no attribute 'url'`
+   - 导致 webhook 通知失败
+
+3. **设计意图推测**：
+   - 从 `base_plugin.py` 中的注释可以看出，这些方法已标记为 **deprecated**：
+   ```python
+   # Note: This method is deprecated and will be removed in a future release.
+   # Webhook-related functionality will be moved from the plugin to core modules.
+   gift_card_export_completed: Callable[["ExportFile", None], None]
+   ```
+   - 可能是为了**保持向后兼容**，无论成功失败都通知外部系统"导出流程已结束"
+   - 外部系统需要通过 payload 中的 `status` 字段判断实际结果
+
+4. **为何 Admin Email Plugin 不会崩溃**：
+   - Admin Email Plugin 的 `send_csv_export_failed` 不访问 `content_file.url`
+   - 它只使用 `CSV_EXPORT_FAILED` 事件，payload 中不包含 `csv_link` 字段
+
+---
+
+### 3.3 Scope 参数从 Mutation 到 Celery 再到 Filter 的完整链路
+
+这是一个经过多层校验、转换和反序列化的复杂链路。让我们逐层追踪：
+
+#### 3.3.1 第一层：GraphQL Mutation 校验
+
+**ExportScope 枚举**（`saleor/graphql/csv/enums.py:14-17`）：
+```python
+class ExportScope(BaseEnum):
+    ALL = "all"
+    IDS = "ids"
+    FILTER = "filter"
+```
+
+**`get_scope` 分派逻辑**（`saleor/graphql/csv/mutations/base_export.py:24-30`）：
+```python
+@classmethod
+def get_scope(cls, input, only_type) -> Mapping[str, list | dict | str]:
+    scope = input["scope"]
+    if scope == ExportScope.IDS.value:
+        return cls.clean_ids(input, only_type)    # 校验并转换 ID
+    if scope == ExportScope.FILTER.value:
+        return cls.clean_filter(input)            # 校验 filter 非空
+    return {"all": ""}
+```
+
+**`clean_ids` - Global ID 转换**（`saleor/graphql/csv/mutations/base_export.py:33-45`）：
+```python
+@classmethod
+def clean_ids(cls, input, only_type) -> dict[str, list[str]]:
+    ids = input.get("ids", [])
+    if not ids:
+        raise ValidationError(...)
+    # 调用 get_global_ids_or_error 将 GraphQL global ID 转为数据库主键
+    pks = cls.get_global_ids_or_error(ids, only_type=only_type, field="ids")
+    return {"ids": pks}
+```
+
+**`get_global_ids_or_error` 实现**（`saleor/graphql/core/mutations.py:385-399`）：
+```python
+@classmethod
+def get_global_ids_or_error(cls, ids, only_type=None, field="ids"):
+    try:
+        _nodes_type, pks = resolve_global_ids_to_primary_keys(
+            ids, only_type, raise_error=True
+        )
+    except GraphQLError as e:
+        raise ValidationError(...) from e
+    return pks
+```
+
+**`resolve_global_ids_to_primary_keys` 实现**（`saleor/graphql/utils/__init__.py:60-90`）：
+```python
+def resolve_global_ids_to_primary_keys(ids, graphene_type=None, raise_error=False):
+    pks = []
+    for graphql_id in ids:
+        node_type, _id = from_global_id_or_error(graphql_id)
+        # 校验 ID 类型是否匹配
+        if used_type and str(used_type) != str(node_type):
+            raise GraphQLError(f"Must receive {str(used_type)} id: {graphql_id}.")
+        pks.append(_id)
+    return used_type, pks
+```
+
+#### 3.3.2 第二层：商品导出特有 - Channel 注入
+
+**`add_channel_to_filter_scope`**（`saleor/graphql/csv/mutations/export_products.py:135-175`）：
+```python
+@classmethod
+def add_channel_to_filter_scope(cls, scope: dict, filter_input: dict, export_info: dict):
+    # 检查是否使用了渠道相关的过滤器
+    used_channel_filters = set(filter_input.keys()) & CHANNEL_REQUIRED_FILTERS
+    if not used_channel_filters:
+        return scope
+    
+    channel_pks = export_info.get("channels") or []
+    # 必须恰好指定一个渠道
+    if len(channel_pks) != 1:
+        raise ValidationError(
+            "Exactly one channel must be provided in export_info.channels "
+            f"when using channel-dependent filters: {sorted(used_channel_filters)}."
+        )
+    
+    # 将 channel slug 注入到 filter dict 中
+    updated_filter = {**scope["filter"], "channel": channel.slug}
+    return {"filter": updated_filter}
+```
+
+**渠道相关过滤器**（`saleor/graphql/csv/mutations/export_products.py:27-38`）：
+```python
+CHANNEL_REQUIRED_FILTERS = frozenset([
+    "is_published", "published_from", "is_available",
+    "available_from", "is_visible_in_listing",
+    "price", "minimal_price", "stock_availability",
+])
+```
+
+#### 3.3.3 第三层：Celery 序列化 - 类型丢失问题
+
+Scope 通过 Celery 传递时会经过 **JSON 序列化**，这会导致：
+- `datetime` 对象 → ISO 格式字符串
+- `date` 对象 → ISO 格式字符串
+- 所有非基本类型都会被字符串化
+
+**问题根源**（`saleor/csv/utils/export.py:153` 注释）：
+```python
+def parse_input(data: Any) -> dict[str, str | dict]:
+    """Parse input into correct data types.
+
+    Scope coming from Celery will be passed as strings.  # 👈 关键注释
+    """
+```
+
+#### 3.3.4 第四层：反序列化 - 类型恢复
+
+**`parse_input` 实现**（`saleor/csv/utils/export.py:150-176`）：
+```python
+def parse_input(data: Any) -> dict[str, str | dict]:
+    if "attributes" in data:
+        serialized_attributes = []
+        for attr in data.get("attributes") or []:
+            # 恢复 date_time 类型
+            if "date_time" in attr:
+                if gte := attr["date_time"].get("gte"):
+                    attr["date_time"]["gte"] = datetime.datetime.fromisoformat(gte)
+                if lte := attr["date_time"].get("lte"):
+                    attr["date_time"]["lte"] = datetime.datetime.fromisoformat(lte)
+            # 恢复 date 类型
+            if "date" in attr:
+                if gte := attr["date"].get("gte"):
+                    attr["date"]["gte"] = datetime.date.fromisoformat(gte)
+                if lte := attr["date"].get("lte"):
+                    attr["date"]["lte"] = datetime.date.fromisoformat(lte)
+            serialized_attributes.append(attr)
+        if serialized_attributes:
+            data["attributes"] = serialized_attributes
+    return data
+```
+
+**测试验证**（`saleor/csv/tests/export/test_export.py:936-972`）：
+```python
+def test_parse_input():
+    data = {
+        "attributes": [
+            {
+                "slug": "release-date-time",
+                "date_time": {
+                    "gte": "2019-08-08T00:00:00+02:00",  # 字符串
+                    "lte": "2021-08-08T00:00:00+02:00",  # 字符串
+                },
+            },
+        ],
+    }
+    parsed_data = parse_input(data)
+    # 断言类型已恢复
+    assert isinstance(parsed_data["attributes"][0]["date_time"]["gte"], datetime.datetime)
+    assert isinstance(parsed_data["attributes"][0]["date_time"]["lte"], datetime.datetime)
+```
+
+#### 3.3.5 第五层：Filter 层应用
+
+**`get_queryset` 实现**（`saleor/csv/utils/export.py:136-147`）：
+```python
+def get_queryset(model, filter, scope: dict) -> "QuerySet":
+    queryset = model.objects.using(settings.DATABASE_CONNECTION_REPLICA_NAME).all()
+    if "ids" in scope:
+        # 直接使用主键过滤
+        queryset = model.objects.using(...).filter(pk__in=scope["ids"])
+    elif "filter" in scope:
+        # 先反序列化，再应用过滤器
+        queryset = filter(data=parse_input(scope["filter"]), queryset=queryset).qs
+    queryset = queryset.order_by("pk")
+    return queryset
+```
+
+#### 3.3.6 Scope 完整流转图
+
+```
+GraphQL 输入 (前端)
+    │
+    ▼
+scope = ExportScope.IDS / FILTER / ALL
+    │
+    ├─► IDS: clean_ids()
+    │    └─► get_global_ids_or_error()
+    │         └─► resolve_global_ids_to_primary_keys()
+    │              └─► {"ids": [1, 2, 3]}  # 数据库主键
+    │
+    ├─► FILTER: clean_filter()
+    │    └─► 校验 filter 非空
+    │         └─► {"filter": {...}}
+    │              │
+    │              └─► (商品导出) add_channel_to_filter_scope()
+    │                   └─► 注入 channel slug
+    │                        └─► {"filter": {..., "channel": "default-channel"}}
+    │
+    └─► ALL: {"all": ""}
+    │
+    ▼
+Celery JSON 序列化
+    │  ⚠️  datetime → "2024-01-01T00:00:00+00:00"
+    │  ⚠️  date → "2024-01-01"
+    │
+    ▼
+Celery Worker 接收
+    │
+    ▼
+get_queryset()
+    │
+    ├─► ids: filter(pk__in=scope["ids"])
+    │
+    └─► filter: parse_input(scope["filter"])  # 恢复类型
+              └─► datetime.fromisoformat() / date.fromisoformat()
+                   └─► Filter(data=...).qs
+```
+
+---
+
+## 四、第二阶段：后台执行编排
+
+### 4.1 Celery 任务定义
 
 任务定义在 `saleor/csv/tasks.py`。
 
@@ -197,14 +538,14 @@ def export_voucher_codes_task(export_file_id: int, file_type: str, ...):
     ...
 ```
 
-### 3.2 任务执行的关键设计
+### 4.2 任务执行的关键设计
 
 1. **`RestrictWriterDBTask` 基类** - 确保任务在只读模式下运行（除了明确标记的 `allow_writer()` 区域）
 2. **主库读取** - 任务开始时用 `allow_writer()` + 主库读取 ExportFile，避免主从延迟
 3. **状态更新通过回调** - `on_success` / `on_failure` 回调由 Celery 框架自动调用
 4. **事件记录完整** - 每个状态变更都有对应的 ExportEvent 记录
 
-### 3.3 数据导出核心逻辑
+### 4.3 数据导出核心逻辑
 
 代码位置：`saleor/csv/utils/export.py`
 
@@ -256,9 +597,9 @@ def save_csv_file_in_export_file(export_file, temporary_file, file_name):
     export_file.content_file.save(file_name, temporary_file)
 ```
 
-## 四、第三阶段：下载产物投递
+## 五、第三阶段：下载产物投递
 
-### 4.1 通知触发机制
+### 5.1 通知触发机制
 
 代码位置：`saleor/csv/notifications.py`
 
@@ -309,7 +650,7 @@ def send_export_failed_info(export_file: "ExportFile", data_type: str):
     ...
 ```
 
-### 4.2 NotifyHandler 延迟加载设计
+### 5.2 NotifyHandler 延迟加载设计
 
 代码位置：`saleor/core/notify.py:5-19`
 
@@ -329,7 +670,7 @@ class NotifyHandler:
 - 使用 `functools.cache` 确保 payload 只生成一次
 - 如果没有插件订阅该事件，payload 永远不会生成，避免不必要的计算
 
-### 4.3 Admin Email Plugin 邮件投递
+### 5.3 Admin Email Plugin 邮件投递
 
 代码位置：`saleor/plugins/admin_email/notify_events.py:42-65`
 
@@ -372,7 +713,7 @@ def get_admin_event_map():
     }
 ```
 
-### 4.4 邮件发送任务
+### 5.4 邮件发送任务
 
 代码位置：`saleor/plugins/admin_email/tasks.py`
 
@@ -395,7 +736,7 @@ def send_email_with_link_to_download_file_task(
     )
 ```
 
-### 4.5 Webhook 通知外部系统
+### 5.5 Webhook 通知外部系统
 
 除了邮件通知，PluginManager 还会触发 webhook：
 
@@ -406,7 +747,7 @@ manager.product_export_completed(export_file)
 
 这会触发 `WebhookEventAsyncType.PRODUCT_EXPORT_COMPLETED` 事件，通知所有订阅了该事件的外部系统。
 
-## 五、完整时序图（接力关系）
+## 六、完整时序图（接力关系）
 
 ```
 HTTP 请求线程
@@ -446,7 +787,7 @@ Celery Worker 线程 (send_email_with_link_to_download_file_task)
 └─► 创建 ExportEvent (type=EXPORTED_FILE_SENT)
 ```
 
-## 六、失败处理流程
+## 七、失败处理流程
 
 ```
 Celery Worker 线程 (export_products_task)
@@ -464,9 +805,9 @@ Celery Worker 线程 (export_products_task)
                 └─► WebhookPlugin 通知外部系统
 ```
 
-## 七、关键设计模式总结
+## 八、关键设计模式总结
 
-### 7.1 接力棒传递模式
+### 8.1 接力棒传递模式
 
 整个流程是典型的 **"接力棒"** 模式：
 1. **第一棒（HTTP线程）**：创建记录 → 交棒给 Celery
@@ -475,13 +816,13 @@ Celery Worker 线程 (export_products_task)
 
 每一步只负责自己的职责，通过数据库记录和消息队列传递状态。
 
-### 7.2 数据库读写分离策略
+### 8.2 数据库读写分离策略
 
 - **读取**：优先使用从库（`settings.DATABASE_CONNECTION_REPLICA_NAME`）
 - **写入**：使用 `@allow_writer()` 装饰器标记需要主库的操作
 - **任务启动时**：强制从主库读取 ExportFile，避免主从延迟
 
-### 7.3 事件溯源模式
+### 8.3 事件溯源模式
 
 每个状态变更都记录 `ExportEvent`，提供完整的审计追踪：
 - `EXPORT_PENDING` - 请求已登记
@@ -491,15 +832,15 @@ Celery Worker 线程 (export_products_task)
 - `EXPORT_FAILED_INFO_SENT` - 失败通知已发送
 - `EXPORT_DELETED` - 文件已删除
 
-### 7.4 延迟加载优化
+### 8.4 延迟加载优化
 
 `NotifyHandler` 使用 `@cache` 装饰器实现 payload 懒加载，只有当真正有订阅者时才生成 payload。
 
-### 7.5 旧文件清理
+### 8.5 旧文件清理
 
 还有一个定时任务 `delete_old_export_files`（`saleor/csv/tasks.py:109-134`），定期清理超过 `settings.EXPORT_FILES_TIMEDELTA` 的导出文件。
 
-## 八、核心文件索引
+## 九、核心文件索引
 
 | 模块 | 文件路径 | 职责 |
 |------|---------|------|
@@ -518,3 +859,9 @@ Celery Worker 线程 (export_products_task)
 | 邮件插件 | `saleor/plugins/admin_email/plugin.py` | AdminEmailPlugin 定义 |
 | 邮件通知逻辑 | `saleor/plugins/admin_email/notify_events.py` | 邮件发送触发逻辑 |
 | 邮件发送任务 | `saleor/plugins/admin_email/tasks.py` | 异步邮件发送 |
+| Webhook 插件 | `saleor/plugins/webhook/plugin.py` | Webhook 通知实现 |
+| 基础插件接口 | `saleor/plugins/base_plugin.py` | *export_completed 方法定义 |
+| Global ID 转换 | `saleor/graphql/utils/__init__.py` | resolve_global_ids_to_primary_keys |
+| Mutation 基类 | `saleor/graphql/core/mutations.py` | get_global_ids_or_error |
+| 事件类型枚举 | `saleor/webhook/event_types.py` | Webhook 事件类型定义 |
+| 范围枚举 | `saleor/graphql/csv/enums.py` | ExportScope 枚举定义 |

@@ -187,9 +187,11 @@ def get_default_export_payload(export_file: "ExportFile") -> dict:
 
 ---
 
-### 3.2 失败路径为何仍触发完成类 webhook 方法
+### 3.2 失败路径仍触发完成类 webhook 的历史遗留问题深度剖析
 
-这是一个有争议的设计，甚至存在潜在的 bug。让我们深入分析：
+#### 3.2.1 历史背景与设计意图
+
+这是一个典型的**技术债务 + 向后兼容**妥协的设计。让我们从多个层面深入剖析：
 
 **问题代码**（`saleor/csv/notifications.py:67-73`）：
 ```python
@@ -205,6 +207,40 @@ def send_export_failed_info(export_file: "ExportFile", data_type: str):
         manager.voucher_code_export_completed(export_file)
 ```
 
+**历史遗留证据**：
+
+1. **接口层面的 deprecated 标记**（`saleor/plugins/base_plugin.py:809-811, 1348-1350, 1654-1656`）：
+   ```python
+   # Note: This method is deprecated and will be removed in a future release.
+   # Webhook-related functionality will be moved from the plugin to core modules.
+   gift_card_export_completed: Callable[["ExportFile", None], None]
+   ```
+
+2. **成功与失败路径的对称性设计**：
+   - 成功路径（`send_export_download_link_notification`）：先 `notify(CSV_EXPORT_SUCCESS)`，再调用 `*_export_completed`
+   - 失败路径（`send_export_failed_info`）：先 `notify(CSV_EXPORT_FAILED)`，再调用 `*_export_completed`
+   - 这种对称性表明设计意图是：**无论成功失败，`*_export_completed` 代表"导出流程已终结"**
+
+3. **测试用例的刻意设计**（`saleor/csv/tests/test_notifications.py:58-99`）：
+   ```python
+   def test_send_export_failed_info(...):
+       # given
+       file_mock = mock.MagicMock(spec=File)  # 👇 关键：手动设置 content_file
+       file_mock.name = "temp_file.csv"
+       user_export_file.content_file = file_mock  # 绕过了真实失败场景！
+       user_export_file.save()
+
+       # when
+       notifications.send_export_failed_info(user_export_file, data_type)
+
+       # then
+       mocked_gift_card_export_completed.assert_called_once_with(user_export_file)
+   ```
+   - ⚠️ **测试缺陷**：测试手动设置了 `content_file`，没有覆盖真实失败场景（`content_file = None`）
+   - 这解释了为什么这个 bug 没有被测试发现
+
+#### 3.2.2 异常类型与触发条件精确识别
+
 **Webhook Plugin 的实现**（`saleor/plugins/webhook/plugin.py:739-755`）：
 ```python
 def _trigger_export_event(self, event_type: str, export: "ExportFile"):
@@ -212,36 +248,133 @@ def _trigger_export_event(self, event_type: str, export: "ExportFile"):
         payload = self._serialize_payload({
             "id": graphene.Node.to_global_id("ExportFile", export.id),
             "export": get_default_export_payload(export),
-            "csv_link": build_absolute_uri(export.content_file.url),  # ⚠️ 危险！
+            "csv_link": build_absolute_uri(export.content_file.url),  # ⚠️ 危险访问
             "recipient_email": export.user.email if export.user else None,
         })
-        self.trigger_webhooks_async(payload, event_type, webhooks, ...)
+        self.trigger_webhooks_async(payload, event_type, webhooks, export, self.requestor)
 ```
 
-**问题分析**：
+**精确的异常分析**：
 
-1. **失败时 content_file 为 None**：
-   - 在 `on_failure` 回调中（`saleor/csv/tasks.py:32`）：`export_file.content_file = None`
-   - 但随后调用 `send_export_failed_info` 时，`content_file` 已经是 `None`
-
-2. **潜在的 AttributeError**：
-   - 如果外部系统订阅了 `PRODUCT_EXPORT_COMPLETED` webhook
-   - `export.content_file.url` 会抛出 `AttributeError: 'NoneType' object has no attribute 'url'`
-   - 导致 webhook 通知失败
-
-3. **设计意图推测**：
-   - 从 `base_plugin.py` 中的注释可以看出，这些方法已标记为 **deprecated**：
-   ```python
-   # Note: This method is deprecated and will be removed in a future release.
-   # Webhook-related functionality will be moved from the plugin to core modules.
-   gift_card_export_completed: Callable[["ExportFile", None], None]
+1. **异常类型**：`ValueError`（不是 `AttributeError`）
+   - Django `FileField` 的描述符在值为 `None` 时，访问 `.url` 属性会抛出：
    ```
-   - 可能是为了**保持向后兼容**，无论成功失败都通知外部系统"导出流程已结束"
-   - 外部系统需要通过 payload 中的 `status` 字段判断实际结果
+   ValueError: The 'content_file' attribute has no file associated with it.
+   ```
+   - 这是 Django `FieldFile` 描述符的标准行为，而非 Python 原生的 `AttributeError`
 
-4. **为何 Admin Email Plugin 不会崩溃**：
-   - Admin Email Plugin 的 `send_csv_export_failed` 不访问 `content_file.url`
-   - 它只使用 `CSV_EXPORT_FAILED` 事件，payload 中不包含 `csv_link` 字段
+2. **触发条件**（必须同时满足）：
+   - ✅ 导出任务执行失败（抛出未捕获的异常）
+   - ✅ Celery 调用 `on_failure` 回调，设置 `export_file.content_file = None`
+   - ✅ 存在至少一个 **激活的** Webhook 订阅了 `*_EXPORT_COMPLETED` 事件
+   - ✅ WebhookPlugin 处于激活状态
+
+3. **异常传播路径**：
+   ```
+   on_failure()
+   ├─► export_file.content_file = None
+   ├─► export_file.status = FAILED
+   ├─► export_file.save()
+   ├─► export_failed_event()
+   └─► send_export_failed_info(export_file, data_type)
+       ├─► manager.notify(CSV_EXPORT_FAILED)  # ✅ 正常执行
+       └─► manager.product_export_completed(export_file)
+           └─► __run_method_on_plugins()
+               └─► WebhookPlugin.product_export_completed()
+                   └─► _trigger_export_event()
+                       ├─► get_webhooks_for_event() → 返回非空
+                       └─► export.content_file.url  # 💥 ValueError!
+   ```
+
+4. **异常后果**：
+   - `__run_method_on_single_plugin` 没有 try-catch 保护（`saleor/plugins/manager.py:233-255`）
+   - 异常向上传播，导致 `on_failure` 回调异常终止
+   - Celery 认为任务失败，可能触发**重试机制**
+   - 重试会导致重复的失败事件和重复的通知尝试
+
+#### 3.2.3 对下游订阅方的影响及判定方法
+
+**影响分类**：
+
+| 订阅类型 | 影响程度 | 说明 |
+|---------|---------|------|
+| `CSV_EXPORT_FAILED` | 🔵 无影响 | payload 不访问 `content_file.url`，通知正常发送 |
+| `CSV_EXPORT_SUCCESS` | 🔵 无影响 | 仅在成功路径触发，此时 `content_file` 已赋值 |
+| `*_EXPORT_COMPLETED` | 🔴 严重 | 失败时触发会导致 `ValueError`，webhook 投递完全失败 |
+
+**下游系统判定方法**：
+
+对于订阅了 `*_EXPORT_COMPLETED` 事件的外部系统，需要通过 payload 中的字段判定结果：
+
+```python
+# 成功时的 payload（简化）
+{
+    "export": {
+        "id": "RXhwb3J0RmlsZToxMjM=",
+        "status": "success",  # ✅ SUCCESS
+        "message": null,
+        ...
+    },
+    "csv_link": "https://.../export_files/product_data_...csv",
+    "recipient_email": "user@example.com",
+    ...
+}
+
+# 失败时，如果异常未发生，payload 会是：
+{
+    "export": {
+        "id": "RXhwb3J0RmlsZToxMjM=",
+        "status": "failed",   # ❌ FAILED
+        "message": "Export failed due to ...",
+        ...
+    },
+    "csv_link": "https://.../export_files/...",  # ⚠️ 实际这里会崩溃
+    ...
+}
+```
+
+**推荐的下游判定逻辑**：
+```python
+def handle_export_completed(payload):
+    export_info = payload.get("export", {})
+    status = export_info.get("status")
+    
+    if status == "success":
+        # 处理成功：下载 csv_link
+        download_url = payload.get("csv_link")
+        process_export_file(download_url)
+    elif status == "failed":
+        # 处理失败：记录错误，通知用户
+        error_message = export_info.get("message")
+        handle_export_failure(error_message)
+    else:
+        # status 为 "pending"（通知先于状态回写）
+        # 需要轮询或等待后续事件
+        handle_pending_state(export_info)
+```
+
+**注意**：如 3.1 节所述，即使是成功路径，通知发送时 `status` 也可能是 `PENDING`，因为 `on_success` 回调在通知之后才更新状态。
+
+#### 3.2.4 为何 Admin Email Plugin 不受影响
+
+Admin Email Plugin 的失败通知处理完全独立于 `*_export_completed` 方法：
+
+```python
+# AdminEmailPlugin 只响应 notify() 调用，不响应 *_export_completed 调用
+def send_csv_export_failed(payload_func, config, plugin):
+    template = get_email_template_or_default(...)
+    if not template:
+        return
+    payload = payload_func()  # ✅ payload 不包含 csv_link，不会崩溃
+    recipient_email = payload.get("recipient_email")
+    ...
+    send_export_failed_email_task.delay(...)
+```
+
+对比 `CSV_EXPORT_SUCCESS` 的 payload：
+- ✅ `CSV_EXPORT_FAILED` payload：**不包含** `csv_link` 字段
+- ✅ `CSV_EXPORT_SUCCESS` payload：**包含** `csv_link` 字段
+- ⚠️ `*_EXPORT_COMPLETED` webhook payload：**总是包含** `csv_link` 字段
 
 ---
 
@@ -865,3 +998,6 @@ Celery Worker 线程 (export_products_task)
 | Mutation 基类 | `saleor/graphql/core/mutations.py` | get_global_ids_or_error |
 | 事件类型枚举 | `saleor/webhook/event_types.py` | Webhook 事件类型定义 |
 | 范围枚举 | `saleor/graphql/csv/enums.py` | ExportScope 枚举定义 |
+| 插件执行器 | `saleor/plugins/manager.py:233-255` | `__run_method_on_single_plugin` 无异常保护 |
+| 异步传输 | `saleor/webhook/transport/asynchronous/transport.py:477-517` | `trigger_webhooks_async` 实现 |
+| Webhook 查询 | `saleor/webhook/utils.py:69-84` | `get_webhooks_for_event` 实现 |

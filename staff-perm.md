@@ -231,7 +231,9 @@ def clean_groups(cls, requestor: models.User, cleaned_input: dict, errors: dict)
 - `check_for_duplicates(data, "add_groups", "remove_groups", "groups")`：防止同一组同时出现在添加和移除列表中
 - 操作人不能管理自己范围外的用户 (`get_out_of_scope_users`)
 
-### 3.4 权限组创建时的用户绑定校验 (`PermissionGroupCreate.clean_users`)
+### 3.4 add_users 只校验 staff 不校验可管理范围的设计原因（新增）
+
+#### 权限组创建场景 (`PermissionGroupCreate.clean_users`)
 
 **文件位置：** `saleor/graphql/account/mutations/permission_group/permission_group_create.py:171-198`
 
@@ -243,26 +245,40 @@ def clean_users(cls, requestor: User, errors: dict, cleaned_input: dict, group: 
         cls.ensure_users_are_staff(errors, "add_users", cleaned_input)
 ```
 
-### 3.5 权限组更新时的用户绑定校验 (`PermissionGroupUpdate.clean_users`)
+#### 权限组更新场景 (`PermissionGroupUpdate.clean_users`)
 
 **文件位置：** `saleor/graphql/account/mutations/permission_group/permission_group_update.py:206-219`
 
 ```python
 @classmethod
 def clean_users(cls, requestor: User, errors: dict, cleaned_input: dict, group: models.Group):
-    super().clean_users(requestor, errors, cleaned_input, group)
+    super().clean_users(requestor, errors, cleaned_input, group)  # 只校验 staff
     remove_users = cleaned_input.get("remove_users")
     if remove_users:
         cls.ensure_can_manage_users(requestor, errors, "remove_users", cleaned_input)
         cls.clean_remove_users(requestor, errors, cleaned_input, group)
 ```
 
-**移除用户时的额外校验：**
-1. `ensure_can_manage_users`：操作人必须能管理被移除的用户
-2. `check_if_removing_user_last_group`：不能将自己从最后一个组中移除
-3. `check_if_users_can_be_removed`：移除后不能导致某些权限无人可管理
+#### 设计原因分析
 
-### 3.6 渠道访问约束在创建与更新场景的分流逻辑（新增）
+**为什么 add_users 只校验 is_staff，不校验可管理范围？**
+
+| 角度 | 分析 |
+|------|------|
+| **权限传播方向** | 组是权限的"容器"，用户加入组只能获得组的权限，不会获得超出组范围的权限。由于组本身已通过 `ensure_requestor_can_manage_group()` 校验（组的权限 ≤ 操作人权限），因此向组内添加任何员工都不会导致权限泄露。 |
+| **移除 vs 添加的区别** | 移除用户可能导致"权限不可管理"问题（某些权限无人可管理），需要校验；添加用户只会增强权限覆盖，不会引入不可管理风险。 |
+| **设计意图** | 采用"组作为权限边界"的设计：只要操作人能管理这个组，就可以自由地向组内添加/移除员工（移除时额外校验不可管理风险）。 |
+| **实际约束** | `ensure_requestor_can_manage_group()` 是第一道也是最关键的闸门，确保组本身在操作人的权限范围内。组内的用户操作被视为组内部的管理行为。 |
+
+**校验矩阵对比：**
+
+| 操作 | 校验 staff | 校验可管理范围 | 校验权限可管理性 |
+|------|------------|----------------|------------------|
+| add_users（创建） | ✅ | ❌ | ❌ |
+| add_users（更新） | ✅ | ❌ | ❌ |
+| remove_users（更新） | - | ✅ | ✅ |
+
+### 3.5 渠道访问约束在创建与更新场景的分流逻辑（新增）
 
 #### 创建场景 (`PermissionGroupCreate.clean_channels`, L201-234)
 
@@ -452,7 +468,93 @@ def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
    └─ call_event(manager.staff_created, instance) → 触发 webhook
 ```
 
-### 4.3 员工更新流程 (`StaffUpdate.perform_mutation`)
+### 4.3 StaffCreate 中通知发送与组关系写入的先后顺序及失败影响（新增）
+
+#### 代码位置 (`staff_create.py:164-201`)
+
+```python
+@classmethod
+def save(
+    cls,
+    info: ResolveInfo,
+    user,
+    cleaned_input,
+    send_notification=True,
+    redirect_url=None,
+):
+    if any(field in cleaned_input for field in USER_SEARCH_FIELDS):
+        update_user_search_vector(user, attach_addresses_data=False, save=False)
+    user.save()  # ✅ 用户保存成功
+    redirect_url = cleaned_input.get("redirect_url")
+    if redirect_url and send_notification:
+        manager = get_plugin_manager_promise(info.context).get()
+        send_set_password_notification(  # ⚠️ 通知发送在 save() 内
+            redirect_url=redirect_url,
+            user=user,
+            manager=manager,
+            channel_slug=None,
+            staff=True,
+        )
+        token = token_generator.make_token(user)
+        params = urlencode({"email": user.email, "token": token})
+        cls.call_event(  # ⚠️ 密码重置请求事件也在 save() 内
+            manager.staff_set_password_requested,
+            user,
+            None,
+            token,
+            prepare_url(params, redirect_url),
+        )
+
+@classmethod
+def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
+    with traced_atomic_transaction():
+        super()._save_m2m(info, instance, cleaned_data)
+        groups = cleaned_data.get("add_groups")
+        if groups:
+            instance.groups.add(*groups)  # ❌ 组关系写入在后
+```
+
+#### 先后顺序总结
+
+| 阶段 | 操作 | 位置 |
+|------|------|------|
+| 1 | `user.save()` → 用户落库 | `save()` 方法内 |
+| 2 | `send_set_password_notification()` → 发送邮件 | `save()` 方法内（user.save() 之后） |
+| 3 | `call_event(staff_set_password_requested)` → 触发事件 | `save()` 方法内 |
+| 4 | `instance.groups.add(*groups)` → 组关系写入 | `_save_m2m()` 方法内 |
+| 5 | `call_event(staff_created)` → 员工创建事件 | `post_save_action()` 内 |
+
+#### 失败影响分析
+
+**场景 1：通知发送失败**
+- 触发点：`send_set_password_notification()` 抛出异常
+- 影响范围：
+  - ✅ `user.save()` 已成功 → 用户已存在
+  - ❌ 通知发送失败 → `save()` 方法整体失败
+  - ❌ `_save_m2m()` 不会执行 → 组关系**未写入**
+  - ❌ `staff_created` 事件**未触发**
+- **最终状态**：系统中存在一个没有权限组的员工账号，用户未收到设置密码邮件
+
+**场景 2：组关系写入失败**
+- 触发点：`instance.groups.add(*groups)` 抛出异常
+- 影响范围：
+  - ✅ `user.save()` 已成功 → 用户已存在
+  - ✅ 通知已发送 → 用户收到了设置密码邮件
+  - ✅ `staff_set_password_requested` 事件已触发
+  - ❌ `_save_m2m()` 失败 → 组关系**未写入**
+  - ❌ `staff_created` 事件**未触发**
+- **最终状态**：用户收到了邮件，但账号没有权限组，无法登录执行操作
+
+**场景 3：post_save_action 失败（罕见）**
+- 触发点：`call_event(staff_created)` 异常
+- 影响范围：
+  - ✅ 用户已创建
+  - ✅ 通知已发送
+  - ✅ 组关系已写入
+  - ❌ webhook 事件未触发
+- **最终状态**：数据一致，但外部系统未收到通知
+
+### 4.4 员工更新流程 (`StaffUpdate.perform_mutation`)
 
 **文件位置：** `saleor/graphql/account/mutations/staff/staff_update.py:181-197`
 
@@ -483,7 +585,7 @@ def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
    └─ 邮箱/姓名变更 → 标记礼品卡搜索索引为脏
 ```
 
-### 4.4 权限组创建流程 (`PermissionGroupCreate.perform_mutation`)
+### 4.5 权限组创建流程 (`PermissionGroupCreate.perform_mutation`)
 
 **文件位置：** `saleor/graphql/account/mutations/permission_group/permission_group_create.py`
 
@@ -507,7 +609,7 @@ def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
    └─ call_event(manager.permission_group_created, instance)
 ```
 
-### 4.5 权限组更新流程 (`PermissionGroupUpdate.perform_mutation`)
+### 4.6 权限组更新流程 (`PermissionGroupUpdate.perform_mutation`)
 
 **文件位置：** `saleor/graphql/account/mutations/permission_group/permission_group_update.py`
 
@@ -541,7 +643,84 @@ def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
    └─ AccessibleChannelsByGroupIdLoader.clear(instance.id)
 ```
 
-### 4.6 权限组删除流程 (`PermissionGroupDelete.perform_mutation`)
+### 4.7 StaffUpdate 与 PermissionGroupUpdate 的事件触发顺序对比（新增）
+
+#### 基类标准顺序 (`core/mutations.py:814-861`)
+
+```
+基类 perform_mutation 标准流程：
+├─ save()               → 实例基本信息保存
+├─ _save_m2m()          → 多对多关系保存
+└─ post_save_action()   → 事件触发
+```
+
+#### StaffUpdate 的特殊扩展 (`staff_update.py:181-197`)
+
+```python
+@classmethod
+def perform_mutation(cls, root, info: ResolveInfo, /, **data):
+    original_instance, _ = cls.get_instance(info, **data)
+    response = super().perform_mutation(root, info, **data)  # 先执行基类完整流程
+    user = response.user
+    has_new_email = user.email != original_instance.email
+    has_new_name = original_instance.get_full_name() != user.get_full_name()
+
+    if has_new_email:
+        assign_user_gift_cards(user)      # ⚠️ 在 post_save_action 之后执行
+        match_orders_with_new_user(user)   # ⚠️ 在 post_save_action 之后执行
+
+    if has_new_email or has_new_name:
+        if gift_cards := get_user_gift_cards(user):
+            mark_gift_cards_search_index_as_dirty(gift_cards)  # ⚠️ 在 post_save_action 之后执行
+
+    return response
+```
+
+#### PermissionGroupUpdate 的特殊扩展 (`permission_group_update.py:83-91`)
+
+```python
+@classmethod
+def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
+    with traced_atomic_transaction():
+        super()._save_m2m(info, instance, cleaned_data)
+        if remove_users := cleaned_data.get("remove_users"):
+            instance.user_set.remove(*remove_users)
+        if remove_permissions := cleaned_data.get("remove_permissions"):
+            instance.permissions.remove(*remove_permissions)
+        if remove_channels := cleaned_data.get("remove_channels"):
+            instance.channels.remove(*remove_channels)
+    # Invalidate dataloader for group channels
+    AccessibleChannelsByGroupIdLoader(info.context).clear(instance.id)  # ⚠️ 在 _save_m2m 内执行
+```
+
+#### 详细对比表
+
+| 阶段 | StaffUpdate | PermissionGroupUpdate | 说明 |
+|------|-------------|------------------------|------|
+| **1. save()** | `user.save()` | `group.save()` | 实例基本信息保存，独立事务 |
+| **2. _save_m2m()** | 组关系 add/remove + traced_atomic_transaction | 权限/用户/渠道 add/remove + traced_atomic_transaction + **DataLoader 缓存清理** | PermissionGroupUpdate 在事务结束后立即清理缓存 |
+| **3. post_save_action()** | `call_event(staff_updated)` | `call_event(permission_group_updated)` | 标准 webhook 事件触发 |
+| **4. 额外 side effects** | ✅ 重新关联礼品卡<br>✅ 匹配订单到新邮箱<br>✅ 标记礼品卡搜索索引为脏 | ❌ 无 | StaffUpdate 在基类 perform_mutation 返回后执行 |
+
+#### 关键差异点
+
+| 差异点 | StaffUpdate | PermissionGroupUpdate |
+|--------|-------------|------------------------|
+| **DataLoader 缓存清理时机** | 无（不需要） | `_save_m2m()` 内，事务结束后 |
+| **Side Effect 位置** | `perform_mutation()` 末尾，**post_save_action 之后** | 无额外 side effect |
+| **Side Effect 事务性** | 不在事务中，失败不影响主流程 | N/A |
+| **事件触发前的一致性** | 事件触发时，用户组关系已更新 | 事件触发时，组关系已更新，缓存已清理 |
+
+#### StaffUpdate Side Effect 的风险
+
+**问题：** `assign_user_gift_cards`、`match_orders_with_new_user`、`mark_gift_cards_search_index_as_dirty` 都在 `post_save_action` **之后**执行，且不在事务中。
+
+**风险场景：**
+1. `staff_updated` 事件已触发 → 外部系统收到用户邮箱变更通知
+2. `assign_user_gift_cards` 失败 → 礼品卡未重新关联
+3. **结果**：外部系统与内部系统状态不一致
+
+### 4.8 权限组删除流程 (`PermissionGroupDelete.perform_mutation`)
 
 **文件位置：** `saleor/graphql/account/mutations/permission_group/permission_group_delete.py`
 
@@ -560,7 +739,7 @@ def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
    └─ call_event(manager.permission_group_deleted, instance)
 ```
 
-### 4.7 员工删除流程 (`StaffDelete.perform_mutation`)
+### 4.9 员工删除流程 (`StaffDelete.perform_mutation`)
 
 **文件位置：** `saleor/graphql/account/mutations/staff/staff_delete.py` + `base.py:431-522`
 
@@ -696,6 +875,8 @@ def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
 │              /deleted, instance)        │
 └─────────────────────────────────────────┘
     ↓
+[StaffUpdate 特有] 邮箱/姓名变更 Side Effects
+    ↓
 Webhook 事件触发 → 外部系统同步
 ```
 
@@ -704,6 +885,7 @@ Webhook 事件触发 → 外部系统同步
 - ⚠️ `save()` 和 `_save_m2m()` 是两个独立事务，存在中间不一致窗口
 - ✅ `_save_m2m()` 内部的多对多操作在同一个 `traced_atomic_transaction` 中
 - ✅ 删除操作（`instance.delete()`）由 Django ORM 保证原子性
+- ⚠️ StaffUpdate 的 Side Effects 在 `post_save_action()` 之后执行，不在事务中
 
 ---
 

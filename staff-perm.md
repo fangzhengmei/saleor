@@ -433,7 +433,68 @@ def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
 - 所有校验都在 `clean_input()` 阶段完成，`_save_m2m()` 阶段不做业务校验
 - `_save_m2m()` 失败主要源于数据库层面的问题（如死锁、连接中断）
 
-### 4.2 员工创建流程 (`StaffCreate.perform_mutation`)
+### 4.2 组关系缺失与账号登录能力的对应关系（新增）
+
+#### 登录认证流程中的校验点 (`CreateToken.get_user`)
+
+**文件位置：** `saleor/graphql/account/mutations/authentication/create_token.py:51-88`
+
+```python
+@classmethod
+def get_user(cls, info: ResolveInfo, email, password):
+    user = authenticate_with_throttling(info.context, email, password)
+    if not user:
+        raise ValidationError({"email": ...INVALID_CREDENTIALS...})
+
+    site_settings = get_site_promise(info.context).get().settings
+    if not user.is_confirmed and not site_settings.allow_login_without_confirmation ...:
+        raise ValidationError({"email": ...ACCOUNT_NOT_CONFIRMED...})
+
+    if not user.is_active:
+        raise ValidationError({"email": ...INACTIVE...})
+    return user
+```
+
+#### 登录校验维度与组关系的关系
+
+| 校验维度 | 登录时检查 | 与组关系相关 | 说明 |
+|----------|------------|---------------|------|
+| 邮箱+密码匹配 | ✅ | ❌ | 纯认证，与组无关 |
+| 邮箱确认状态 | ✅（可配置） | ❌ | `is_confirmed` 标志，与组无关 |
+| 账号活跃状态 | ✅ | ❌ | `is_active` 标志，与组无关 |
+| `is_staff` 标志 | ❌ | ❌ | **登录不检查 `is_staff`**，客户和员工用相同登录入口 |
+| 组成员关系 | ❌ | ❌ | **登录不检查组关系**，组关系仅用于授权（授权检查在 mutation 层） |
+| 权限拥有情况 | ❌ | ❌ | **登录不检查权限**，权限检查在每个 mutation 的 `check_permissions` 中 |
+
+#### 关键结论：组关系缺失不影响登录，但影响操作能力
+
+**场景分析：**
+
+| 场景 | 能否登录 | 登录后能做什么 |
+|------|----------|----------------|
+| 员工（is_staff=True）+ 有组 + 组有权限 | ✅ | 正常使用组内权限范围内的功能 |
+| 员工（is_staff=True）+ 无组（组关系缺失） | ✅ | 登录成功，但执行任何需要权限的 mutation 会被 `check_permissions` 拒绝 |
+| 员工（is_staff=True）+ 有组 + 组无权限 | ✅ | 登录成功，但无实际操作能力 |
+| 客户（is_staff=False）+ 有组 | ✅ | 正常使用客户功能 |
+| 员工（is_staff=True）+ is_active=False | ❌ | 登录被拒绝 |
+| 客户（is_staff=False）+ is_active=False | ❌ | 登录被拒绝 |
+
+**影响链路：**
+```
+组关系缺失
+  └─> effective_permissions 为空（无任何权限）
+      └─> 登录成功（登录不检查权限）
+          └─> 调用需要 MANAGE_STAFF 等权限的 mutation
+              └─> check_permissions() 中 get_user_permissions() 返回空集
+                  └─> PermissionDenied 错误
+```
+
+**因此，StaffCreate 中 `_save_m2m()` 失败导致的"用户存在但无组关系"状态：**
+- 用户**可以登录**（因为登录只检查 `is_active` 和密码）
+- 但用户**无法执行任何需要权限的后台操作**
+- 对于新建员工而言，这是一个严重的功能阻塞状态
+
+### 4.3 员工创建流程 (`StaffCreate.perform_mutation`)
 
 **文件位置：** `saleor/graphql/account/mutations/staff/staff_create.py:225-251`
 
@@ -468,7 +529,7 @@ def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
    └─ call_event(manager.staff_created, instance) → 触发 webhook
 ```
 
-### 4.3 StaffCreate 中通知发送与组关系写入的先后顺序及失败影响（新增）
+### 4.4 StaffCreate 中通知发送与组关系写入的先后顺序及失败影响（新增）
 
 #### 代码位置 (`staff_create.py:164-201`)
 
@@ -554,7 +615,86 @@ def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
   - ❌ webhook 事件未触发
 - **最终状态**：数据一致，但外部系统未收到通知
 
-### 4.4 员工更新流程 (`StaffUpdate.perform_mutation`)
+### 4.5 StaffCreate 复用非员工账号分支 (`send_notification=False`)（新增）
+
+#### 触发条件
+
+**文件位置：** `saleor/graphql/account/mutations/staff/staff_create.py:209-223`
+
+```python
+@classmethod
+def get_instance(cls, info: ResolveInfo, **data):
+    object_id = data.get("id")
+    email = data.get("input", {}).get("email")
+    send_notification = True
+
+    if (
+        not object_id
+        and email
+        and (
+            user := models.User.objects.filter(email=email, is_staff=False).first()
+        )
+    ):
+        send_notification = False
+        return user, send_notification
+    return super().get_instance(info, **data), send_notification
+```
+
+**触发条件（全部满足）：**
+1. 没有传入 `id`（新建场景）
+2. 传入了 `email`
+3. 数据库中存在该邮箱的用户且 `is_staff=False`（非员工）
+
+#### 复用分支与常规分支的时序对比
+
+**常规分支（新用户）时序：**
+
+| 序号 | 操作 | 方法 | 是否执行 |
+|------|------|------|----------|
+| 1 | `get_instance()` → 新建空 User | `get_instance` | ✅ |
+| 2 | 设置 `is_staff=True` | `clean_input` | ✅ |
+| 3 | `user.save()` 保存新用户 | `save` | ✅ |
+| 4 | `send_set_password_notification()` 发送密码邮件 | `save` | ✅（若有 redirect_url） |
+| 5 | `call_event(staff_set_password_requested)` | `save` | ✅（若有 redirect_url） |
+| 6 | `instance.groups.add(*groups)` 绑定组 | `_save_m2m` | ✅ |
+| 7 | `call_event(staff_created)` | `post_save_action` | ✅ |
+
+**复用分支（非员工升级）时序：**
+
+| 序号 | 操作 | 方法 | 是否执行 | 差异 |
+|------|------|------|----------|------|
+| 1 | `get_instance()` → 返回现有 User | `get_instance` | ✅ | 返回已存在用户 |
+| 2 | 设置 `is_staff=True` | `clean_input` | ✅ | 将现有客户升级为员工 |
+| 3 | `user.save()` 保存更新（密码不变） | `save` | ✅ | 不新建用户 |
+| 4 | `send_set_password_notification()` | `save` | ❌ | **不发送密码邮件**（用户已有密码） |
+| 5 | `call_event(staff_set_password_requested)` | `save` | ❌ | **不触发事件**（用户已有密码） |
+| 6 | `instance.groups.add(*groups)` 绑定组 | `_save_m2m` | ✅ | 与常规分支相同 |
+| 7 | `call_event(staff_created)` | `post_save_action` | ✅ | 与常规分支相同 |
+
+#### save() 方法内通知发送的条件分支
+
+**文件位置：** `saleor/graphql/account/mutations/staff/staff_create.py:164-193`
+
+```python
+@classmethod
+def save(cls, info, user, cleaned_input, send_notification=True, redirect_url=None):
+    if any(field in cleaned_input for field in USER_SEARCH_FIELDS):
+        update_user_search_vector(user, attach_addresses_data=False, save=False)
+    user.save()
+    redirect_url = cleaned_input.get("redirect_url")
+    # 关键：send_notification 参数作为门禁
+    if redirect_url and send_notification:  # ← 两个条件都满足才发送
+        manager = get_plugin_manager_promise(info.context).get()
+        send_set_password_notification(...)
+        token = token_generator.make_token(user)
+        cls.call_event(manager.staff_set_password_requested, ...)
+```
+
+**通知发送条件 = `redirect_url` 存在 AND `send_notification=True`**
+
+复用分支中 `send_notification=False`，因此即使传了 `redirect_url`，也不会发送通知。
+
+### 4.6 员工更新流程 (`StaffUpdate.perform_mutation`)
 
 **文件位置：** `saleor/graphql/account/mutations/staff/staff_update.py:181-197`
 
@@ -585,7 +725,7 @@ def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
    └─ 邮箱/姓名变更 → 标记礼品卡搜索索引为脏
 ```
 
-### 4.5 权限组创建流程 (`PermissionGroupCreate.perform_mutation`)
+### 4.7 权限组创建流程 (`PermissionGroupCreate.perform_mutation`)
 
 **文件位置：** `saleor/graphql/account/mutations/permission_group/permission_group_create.py`
 
@@ -609,7 +749,7 @@ def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
    └─ call_event(manager.permission_group_created, instance)
 ```
 
-### 4.6 权限组更新流程 (`PermissionGroupUpdate.perform_mutation`)
+### 4.8 权限组更新流程 (`PermissionGroupUpdate.perform_mutation`)
 
 **文件位置：** `saleor/graphql/account/mutations/permission_group/permission_group_update.py`
 
@@ -643,7 +783,7 @@ def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
    └─ AccessibleChannelsByGroupIdLoader.clear(instance.id)
 ```
 
-### 4.7 StaffUpdate 与 PermissionGroupUpdate 的事件触发顺序对比（新增）
+### 4.9 StaffUpdate 与 PermissionGroupUpdate 的事件触发顺序对比（新增）
 
 #### 基类标准顺序 (`core/mutations.py:814-861`)
 
@@ -720,7 +860,65 @@ def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
 2. `assign_user_gift_cards` 失败 → 礼品卡未重新关联
 3. **结果**：外部系统与内部系统状态不一致
 
-### 4.8 权限组删除流程 (`PermissionGroupDelete.perform_mutation`)
+### 4.10 四类写操作的完整协作链路对照表（新增）
+
+#### 对照维度说明
+
+| 符号 | 含义 |
+|------|------|
+| ✅ | 总是执行 |
+| ❌ | 从不执行 |
+| ⚠️ | 条件执行 |
+| 事务1 | `save()` 独立事务 |
+| 事务2 | `_save_m2m()` traced_atomic_transaction |
+| 无事务 | 不在数据库事务中 |
+
+#### 完整对照矩阵
+
+| 执行阶段 | StaffCreate (常规) | StaffCreate (复用) | StaffUpdate | PermissionGroupUpdate |
+|----------|---------------------|---------------------|-------------|------------------------|
+| **1. get_instance()** | 新建空 User | 返回现有客户 User | 返回现有员工 User | 返回现有 Group |
+| **2. clean_input()** | 设置 is_staff=True | 设置 is_staff=True | 校验 add/remove_groups 不重复 | 校验三个维度不重复 |
+| **2a. 组权限校验** | 校验操作人可管理 add_groups | 同左 | 校验操作人可管理 add/remove_groups | `ensure_requestor_can_manage_group()` 校验组的权限和渠道 ≤ 操作人 |
+| **2b. 用户校验** | N/A（创建新用户） | N/A（复用现有） | `get_out_of_scope_users` 校验操作人可管理目标用户 | add_users 仅校验 is_staff；remove_users 校验可管理范围 + 不可管理权限风险 |
+| **2c. 渠道校验** | N/A | N/A | N/A | add_channels 校验操作人可管理；remove_channels 校验操作人可管理；restricted_access_to_channels=False 时清空所有渠道操作 |
+| **2d. 权限校验** | N/A | N/A | N/A | add_permissions 校验操作人拥有；remove_permissions 校验操作人拥有 + 不可管理风险 |
+| **3. save() [事务1]** | `user.save()` 新建用户 | `user.save()` 更新 is_staff | `user.save()` 更新基本信息 | `group.save()` 更新基本信息 |
+| **3a. 通知发送 [事务1内]** | ⚠️ `send_set_password_notification`（若 redirect_url 且 send_notification=True） | ❌ **不发送**（send_notification=False） | ❌ 不发送 | ❌ 不发送 |
+| **3b. 密码重置事件 [事务1内]** | ⚠️ `staff_set_password_requested`（同上） | ❌ **不触发** | ❌ 不触发 | ❌ 不触发 |
+| **4. _save_m2m() [事务2]** | `instance.groups.add(*groups)` | `instance.groups.add(*groups)` | `instance.groups.add/remove(*groups)` | permissions add/remove + user_set add/remove + channels add/remove |
+| **4a. DataLoader 缓存清理 [事务2后]** | ❌ 不清理 | ❌ 不清理 | ❌ 不清理 | ✅ `AccessibleChannelsByGroupIdLoader.clear()` |
+| **5. post_save_action() [无事务]** | `call_event(staff_created)` | `call_event(staff_created)` | `call_event(staff_updated)` | `call_event(permission_group_updated)` |
+| **6. Side Effects [无事务]** | ❌ 无 | ❌ 无 | ⚠️ 邮箱变更→重新关联礼品卡+订单；邮箱/姓名变更→标记礼品卡搜索索引 | ❌ 无 |
+
+#### 事件触发时序对照
+
+| 事件 | StaffCreate (常规) | StaffCreate (复用) | StaffUpdate | PermissionGroupUpdate |
+|------|---------------------|---------------------|-------------|------------------------|
+| `staff_set_password_requested` | ✅（在 save 内，事务1） | ❌ | ❌ | ❌ |
+| `staff_created` | ✅（post_save_action） | ✅（post_save_action） | ❌ | ❌ |
+| `staff_updated` | ❌ | ❌ | ✅（post_save_action） | ❌ |
+| `permission_group_updated` | ❌ | ❌ | ❌ | ✅（post_save_action） |
+| 礼品卡/订单重新关联 | ❌ | ❌ | ⚠️（post_save_action 之后） | ❌ |
+
+#### 事务边界与一致性风险对照
+
+| 风险点 | StaffCreate (常规) | StaffCreate (复用) | StaffUpdate | PermissionGroupUpdate |
+|--------|---------------------|---------------------|-------------|------------------------|
+| 通知发送失败→用户存在但无组 | ⚠️ 高风险 | ✅ 无此风险（不发通知） | ✅ 无此风险 | ✅ 无此风险 |
+| _save_m2m 失败→用户/组存在但关系未绑定 | ⚠️ 高风险 | ⚠️ 高风险 | ⚠️ 中风险 | ⚠️ 中风险 |
+| Side Effect 失败→事件已触发但数据不一致 | ✅ 无 Side Effect | ✅ 无 Side Effect | ⚠️ 中风险（礼品卡/订单） | ✅ 无 Side Effect |
+| DataLoader 缓存失效延迟 | ✅ 不涉及 | ✅ 不涉及 | ✅ 不涉及 | ✅ 无风险（在 _save_m2m 内清理） |
+
+#### 登录能力对照（_save_m2m 失败后）
+
+| 场景 | StaffCreate (常规) | StaffCreate (复用) | StaffUpdate | PermissionGroupUpdate |
+|------|---------------------|---------------------|-------------|------------------------|
+| 能否登录 | ✅ 可以（is_active=True，有密码） | ✅ 可以（已有密码） | ✅ 可以（原有密码） | N/A（组不登录） |
+| 登录后能操作 | ❌ 无权限（无组） | ❌ 无权限（无组） | ⚠️ 权限未变更（旧组仍在） | N/A |
+| 用户感知 | 收到邮件但登录后无法操作 | 知道升级但登录后无法操作 | 几乎无感 | N/A |
+
+### 4.11 权限组删除流程 (`PermissionGroupDelete.perform_mutation`)
 
 **文件位置：** `saleor/graphql/account/mutations/permission_group/permission_group_delete.py`
 
@@ -739,7 +937,7 @@ def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
    └─ call_event(manager.permission_group_deleted, instance)
 ```
 
-### 4.9 员工删除流程 (`StaffDelete.perform_mutation`)
+### 4.12 员工删除流程 (`StaffDelete.perform_mutation`)
 
 **文件位置：** `saleor/graphql/account/mutations/staff/staff_delete.py` + `base.py:431-522`
 
@@ -859,7 +1057,9 @@ def _save_m2m(cls, info: ResolveInfo, instance, cleaned_data):
     ↓
 ┌─────────────────────────────────────────┐
 │  save() - 第1次落库（独立事务）          │
-│  └─ 实例本身保存（User/Group）           │
+│  ├─ 实例本身保存（User/Group）           │
+│  └─ StaffCreate 常规分支：发送密码邮件   │
+│     + 触发 staff_set_password_requested │
 └─────────────────────────────────────────┘
     ↓
 ┌─────────────────────────────────────────┐
@@ -886,6 +1086,7 @@ Webhook 事件触发 → 外部系统同步
 - ✅ `_save_m2m()` 内部的多对多操作在同一个 `traced_atomic_transaction` 中
 - ✅ 删除操作（`instance.delete()`）由 Django ORM 保证原子性
 - ⚠️ StaffUpdate 的 Side Effects 在 `post_save_action()` 之后执行，不在事务中
+- ✅ StaffCreate 复用分支（`send_notification=False`）：无通知发送，减少了通知失败导致不一致的风险
 
 ---
 

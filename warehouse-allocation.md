@@ -740,3 +740,255 @@ _handle_allocations_of_order_lines()  [complete_checkout.py:1278]
         └─ quantity_allocation_for_stocks = {} （空！）
             └─ available = stock.quantity （忽略已分配量！）
 ```
+
+---
+
+## 九、支付后分支与草稿单转正链路深度分析
+
+### 9.1 action_required 与退款门槛对订单创建及预留释放的影响
+
+#### 9.1.1 支付后分支控制逻辑
+
+**核心控制条件** (`saleor/checkout/complete_checkout.py:1171`):
+```python
+if not action_required and not _is_refund_ongoing(payment):
+    order = _create_order(...)
+    delete_checkouts([checkout_info.checkout.pk])
+```
+
+两个门槛条件**任一满足**都会阻止订单创建：
+
+| 条件 | 判定逻辑 | 来源 |
+|------|---------|------|
+| `action_required` | `txn.action_required` | 支付网关返回（如 3DS 验证） |
+| `_is_refund_ongoing(payment)` | 存在 `REFUND_ONGOING` 且成功的交易 | 支付退款中 |
+
+#### 9.1.2 完整分支流程图
+
+```
+complete_checkout_post_payment_part()
+    │
+    ├─ 检查 action_required
+    │   ├─ True: 释放 voucher 占用（lines 1162-1168）
+    │   │   └─ _release_checkout_voucher_usage()
+    │   └─ False: 继续
+    │
+    ├─ 检查 _is_refund_ongoing(payment)
+    │   ├─ True: 跳过订单创建
+    │   └─ False: 继续
+    │
+    ├─ 🔀 分支判断
+    │   │
+    │   ├─ ✅ 两个条件都不满足：创建订单路径
+    │   │   ├─ _create_order() → allocate_stocks()
+    │   │   ├─ delete_checkouts() → CASCADE 删除 Reservation
+    │   │   └─ 返回 (order, action_required, action_data)
+    │   │
+    │   └─ ❌ 任一条件满足：跳过订单创建
+    │       ├─ order = None
+    │       ├─ Checkout 保留 → Reservation 保留
+    │       └─ 返回 (None, action_required, action_data)
+```
+
+#### 9.1.3 Reservation 释放的条件化结论
+
+| 场景 | action_required | refund_ongoing | 订单创建 | Checkout 删除 | Reservation 释放 |
+|------|----------------|----------------|---------|--------------|-----------------|
+| 正常支付成功 | False | False | ✅ 是 | ✅ 是 | ✅ CASCADE 删除 |
+| 需 3DS 验证 | True | False | ❌ 否 | ❌ 否 | ❌ **保留** |
+| 退款中 | False | True | ❌ 否 | ❌ 否 | ❌ **保留** |
+| 两者都有 | True | True | ❌ 否 | ❌ 否 | ❌ **保留** |
+
+**关键结论**：
+- ✅ **无条件释放仅存在于正常支付成功场景**（`complete_checkout_post_payment_part` 硬编码删除）
+- ❌ **action_required 和退款中场景，Reservation 不会被释放**，依赖定时任务 `delete_expired_reservations_task` 过期清理
+- ⚠️ **voucher 在 action_required 时会被释放**（line 1162-1168），但 Reservation 不释放，存在不一致性
+
+#### 9.1.4 失败处理分支的预留行为
+
+**`_complete_checkout_fail_handler`** (`saleor/checkout/complete_checkout.py:1996-2033`):
+```python
+def _complete_checkout_fail_handler(checkout_info, manager, *, voucher_code=None, voucher=None, payment=None):
+    # 1. 释放 checkout processing indicator
+    # 2. 释放 voucher usage
+    # 3. 退款或取消支付
+    # ⚠️ 注意：没有释放 Reservation！
+```
+
+**失败场景下的 Reservation 状态**：
+- `InsufficientStock` 异常：Checkout 保留 → Reservation 保留
+- `GiftCardNotApplicable` 异常：Checkout 保留 → Reservation 保留
+- 其他异常：Checkout 保留 → Reservation 保留
+
+**设计意图**：失败时保留购物车，用户可调整后重试，无需重新预留。
+
+---
+
+### 9.2 draft_order_complete 调用差异分析
+
+#### 9.2.1 两条转正链路对比
+
+| 维度 | 正常结账链路 `_handle_allocations_of_order_lines` | 草稿单转正链路 `DraftOrderComplete.perform_mutation` |
+|------|------------------------------------------------|---------------------------------------------------|
+| **位置** | `complete_checkout.py:1265-1295` | `draft_order_complete.py:201-234` |
+| **调用方式** | 批量调用（所有订单行一次调用） | **逐行调用**（每行单独事务） |
+| `check_reservations` | 硬编码 `True` | `is_reservation_enabled(site_settings)`（配置驱动） |
+| `checkout_lines` | 传入，用于 `exclude_checkout_lines` | ❌ **不传入**（草稿单无 Checkout） |
+| `calculate_stocks_with_shipping_zones` | 传入 | ✅ 同样传入，来自 `site_settings` |
+| `additional_filter_lookup` | 传入（配送方式过滤） | ❌ 不传入 |
+| `collection_point_pk` | 传入（自提点过滤） | ❌ 不传入 |
+
+#### 9.2.2 逐行调用 vs 批量调用的关键差异
+
+**正常结账（批量）**:
+```python
+# complete_checkout.py:1278-1289
+allocate_stocks(
+    order_lines_info,  # 所有行一次性传入
+    ...
+    check_reservations=True,
+    checkout_lines=[line.line for line in checkout_lines],
+)
+```
+
+**草稿单转正（逐行）**:
+```python
+# draft_order_complete.py:212-234
+for line in lines:
+    if line.variant.track_inventory or line.variant.is_preorder_active():
+        line_data = OrderLineInfo(...)
+        order_lines_info.append(line_data)
+        try:
+            with traced_atomic_transaction():  # 每行单独事务
+                allocate_stocks(
+                    [line_data],  # 🔴 只传一行
+                    ...
+                    check_reservations=is_reservation_enabled(site_settings),
+                    # ❌ 没有 checkout_lines 参数
+                )
+                allocate_preorders(...)
+        except InsufficientStock as e:
+            # 逐行失败逐行抛错
+```
+
+**逐行调用的后果**:
+1. **生成器 bug 被隐藏**：每次调用 `allocate_stocks` 时 `stocks` 都是新的查询结果，`stocks_id` 生成器每次都是新的，不会出现重复消费问题
+2. **性能较差**：N 行商品 → N 次事务 + N 次库存查询 + N 次分配写入
+3. **部分成功风险**：前几行分配成功，某一行失败时已成功的分配不会回滚（因为每行独立事务）
+4. **可用量计算偏差**：前一行分配成功会扣减库存，后一行查询时看到的是扣减后的库存，与批量计算的结果可能不一致
+
+#### 9.2.3 check_reservations 参数差异的业务影响
+
+**正常结账** (`check_reservations=True` 硬编码):
+```python
+available = quantity - allocation - other_reservations
+```
+
+**草稿单转正** (`check_reservations=is_reservation_enabled(site_settings)`):
+```python
+if is_reservation_enabled(site_settings):
+    available = quantity - allocation - other_reservations
+else:
+    available = quantity - allocation  # 不考虑其他 checkout 的预留
+```
+
+**`is_reservation_enabled` 判定** (`saleor/warehouse/reservations.py:401-405`):
+```python
+def is_reservation_enabled(settings) -> bool:
+    return bool(
+        settings.reserve_stock_duration_authenticated_user
+        or settings.reserve_stock_duration_anonymous_user
+    )
+```
+
+**场景对比**:
+- 预留功能开启：两条链路可用量计算一致
+- 预留功能关闭：草稿单转正链路可用量更多（不扣除预留），可能与购物车链路的库存检查不一致
+
+#### 9.2.4 库存范围开关的一致性
+
+两边都使用 `site_settings.use_legacy_shipping_zone_stock_availability` 控制 `calculate_stocks_with_shipping_zones`，行为一致：
+- `True`: 考虑配送区域关联的仓库（legacy 行为）
+- `False`: 只考虑渠道直接关联的仓库
+
+**测试验证**（`test_draft_order_complete.py:709-741`）:
+```python
+def test_draft_order_complete_channel_with_shipping_zones_excluded_from_stock_calculation():
+    # use_legacy_shipping_zone_stock_availability = False
+    # 即使 channel.shipping_zones.clear()，也不会报 INSUFFICIENT_STOCK
+    # 因为库存范围不考虑 shipping zones
+```
+
+---
+
+### 9.3 现有测试梳理与遗漏覆盖点
+
+#### 9.3.1 已覆盖的测试场景
+
+| 测试用例 | 覆盖内容 | 文件位置 |
+|---------|---------|---------|
+| `test_draft_order_complete` | 基本分配、事件触发 | line 108 |
+| `test_draft_order_complete_no_automatically_confirm_all_new_orders` | 订单状态 | line 175 |
+| `test_draft_order_complete_by_user_no_channel_access` | 权限控制 | line 219 |
+| `test_draft_order_complete_by_app` | App 调用 | line 242 |
+| `test_draft_order_complete_with_voucher` | 优惠券处理 | line 272 |
+| `test_draft_order_complete_0_total` | 零元订单 | line 413 |
+| `test_draft_order_complete_channel_without_shipping_zones_assigned` | 无配送区域时的库存不足 | line 674 |
+| `test_draft_order_complete_channel_with_shipping_zones_excluded_from_stock_calculation` | 库存范围开关 | line 709 |
+| `test_draft_order_complete_product_without_inventory_tracking` | 无库存跟踪商品 | line 743 |
+| `test_draft_order_complete_with_preorder_lines` | 预购商品 | line 820 |
+
+#### 9.3.2 严重遗漏的测试覆盖点
+
+| 遗漏场景 | 风险等级 | 说明 |
+|---------|---------|------|
+| 🔴 **`action_required=True` 路径** | P0 | Reservation 保留，voucher 释放的不一致性 |
+| 🔴 **`_is_refund_ongoing=True` 路径** | P0 | Reservation 保留，订单不创建 |
+| 🔴 **`check_reservations=True/False` 差异** | P1 | 草稿单转正与正常结账的可用量计算差异 |
+| 🟠 **逐行分配部分成功** | P1 | 前 N-1 行成功，第 N 行失败，已分配的不回滚 |
+| 🟠 **多仓分配在草稿单中的行为** | P1 | 逐行调用 vs 批量调用的多仓分配结果差异 |
+| 🟠 **草稿单转正时现有 Reservation 冲突** | P1 | 其他 checkout 已预留该商品库存时的处理 |
+| 🟡 **`delete_checkout=False` 路径** | P2 | Reservation 与 Allocation 双重占用 |
+| 🟡 **失败处理分支的 Reservation 状态** | P2 | `_complete_checkout_fail_handler` 不释放 Reservation |
+| 🟡 **生成器 bug 在草稿单链路中的免疫性** | P2 | 逐行调用为何不会触发生成器 bug |
+
+#### 9.3.3 建议补充的测试用例
+
+**P0 级测试**:
+```python
+def test_complete_checkout_action_required_keeps_reservation():
+    # 验证 action_required=True 时 Reservation 保留
+
+def test_complete_checkout_refund_ongoing_keeps_reservation():
+    # 验证退款中时 Reservation 保留
+
+def test_draft_order_complete_check_reservations_enabled():
+    # 验证 is_reservation_enabled=True 时会扣除其他 checkout 的预留
+
+def test_draft_order_complete_check_reservations_disabled():
+    # 验证 is_reservation_enabled=False 时不扣除其他 checkout 的预留
+```
+
+**P1 级测试**:
+```python
+def test_draft_order_complete_partial_success_no_rollback():
+    # 验证多行分配时，某一行失败不影响已成功的行
+
+def test_draft_order_complete_multi_warehouse_allocation():
+    # 验证草稿单转正的多仓分配结果与正常结账一致
+
+def test_draft_order_complete_with_existing_reservations():
+    # 验证其他 checkout 已预留时，草稿单转正的可用量计算正确
+```
+
+**P2 级测试**:
+```python
+def test_create_order_from_checkout_keep_reservation():
+    # 验证 delete_checkout=False 时 Reservation 保留
+
+def test_complete_checkout_fail_keeps_reservation():
+    # 验证 InsufficientStock 异常时 Reservation 保留
+
+def test_allocate_stocks_generator_bug_hidden_in_draft_order():
+    # 验证逐行调用不会触发生成器 bug（用于文档化和回归）
+```

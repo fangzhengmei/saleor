@@ -565,12 +565,12 @@ def _complete_checkout_fail_handler(
     checkout = checkout_info.checkout
     update_fields = []
     
-    # 1. 释放处理标记
+    # 1. 释放处理标记（总是执行）
     if checkout.completing_started_at is not None:
         checkout.completing_started_at = None
         update_fields.append("completing_started_at")
     
-    # 2. 释放优惠券使用量
+    # 2. 释放优惠券使用量（仅当传入 voucher 时执行）
     if voucher:
         _release_checkout_voucher_usage(
             checkout, voucher_code, voucher, customer_email, update_fields
@@ -579,17 +579,48 @@ def _complete_checkout_fail_handler(
     if update_fields:
         checkout.save(update_fields=update_fields)
     
-    # 3. 退款/取消支付
+    # 3. 退款/取消支付（仅当传入 payment 时执行）
     if payment:
         gateway.payment_refund_or_void(
             payment, manager, channel_slug=checkout_info.channel.slug
         )
 ```
 
-**支付退款逻辑**（`saleor/payment/gateway.py:546-574`）：
-- 已捕获（captured）的支付 → 调用 `refund()` 退款
-- 已授权（authorized）但未捕获的支付 → 调用 `void()` 取消授权
-- 根据 `TransactionKind.REFUND_ONGOING` 或 `TransactionKind.VOID` 检查是否已处理，避免重复操作
+> **⚠️ 关键收敛**：优惠券回滚和支付退款**不是总能执行**，取决于调用时是否传入了 `voucher` 和 `payment` 参数。
+
+#### 各调用点参数对比
+
+| 调用位置 | 传入 `payment` | 传入 `voucher` | 说明 |
+|---------|--------------|---------------|------|
+| `_process_payment` 支付失败 | ❌ 不传 | ❌ 不传 | 支付失败时**不会**退款，**不会**回滚优惠券 |
+| `complete_checkout_pre_payment_part` 准备失败 | ✅ 传 | ❌ 不传 | 会退款，但**不会**回滚优惠券 |
+| `complete_checkout_post_payment_part` 订单创建失败 | ✅ 传 | ✅ 传 | 会退款，会回滚优惠券 |
+| `complete_checkout_with_payment` 支付变为 inactive | ✅ 传 | ⚠️ 传 `order_data["voucher"]` | 可能回滚优惠券（如果 order_data 中包含） |
+| `create_order_from_checkout` 订单创建失败 | ❌ 不传 | ✅ 传 | **不会**退款，但会回滚优惠券 |
+
+**支付退款前置条件**（`saleor/payment/gateway.py:546-574`）：
+
+`payment_refund_or_void` 内部还有两层检查：
+1. **`can_refund()`**：`payment.charge_status` 必须是 `PARTIALLY_CHARGED` / `FULLY_CHARGED` / `PARTIALLY_REFUNDED`
+2. **`can_void()`**：必须同时满足 `payment.not_charged` **且** `payment.is_authorized`
+
+> **⚠️ 关键收敛**：即使传入了 `payment`，也不一定能退款/取消。如果支付在授权阶段就失败了：
+> - `is_authorized` = False（没有成功的 AUTH 交易）
+> - `charge_status` = NOT_CHARGED
+> - 结果：`can_refund()` 和 `can_void()` 都返回 False，**什么也不做**
+
+**优惠券回滚前置条件**（`saleor/checkout/complete_checkout.py:156-177`）：
+
+`_release_checkout_voucher_usage` 内部还有检查：
+```python
+if not checkout.is_voucher_usage_increased:
+    return  # 优惠券未增加过，直接返回
+```
+
+> **⚠️ 关键收敛**：即使传入了 `voucher`，如果 `is_voucher_usage_increased` 为 False，也不会执行回滚。
+
+**防止重复退款**：
+根据 `TransactionKind.REFUND_ONGOING` 或 `TransactionKind.VOID` 检查是否已处理，避免重复操作。
 
 ---
 
@@ -605,6 +636,7 @@ def _complete_checkout_fail_handler(
   - 税费计算失败（`TaxError`）
   - 运费方法无效
   - 商品已下架/不可购买
+  - 优惠券不可用（`NotApplicable`）
 
 **代码位置**：`saleor/checkout/complete_checkout.py:1121-1129`
 
@@ -623,14 +655,18 @@ except ValidationError as exc:
     raise exc
 ```
 
+> **⚠️ 关键收敛**：此处调用 `_complete_checkout_fail_handler` 时传入了 `payment`，但**没有传入 `voucher`**。
+> - 如果 `_prepare_checkout_with_payment` 失败，优惠券还未增加，无需回滚
+> - 如果 `_get_order_data` 失败（在 `_prepare_order_data` 中调用了 `_process_voucher_data_for_order` 增加了优惠券），则优惠券**不会被回滚**（因为没传 voucher 参数）
+
 **各要素状态**：
 
 | 要素 | 状态 |
 |------|------|
 | **订单创建** | ❌ 未创建（`_create_order` 尚未调用） |
 | **库存预占** | ❌ 临时预占未创建（在 `_reserve_stocks_without_availability_check` 之前失败） |
-| **优惠券** | ✅ 回滚（`_release_checkout_voucher_usage`） |
-| **支付** | ✅ 退款/取消（如果已有支付） |
+| **优惠券** | ⚠️ 视失败时机而定<br>• `_prepare_checkout_with_payment` 失败：未增加，无需回滚<br>• `_get_order_data` 失败：已增加但**不回滚**（调用时未传 voucher 参数） |
+| **支付** | ✅ 尝试退款/取消（传入了 payment）<br>⚠️ 但受 `can_refund()`/`can_void()` 前置条件限制，可能实际不执行 |
 | **事件/通知** | ❌ 不触发任何订单事件或邮件 |
 | **事务** | 提交（使用 `transaction_with_commit_on_errors`） |
 
@@ -678,9 +714,15 @@ try:
     if not txn.is_success:
         raise PaymentError(txn.error)
 except PaymentError as e:
+    # ⚠️ 关键问题：只传了 checkout_info 和 manager，没有传 payment 和 voucher!
     _complete_checkout_fail_handler(checkout_info, manager)
     raise ValidationError(str(e), code=CheckoutErrorCode.PAYMENT_ERROR.value) from e
 ```
+
+> **⚠️ 关键收敛**：此处调用 `_complete_checkout_fail_handler` 时 **既没有传 `payment`，也没有传 `voucher`**！
+> - 支付不会被退款/取消
+> - 优惠券不会被回滚
+> - 只有 `checkout.completing_started_at` 会被清理
 
 **各要素状态**：
 
@@ -688,12 +730,14 @@ except PaymentError as e:
 |------|------|
 | **订单创建** | ❌ 未创建 |
 | **库存预占** | ✅ 临时预占已创建<br>⚠️ 等待过期自动清理 |
-| **优惠券** | ✅ 回滚（`_complete_checkout_fail_handler` 中释放） |
-| **支付** | ✅ 退款/取消（`payment_refund_or_void`） |
+| **优惠券** | ⚠️ 已增加但**不回滚**（调用时未传 voucher 参数）<br>下次重试时 `is_voucher_usage_increased=True` 会跳过重复增加 |
+| **支付** | ⚠️ **不退款/不取消**（调用时未传 payment 参数）<br>⚠️ 且 `can_refund()`/`can_void()` 前置条件可能不满足 |
+| **Transaction 记录** | ✅ 已创建（`kind=AUTH/CAPTURE`, `is_success=False`），用于审计和追踪 |
+| **支付状态** | ⚠️ 不更新（`gateway_postprocess` 对失败交易直接 return） |
 | **事件/通知** | ❌ 不触发 |
-| **事务** | 提交（`_process_payment` 内使用 `transaction_with_commit_on_errors`） |
+| **事务** | 提交（`_process_payment` 被 `transaction_with_commit_on_errors` 包裹） |
 
-> **注意**：支付失败时，`Transaction` 记录已创建（`kind=AUTH/CAPTURE`, `is_success=False`），用于审计和追踪。
+> **补充说明**：即使传入了 payment，支付状态的更新也只在 `gateway_postprocess` 中对成功交易执行。失败交易的支付状态保持原样，charge_status 仍为 NOT_CHARGED，is_authorized 仍为 False。
 
 ---
 
@@ -722,13 +766,18 @@ if action_required:
 
 **典型场景**：3D Secure 验证、SCA 强客户认证
 
+> **⚠️ 关键收敛**：此处直接调用 `_release_checkout_voucher_usage`，**没有通过 `_complete_checkout_fail_handler`**。
+> - 优惠券会被回滚（直接调用释放函数）
+> - 支付**不会**被退款（action_required 表示需要用户进一步验证，不是支付失败）
+> - 没有 `_complete_checkout_fail_handler` 中的其他清理逻辑
+
 **各要素状态**：
 
 | 要素 | 状态 |
 |------|------|
 | **订单创建** | ❌ 未创建（等待用户完成验证后重试） |
 | **库存预占** | ✅ 临时预占已创建<br>⚠️ 等待过期，如果用户在过期前完成验证，重试时会重新创建 |
-| **优惠券** | ✅ 释放（临时回滚，重试时重新增加） |
+| **优惠券** | ✅ 释放（直接调用 `_release_checkout_voucher_usage`，重试时重新增加） |
 | **支付** | ⚠️ 不退款，等待验证结果<br>`Transaction.action_required=True` |
 | **事件/通知** | ❌ 不触发 |
 | **事务** | 提交 |
@@ -742,11 +791,13 @@ payment.refresh_from_db()
 if not payment.is_active:
     _complete_checkout_fail_handler(
         checkout_info, manager,
-        voucher=order_data.get("voucher"),
+        voucher=order_data.get("voucher"),  # ⚠️ 传入的是 order_data 中的 voucher
         payment=payment,
     )
     raise ValidationError(...)
 ```
+
+> **⚠️ 关键收敛**：此处传入的 `voucher` 来自 `order_data.get("voucher")`，只有在 `_prepare_order_data` 中成功调用 `_process_voucher_data_for_order` 并返回 voucher 时才会有值。
 
 **各要素状态**：
 
@@ -754,8 +805,8 @@ if not payment.is_active:
 |------|------|
 | **订单创建** | ❌ 未创建 |
 | **库存预占** | ✅ 临时预占已创建，等待过期 |
-| **优惠券** | ✅ 回滚 |
-| **支付** | ✅ 退款/取消 |
+| **优惠券** | ⚠️ 可能回滚（取决于 `order_data["voucher"]` 是否存在） |
+| **支付** | ✅ 尝试退款/取消（传入了 payment）<br>⚠️ 受 `can_refund()`/`can_void()` 前置条件限制 |
 | **事件/通知** | ❌ 不触发 |
 | **事务** | 提交 |
 
@@ -770,9 +821,11 @@ if not payment.is_active:
 - 礼品卡不可用（`GiftCardNotApplicable`）
 - 其他数据库错误
 
+**有两个调用路径，处理逻辑不同**：
+
+**路径 A：支付流程中创建订单失败**（`complete_checkout_post_payment_part`）
 **代码位置**：`saleor/checkout/complete_checkout.py:1188-1206`
 
-**处理流程**：
 ```python
 try:
     order = _create_order(...)
@@ -781,52 +834,64 @@ except InsufficientStock as e:
         checkout_info, manager,
         voucher_code=checkout_info.voucher_code,
         voucher=checkout_info.voucher,
-        payment=payment,
+        payment=payment,  # ✅ 传入了 payment
     )
     error = prepare_insufficient_stock_checkout_validation_error(e)
     raise error from e
 ```
 
+**路径 B：直接从 checkout 创建订单失败**（`create_order_from_checkout`）
+**代码位置**：`saleor/checkout/complete_checkout.py:1668-1683`
+
+```python
+except InsufficientStock:
+    _complete_checkout_fail_handler(
+        checkout_info, manager,
+        voucher_code=code,
+        voucher=voucher,  # ✅ 传入了 voucher
+        # ❌ 没有传入 payment！
+    )
+    raise
+```
+
+> **⚠️ 关键收敛**：两个路径的参数传递不同！
+> - 路径 A（支付流程）：传入了 `payment` 和 `voucher`，会尝试退款和回滚优惠券
+> - 路径 B（直接创建订单）：只传入了 `voucher`，**不会退款**，但会回滚优惠券
+
 **子场景 5a：`Order.objects.create()` 之前失败**
 
-**各要素状态**：
-
-| 要素 | 状态 |
-|------|------|
-| **订单创建** | ❌ 未创建 |
-| **库存预占** | ❌ 正式分配未创建<br>✅ 临时预占已创建，等待过期 |
-| **优惠券** | ✅ 回滚 |
-| **支付** | ✅ 退款/取消 |
-| **事件/通知** | ❌ 不触发 |
-| **事务** | 回滚（`_create_order` 使用 `traced_atomic_transaction`） |
+| 要素 | 路径 A（支付流程） | 路径 B（直接创建） |
+|------|------------------|------------------|
+| **订单创建** | ❌ 未创建 | ❌ 未创建 |
+| **库存预占** | ❌ 正式分配未创建<br>✅ 临时预占已创建，等待过期 | ❌ 无临时预占<br>❌ 正式分配未创建 |
+| **优惠券** | ✅ 回滚（传入了 voucher） | ✅ 回滚（传入了 voucher） |
+| **支付** | ✅ 尝试退款/取消（传入了 payment）<br>⚠️ 受 `can_refund()`/`can_void()` 限制 | ❌ 不退款（未传入 payment） |
+| **事件/通知** | ❌ 不触发 | ❌ 不触发 |
+| **事务** | 回滚（`_create_order` 使用 `traced_atomic_transaction`） | 回滚 |
 
 **子场景 5b：`Order.objects.create()` 之后、`allocate_stocks()` 之前失败**
 
-**各要素状态**：
-
-| 要素 | 状态 |
-|------|------|
-| **订单创建** | ❌ 已创建但事务回滚，最终不存在 |
-| **库存预占** | ❌ 正式分配未创建<br>✅ 临时预占等待过期 |
-| **优惠券** | ✅ 回滚 |
-| **支付** | ✅ 退款/取消 |
-| **事件/通知** | ❌ 不触发（`transaction.on_commit` 回调因回滚不执行） |
-| **事务** | 回滚 |
+| 要素 | 路径 A（支付流程） | 路径 B（直接创建） |
+|------|------------------|------------------|
+| **订单创建** | ❌ 已创建但事务回滚，最终不存在 | ❌ 已创建但事务回滚，最终不存在 |
+| **库存预占** | ❌ 正式分配未创建<br>✅ 临时预占等待过期 | ❌ 正式分配未创建 |
+| **优惠券** | ✅ 回滚 | ✅ 回滚 |
+| **支付** | ✅ 尝试退款/取消<br>⚠️ 受前置条件限制 | ❌ 不退款 |
+| **事件/通知** | ❌ 不触发（`transaction.on_commit` 回调因回滚不执行） | ❌ 不触发 |
+| **事务** | 回滚 | 回滚 |
 
 **子场景 5c：`allocate_stocks()` 之后失败**
 
-**各要素状态**：
+| 要素 | 路径 A（支付流程） | 路径 B（直接创建） |
+|------|------------------|------------------|
+| **订单创建** | ❌ 已创建但事务回滚，最终不存在 | ❌ 已创建但事务回滚，最终不存在 |
+| **库存预占** | ❌ 正式分配已创建但事务回滚，最终不存在<br>✅ 临时预占等待过期 | ❌ 正式分配已创建但事务回滚，最终不存在 |
+| **优惠券** | ✅ 回滚 | ✅ 回滚 |
+| **支付** | ✅ 尝试退款/取消<br>⚠️ 受前置条件限制 | ❌ 不退款 |
+| **事件/通知** | ❌ 不触发 | ❌ 不触发 |
+| **事务** | 回滚 | 回滚 |
 
-| 要素 | 状态 |
-|------|------|
-| **订单创建** | ❌ 已创建但事务回滚，最终不存在 |
-| **库存预占** | ❌ 正式分配已创建但事务回滚，最终不存在<br>✅ 临时预占等待过期 |
-| **优惠券** | ✅ 回滚 |
-| **支付** | ✅ 退款/取消 |
-| **事件/通知** | ❌ 不触发 |
-| **事务** | 回滚 |
-
-> **关键洞察**：所有在 `_create_order` 内的数据库操作都在 `@traced_atomic_transaction()` 装饰的事务中，任何失败都会导致全部回滚。`order_created` 和 `send_order_confirmation` 通过 `transaction.on_commit` 注册，只有事务成功提交才会执行。
+> **关键洞察**：所有在 `_create_order` / `_create_order_from_checkout` 内的数据库操作都在事务中，任何失败都会导致全部回滚。`order_created` 和 `send_order_confirmation` 通过 `transaction.on_commit` 注册，只有事务成功提交才会执行。
 
 ---
 
@@ -894,13 +959,18 @@ Reservation.objects.bulk_create([
    - 结账删除时，`Reservation` 会级联删除
 
 **⚠️ 失败场景不主动删除**：
-`_complete_checkout_fail_handler` 中 **不** 包含删除临时预占的逻辑。临时预占依赖过期机制自动释放。
+`_complete_checkout_fail_handler` 中 **不** 包含删除临时预占的逻辑。所有失败场景下都不会主动删除临时预占，完全依赖：
+1. **过期自动清理**（主要方式）
+2. **结账删除时级联删除**（仅成功场景）
+3. **正式分配时自动排除**（不删除，仅计算可用量时排除）
 
 #### 正式分配（Allocation）的回滚
 
 - 正式分配在 `_create_order` / `_create_order_from_checkout` 的事务内创建
 - 如果订单创建失败，事务回滚会自动撤销 `Allocation` 记录
 - `Stock.quantity_allocated` 的更新也会被回滚
+
+> **⚠️ 关键收敛**：库存预占的释放是**最终一致**而非**强一致**的。失败场景下临时预占会存在 `RESERVE_DURATION` 秒，这段时间内其他用户可能看到"库存不足"，即使原订单已失败。
 
 ---
 
@@ -951,17 +1021,25 @@ transaction.on_commit(
 
 ### 9.6 失败场景汇总表
 
+> **⚠️ 收敛说明**：以下状态基于代码分析的"最坏情况"或"典型情况"，实际行为受多种前置条件影响，详见各时点详细分析。
+
 | 失败时点 | 订单创建 | 库存临时预占 | 库存正式分配 | 优惠券 | 支付 | 事件/通知 | 事务处理 |
 |---------|---------|-------------|-------------|--------|------|----------|---------|
-| **支付前准备失败** | ❌ 未创建 | ❌ 未创建 | ❌ 未创建 | ✅ 回滚 | ✅ 退款/取消 | ❌ 不触发 | 提交 |
-| **临时预占后崩溃** | ❌ 未创建 | ✅ 已创建<br>等待过期 | ❌ 未创建 | ⚠️ 可能已增加 | ❌ 未处理 | ❌ 不触发 | 已提交 |
-| **支付处理失败** | ❌ 未创建 | ✅ 已创建<br>等待过期 | ❌ 未创建 | ✅ 回滚 | ✅ 退款/取消 | ❌ 不触发 | 提交 |
-| **action_required** | ❌ 未创建<br>等待重试 | ✅ 已创建<br>等待过期 | ❌ 未创建 | ✅ 临时释放 | ⚠️ 不退款<br>等待验证 | ❌ 不触发 | 提交 |
-| **支付变为inactive** | ❌ 未创建 | ✅ 已创建<br>等待过期 | ❌ 未创建 | ✅ 回滚 | ✅ 退款/取消 | ❌ 不触发 | 提交 |
-| **订单创建前失败** | ❌ 未创建 | ✅ 已创建<br>等待过期 | ❌ 未创建 | ✅ 回滚 | ✅ 退款/取消 | ❌ 不触发 | 回滚 |
-| **订单创建后失败** | ❌ 已创建但回滚 | ✅ 已创建<br>等待过期 | ❌ 已创建但回滚 | ✅ 回滚 | ✅ 退款/取消 | ❌ 不触发 | 回滚 |
-| **库存分配后失败** | ❌ 已创建但回滚 | ✅ 已创建<br>等待过期 | ❌ 已创建但回滚 | ✅ 回滚 | ✅ 退款/取消 | ❌ 不触发 | 回滚 |
+| **支付前准备失败** | ❌ 未创建 | ❌ 未创建 | ❌ 未创建 | ⚠️ 视时机而定<br>• 早期失败：未增加<br>• 后期失败：已增加但**不回滚**（调用未传 voucher） | ⚠️ 尝试退款（传入了 payment）<br>但受 `can_refund()`/`can_void()` 限制，可能不执行 | ❌ 不触发 | 提交 |
+| **临时预占后崩溃** | ❌ 未创建 | ✅ 已创建<br>等待过期 | ❌ 未创建 | ⚠️ 可能已增加<br>`is_voucher_usage_increased=True` | ❌ 未处理 | ❌ 不触发 | 已提交 |
+| **支付处理失败** | ❌ 未创建 | ✅ 已创建<br>等待过期 | ❌ 未创建 | ⚠️ 已增加但**不回滚**<br>（调用未传 voucher） | ⚠️ **不退款/不取消**<br>（调用未传 payment + 前置条件可能不满足） | ❌ 不触发 | 提交 |
+| **action_required** | ❌ 未创建<br>等待重试 | ✅ 已创建<br>等待过期 | ❌ 未创建 | ✅ 释放（直接调用释放函数） | ⚠️ 不退款，等待验证<br>`Transaction.action_required=True` | ❌ 不触发 | 提交 |
+| **支付变为inactive** | ❌ 未创建 | ✅ 已创建<br>等待过期 | ❌ 未创建 | ⚠️ 可能回滚（取决于 `order_data["voucher"]` 是否存在） | ⚠️ 尝试退款（传入了 payment）<br>但受前置条件限制 | ❌ 不触发 | 提交 |
+| **订单创建前失败（路径A）** | ❌ 未创建 | ✅ 已创建<br>等待过期 | ❌ 未创建 | ✅ 回滚（传入了 voucher） | ⚠️ 尝试退款（传入了 payment）<br>但受前置条件限制 | ❌ 不触发 | 回滚 |
+| **订单创建前失败（路径B）** | ❌ 未创建 | ❌ 无临时预占 | ❌ 未创建 | ✅ 回滚（传入了 voucher） | ❌ 不退款（未传 payment） | ❌ 不触发 | 回滚 |
+| **订单创建后失败（路径A）** | ❌ 已创建但回滚 | ✅ 已创建<br>等待过期 | ❌ 已创建但回滚 | ✅ 回滚 | ⚠️ 尝试退款<br>但受前置条件限制 | ❌ 不触发 | 回滚 |
+| **订单创建后失败（路径B）** | ❌ 已创建但回滚 | ❌ 无临时预占 | ❌ 已创建但回滚 | ✅ 回滚 | ❌ 不退款 | ❌ 不触发 | 回滚 |
+| **库存分配后失败（路径A）** | ❌ 已创建但回滚 | ✅ 已创建<br>等待过期 | ❌ 已创建但回滚 | ✅ 回滚 | ⚠️ 尝试退款<br>但受前置条件限制 | ❌ 不触发 | 回滚 |
+| **库存分配后失败（路径B）** | ❌ 已创建但回滚 | ❌ 无临时预占 | ❌ 已创建但回滚 | ✅ 回滚 | ❌ 不退款 | ❌ 不触发 | 回滚 |
 | **订单成功后崩溃** | ✅ 已创建 | ❌ 已释放<br>（结账删除级联） | ✅ 已创建 | ✅ 已使用 | ✅ 已关联 | ✅ 已触发 | 已提交 |
+
+> **路径 A** = 支付流程中创建订单（`complete_checkout_post_payment_part`）<br>
+> **路径 B** = 直接从 checkout 创建订单（`create_order_from_checkout` / `OrderCreateFromCheckout` mutation）
 
 ---
 
@@ -973,8 +1051,11 @@ transaction.on_commit(
 | 失败处理器 | `saleor/checkout/complete_checkout.py:1996` | `_complete_checkout_fail_handler()` |
 | 支付退款/取消 | `saleor/payment/gateway.py:546` | `payment_refund_or_void()` |
 | 优惠券回滚 | `saleor/checkout/complete_checkout.py:156` | `_release_checkout_voucher_usage()` |
-| 支付处理失败 | `saleor/checkout/complete_checkout.py:1082` | `_process_payment()` 异常处理 |
-| 订单创建失败 | `saleor/checkout/complete_checkout.py:1188` | `complete_checkout_post_payment_part()` 异常处理 |
+| 支付处理失败（缺参数） | `saleor/checkout/complete_checkout.py:1082` | `_process_payment()` 异常处理 |
+| 订单创建失败（支付流程） | `saleor/checkout/complete_checkout.py:1188` | `complete_checkout_post_payment_part()` 异常处理 |
+| 订单创建失败（直接创建） | `saleor/checkout/complete_checkout.py:1668` | `create_order_from_checkout()` 异常处理 |
+| 支付状态检查 | `saleor/payment/models.py:443` | `Payment.can_void()`, `Payment.can_refund()` |
+| 交易后处理（失败跳过） | `saleor/payment/utils.py:562` | `gateway_postprocess()` |
 | 过期预占清理 | `saleor/warehouse/tasks.py:27` | `delete_expired_reservations_task()` |
 | 订单已创建检查 | `saleor/checkout/complete_checkout.py:1844` | `Order.objects.get_by_checkout_token()` |
 
@@ -991,6 +1072,7 @@ transaction.on_commit(
    - 失败时不主动删除临时预占，依赖过期机制
    - 简化了失败处理逻辑，避免分布式事务问题
    - 代价是库存可能被"锁定"一段时间（`RESERVE_DURATION`）
+   - ⚠️ **收敛**：这是**最终一致**而非**强一致**，失败后短时间内库存仍显示被占用
 
 3. **事件驱动的最终一致性**：
    - 所有事件和通知通过 `transaction.on_commit` 注册
@@ -1002,3 +1084,17 @@ transaction.on_commit(
    - `checkout.is_voucher_usage_increased` 防止优惠券重复增加
    - `Order.objects.get_by_checkout_token()` 防止订单重复创建
    - `payment_refund_or_void` 检查已有交易，防止重复退款
+
+5. **⚠️ 失败处理的不一致性（新发现）**：
+   - `_complete_checkout_fail_handler` 的参数传递不统一
+   - 支付失败（`_process_payment` 内）时**不退款也不回滚优惠券**
+   - 直接创建订单（`OrderCreateFromCheckout` mutation）失败时**不退款**
+   - 支付前准备后期失败时**不回滚优惠券**
+   - 这些可能是代码缺陷，需要注意
+
+6. **⚠️ 支付退款/取消的前置条件（新发现）**：
+   - 即使传入 `payment`，也不一定能退款/取消
+   - `can_void()` 需要 `not_charged and is_authorized`
+   - `can_refund()` 需要特定的 `charge_status`
+   - 如果支付在授权阶段就失败，两个条件都不满足，什么也不做
+   - 失败交易的支付状态不会更新（`gateway_postprocess` 对失败交易直接 return）

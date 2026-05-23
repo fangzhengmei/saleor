@@ -173,9 +173,10 @@ def invalidate_order_prices(order: Order, *, save: bool = False) -> None:
         order.save(update_fields=["should_refresh_prices", "updated_at"])
 ```
 
-**⚠️ 注意**: 此函数定义了，但**未被业务代码直接调用**。业务代码主要通过两种方式设置刷新标记：
-1. 直接设置 `order.should_refresh_prices = True` 然后保存
-2. 批量 `update()` 语句
+**⚠️ 重要修正**: 此函数**被业务代码广泛调用**，是设置刷新标记的主要方式。业务代码通过三种方式设置刷新标记：
+1. **调用 `invalidate_order_prices()`** - 主要方式，共 13 处调用（详见第 4 节）
+2. **直接设置 `order.should_refresh_prices = True`** - 特殊场景（如 `TaxExemptionManage`）
+3. **批量 `update()` / `bulk_update()`** - 异步任务批量处理时使用
 
 ---
 
@@ -324,67 +325,138 @@ tax_app_identifier 以 PLUGIN_IDENTIFIER_PREFIX 开头时:
 
 ## 四、业务入口：设置 `should_refresh_prices=True` 的场景
 
-### 4.1 GraphQL Mutations（通过 `invalidate_order_prices` 或直接设置）
+### 4.0 `invalidate_order_prices` 调用方式详解
 
-#### 订单行相关操作
-| Mutation | 文件位置 | 触发场景 |
-|----------|----------|----------|
-| `DraftOrderCreate` | `saleor/graphql/order/mutations/draft_order_create.py` | 创建草稿订单时 |
-| `DraftOrderUpdate` | `saleor/graphql/order/mutations/draft_order_update.py` | 更新草稿订单时 |
-| `OrderLinesCreate` | `saleor/graphql/order/mutations/order_lines_create.py` | 添加订单行时 |
-| `OrderLineUpdate` | `saleor/graphql/order/mutations/order_line_update.py` | 更新订单行（数量、价格）时 |
-| `OrderLineDelete` | `saleor/graphql/order/mutations/order_line_delete.py` | 删除订单行时 |
+**函数签名**:
+```python
+def invalidate_order_prices(order: Order, *, save: bool = False) -> None:
+```
 
-#### 折扣相关操作
-| Mutation | 文件位置 | 触发场景 |
-|----------|----------|----------|
-| `OrderDiscountAdd` | `saleor/graphql/order/mutations/order_discount_add.py` | 添加订单折扣时 |
-| `OrderDiscountDelete` | `saleor/graphql/order/mutations/order_discount_delete.py` | 删除订单折扣时 |
-| `OrderLineDiscountUpdate` | `saleor/graphql/order/mutations/order_line_discount_update.py` | 更新订单行折扣时 |
-| `OrderLineDiscountRemove` | `saleor/graphql/order/mutations/order_line_discount_remove.py` | 移除订单行折扣时 |
+**两种调用模式**:
+1. **`invalidate_order_prices(order)`** - 仅设置内存属性，需后续手动调用 `order.save()` 或 `bulk_update()`
+2. **`invalidate_order_prices(order, save=True)`** - 设置属性后立即保存到数据库
 
-#### 配送方式相关操作
-| Mixin 方法 | 文件位置 | 触发场景 |
-|------------|----------|----------|
-| `ShippingMethodUpdateMixin.update_shipping_method` | `saleor/graphql/order/mutations/utils.py:119-134` | 更新配送方式时 |
-| `ShippingMethodUpdateMixin.clear_shipping_method_from_order` | `saleor/graphql/order/mutations/utils.py:105-116` | 清除配送方式时 |
-
-#### 其他订单操作
-| Mutation | 文件位置 | 触发场景 |
-|----------|----------|----------|
-| `OrderUpdate` | `saleor/graphql/order/mutations/order_update.py` | 更新订单地址、用户等信息时 |
-| `TaxExemptionManage` | `saleor/graphql/tax/mutations/tax_exemption_manage.py:111` | 设置/取消税务豁免时（直接设置 `should_refresh_prices=True`） |
+**调用分布（共 13 处非测试调用）**:
+- GraphQL Mutations: 11 处
+- 异步任务: 2 处
 
 ---
 
-### 4.2 异步任务（直接批量更新）
+### 4.1 GraphQL Mutations 调用明细
 
-| 任务函数 | 文件位置 | 触发场景 |
-|----------|----------|----------|
-| `drop_invalid_shipping_methods_relations_for_given_channels` | `saleor/shipping/tasks.py:29-33` | 配送方法从渠道移除时，批量更新使用了该配送方法的可编辑订单 |
-| `disconnect_voucher_codes_from_draft_orders_task` | `saleor/discount/tasks.py:304-324` | 凭证码与草稿订单断开连接时，批量标记重算 |
+#### 模式 A：`invalidate_order_prices(order)` + 手动 save（共 7 处）
+
+| 序号 | 触发场景 | 文件位置 | 行号 | 后续保存方式 |
+|------|----------|----------|------|-------------|
+| 1 | **DraftOrderCreate** | `saleor/graphql/order/mutations/draft_order_create.py` | 439 | `instance.save()` 更新多个字段 |
+| 2 | **DraftOrderUpdate** | `saleor/graphql/order/mutations/draft_order_update.py` | 286 | `instance.save()` 更新多个字段 |
+| 3 | **OrderLinesCreate** | `saleor/graphql/order/mutations/order_lines_create.py` | 219 | `order.save()` 更新多个字段 |
+| 4 | **OrderLineUpdate** | `saleor/graphql/order/mutations/order_line_update.py` | 112 | `order.save(update_fields=["should_refresh_prices", ...])` |
+| 5 | **OrderLineDelete** | `saleor/graphql/order/mutations/order_line_delete.py` | 105 | `order.save(update_fields=["should_refresh_prices", ...])` |
+| 6 | **OrderDiscountDelete** | `saleor/graphql/order/mutations/order_discount_delete.py` | 69 | `order.save(update_fields=["should_refresh_prices", ...])` |
+| 7 | **OrderUpdate** | `saleor/graphql/order/mutations/order_update.py` | 156 | `_save_order_instance()` 统一保存 |
+
+#### 模式 B：`invalidate_order_prices(order, save=True)`（共 3 处）
+
+| 序号 | 触发场景 | 文件位置 | 行号 | 说明 |
+|------|----------|----------|------|------|
+| 8 | **OrderDiscountAdd** | `saleor/graphql/order/mutations/order_discount_add.py` | 85 | 函数内部自动保存 |
+| 9 | **OrderLineDiscountUpdate** | `saleor/graphql/order/mutations/order_line_discount_update.py` | 85 | 函数内部自动保存 |
+| 10 | **OrderLineDiscountRemove** | `saleor/graphql/order/mutations/order_line_discount_remove.py` | 62 | 函数内部自动保存 |
+
+#### 模式 C：Mixin 方法调用 `invalidate_order_prices(order)`（共 2 处）
+
+| 序号 | 触发场景 | 文件位置 | 行号 | 说明 |
+|------|----------|----------|------|------|
+| 11 | **update_shipping_method** | `saleor/graphql/order/mutations/utils.py` | 134 | `ShippingMethodUpdateMixin` 方法，调用方后续负责保存 |
+| 12 | **clear_shipping_method_from_order** | `saleor/graphql/order/mutations/utils.py` | 116 | `ShippingMethodUpdateMixin` 方法，调用方后续负责保存 |
+
+#### 模式 D：直接设置 `should_refresh_prices = True`（共 1 处）
+
+| 序号 | 触发场景 | 文件位置 | 行号 | 说明 |
+|------|----------|----------|------|------|
+| 13 | **TaxExemptionManage** | `saleor/graphql/tax/mutations/tax_exemption_manage.py` | 111 | 直接设置属性后 `order.save()` |
 
 ---
 
-### 4.3 触发入口汇总表
+### 4.2 异步任务调用明细
 
-| 触发方式 | 触发场景 | 设置方式 | 适用订单状态 |
-|----------|----------|----------|-------------|
-| **创建草稿订单** | `DraftOrderCreate` mutation | `invalidate_order_prices()` | DRAFT |
-| **更新草稿订单** | `DraftOrderUpdate` mutation | `invalidate_order_prices()` | DRAFT |
-| **添加订单行** | `OrderLinesCreate` mutation | `invalidate_order_prices()` | DRAFT / UNCONFIRMED |
-| **更新订单行** | `OrderLineUpdate` mutation | `invalidate_order_prices()` | DRAFT / UNCONFIRMED |
-| **删除订单行** | `OrderLineDelete` mutation | `invalidate_order_prices()` | DRAFT / UNCONFIRMED |
-| **添加订单折扣** | `OrderDiscountAdd` mutation | `invalidate_order_prices()` | DRAFT / UNCONFIRMED |
-| **删除订单折扣** | `OrderDiscountDelete` mutation | `invalidate_order_prices()` | DRAFT / UNCONFIRMED |
-| **更新行折扣** | `OrderLineDiscountUpdate` mutation | `invalidate_order_prices()` | DRAFT / UNCONFIRMED |
-| **移除行折扣** | `OrderLineDiscountRemove` mutation | `invalidate_order_prices()` | DRAFT / UNCONFIRMED |
-| **更新配送方式** | `update_shipping_method()` | `invalidate_order_prices()` | DRAFT / UNCONFIRMED |
-| **清除配送方式** | `clear_shipping_method_from_order()` | `invalidate_order_prices()` | DRAFT / UNCONFIRMED |
-| **更新订单信息** | `OrderUpdate` mutation | `invalidate_order_prices()` | DRAFT / UNCONFIRMED |
-| **税务豁免管理** | `TaxExemptionManage` mutation | 直接设置 `= True` | DRAFT / UNCONFIRMED |
-| **配送方法失效** | 异步任务 `drop_invalid_shipping_methods_...` | 批量 `update()` | DRAFT / UNCONFIRMED |
-| **凭证码失效** | 异步任务 `disconnect_voucher_codes_...` | 批量 `bulk_update()` | DRAFT |
+#### 模式 E：`invalidate_order_prices()` + `bulk_update()`（共 1 处）
+
+| 序号 | 触发场景 | 文件位置 | 行号 | 说明 |
+|------|----------|----------|------|------|
+| 14 | **recalculate_orders_task** | `saleor/order/tasks.py` | 44 | 遍历订单调用 `invalidate_order_prices()` 后，`bulk_update()` 批量保存 |
+
+#### 模式 F：直接批量 `update()`（共 2 处）
+
+| 序号 | 触发场景 | 文件位置 | 行号 | 说明 |
+|------|----------|----------|------|------|
+| 15 | **drop_invalid_shipping_methods_relations_for_given_channels** | `saleor/shipping/tasks.py` | 33 | 直接 `update(shipping_method=None, should_refresh_prices=True)` 批量更新 |
+| 16 | **disconnect_voucher_codes_from_draft_orders_task** | `saleor/discount/tasks.py` | 315 | 遍历订单直接设置属性后，`bulk_update()` 批量保存 |
+
+---
+
+### 4.3 触发入口汇总表（16 个入口，逐一核对）
+
+| 序号 | 触发方式 | 触发场景 | 设置方式 | 具体代码 | 适用订单状态 |
+|------|----------|----------|----------|----------|-------------|
+| 1 | **创建草稿订单** | `DraftOrderCreate` mutation | `invalidate_order_prices()` + 手动 save | `invalidate_order_prices(instance)` → `instance.save()` | DRAFT |
+| 2 | **更新草稿订单** | `DraftOrderUpdate` mutation | `invalidate_order_prices()` + 手动 save | `invalidate_order_prices(instance)` → `instance.save()` | DRAFT |
+| 3 | **添加订单行** | `OrderLinesCreate` mutation | `invalidate_order_prices()` + 手动 save | `invalidate_order_prices(order)` → `order.save()` | DRAFT / UNCONFIRMED |
+| 4 | **更新订单行** | `OrderLineUpdate` mutation | `invalidate_order_prices()` + 手动 save | `invalidate_order_prices(order)` → `order.save(update_fields=...)` | DRAFT / UNCONFIRMED |
+| 5 | **删除订单行** | `OrderLineDelete` mutation | `invalidate_order_prices()` + 手动 save | `invalidate_order_prices(order)` → `order.save(update_fields=...)` | DRAFT / UNCONFIRMED |
+| 6 | **添加订单折扣** | `OrderDiscountAdd` mutation | `invalidate_order_prices(save=True)` | `invalidate_order_prices(order, save=True)` | DRAFT / UNCONFIRMED |
+| 7 | **删除订单折扣** | `OrderDiscountDelete` mutation | `invalidate_order_prices()` + 手动 save | `invalidate_order_prices(order)` → `order.save(update_fields=...)` | DRAFT / UNCONFIRMED |
+| 8 | **更新行折扣** | `OrderLineDiscountUpdate` mutation | `invalidate_order_prices(save=True)` | `invalidate_order_prices(order, save=True)` | DRAFT / UNCONFIRMED |
+| 9 | **移除行折扣** | `OrderLineDiscountRemove` mutation | `invalidate_order_prices(save=True)` | `invalidate_order_prices(order, save=True)` | DRAFT / UNCONFIRMED |
+| 10 | **更新配送方式** | `update_shipping_method()` Mixin | `invalidate_order_prices()` + 调用方保存 | `invalidate_order_prices(order)` | DRAFT / UNCONFIRMED |
+| 11 | **清除配送方式** | `clear_shipping_method_from_order()` Mixin | `invalidate_order_prices()` + 调用方保存 | `invalidate_order_prices(order)` | DRAFT / UNCONFIRMED |
+| 12 | **更新订单信息** | `OrderUpdate` mutation | `invalidate_order_prices()` + 统一保存 | `invalidate_order_prices(instance)` → `_save_order_instance()` | DRAFT / UNCONFIRMED |
+| 13 | **税务豁免管理** | `TaxExemptionManage` mutation | 直接赋值 + save | `order.should_refresh_prices = True` → `order.save()` | DRAFT / UNCONFIRMED |
+| 14 | **订单重算任务** | `recalculate_orders_task` 异步任务 | `invalidate_order_prices()` + 批量保存 | `invalidate_order_prices(order)` → `bulk_update()` | DRAFT / UNCONFIRMED |
+| 15 | **配送方法失效** | 异步任务 `drop_invalid_shipping_methods_...` | 直接批量 `update()` | `update(..., should_refresh_prices=True)` | DRAFT / UNCONFIRMED |
+| 16 | **凭证码失效** | 异步任务 `disconnect_voucher_codes_...` | 直接赋值 + `bulk_update()` | `order.should_refresh_prices = True` → `bulk_update()` | DRAFT |
+
+---
+
+### 4.4 设置方式分类统计
+
+| 设置方式 | 数量 | 占比 | 典型场景 |
+|----------|------|------|----------|
+| `invalidate_order_prices()` + 手动 save | 8 | 50% | 大部分 mutations（需要同时更新其他字段时） |
+| `invalidate_order_prices(save=True)` | 3 | 18.75% | 折扣相关 mutation（仅需更新刷新标记时） |
+| 直接设置 `should_refresh_prices = True` + save | 2 | 12.5% | `TaxExemptionManage`、凭证码失效任务 |
+| 批量 `update()` / `bulk_update()` | 3 | 18.75% | 异步任务批量处理 |
+| **总计** | **16** | **100%** | |
+
+---
+
+### 4.5 关键调用链说明
+
+**典型 Mutation 调用链（以 OrderLineUpdate 为例）**:
+```
+OrderLineUpdate.save()
+    ↓
+change_order_line_quantity()  # 修改订单行数量
+    ↓
+invalidate_order_prices(order)  # 设置 should_refresh_prices = True（内存）
+    ↓
+order.save(update_fields=["should_refresh_prices", "weight", "updated_at"])
+    ↓
+后续 GraphQL 解析时触发 fetch_order_prices_if_expired() 实际重算
+```
+
+**典型异步任务调用链（以 recalculate_orders_task 为例）**:
+```
+recalculate_orders_task(order_ids)
+    ↓
+for order in orders:
+    invalidate_order_prices(order)  # 设置内存属性
+    ↓
+Order.objects.bulk_update(orders, ["should_refresh_prices"])  # 批量保存
+    ↓
+后续订单访问时触发实际重算
+```
 
 ---
 
@@ -463,10 +535,16 @@ _apply_tax_data() 应用税务数据到订单和订单行
    **修正**: 该方法是死代码，从未被调用。真正的覆盖策略在 `tax/webhooks/shared.py` 中实现。
 
 2. **错误**: `mark_order_as_priced` 函数标记重算
-   **修正**: 函数实际名为 `invalidate_order_prices`，且**未被业务代码直接调用**。业务代码主要通过直接设置属性或批量更新来标记重算。
+   **修正**: 函数实际名为 `invalidate_order_prices`。
 
-3. **错误**: 未说明哪些业务入口会设置刷新标记
-   **修正**: 补充了 4.1-4.3 节，详细列出了所有 15 个业务入口。
+3. **错误**: `invalidate_order_prices` 未被业务代码直接调用
+   **修正**: 该函数**被业务代码广泛调用**，共 13 处非测试调用，是设置刷新标记的主要方式。另有 3 处直接设置属性或批量更新。
+
+4. **错误**: 未说明哪些业务入口会设置刷新标记
+   **修正**: 补充了 4.1-4.5 节，详细列出了所有 16 个业务入口及其具体调用方式。
+
+5. **错误**: 未区分 `invalidate_order_prices()` 的两种调用模式
+   **修正**: 明确了 `save=True`（3 处，折扣相关）和 `save=False`（10 处，需后续手动保存）两种调用模式的区别和使用场景。
 
 ### 7.2 三种策略实际生效位置
 
@@ -516,6 +594,8 @@ _calculate_and_add_tax()
 
 ## 九、关键代码位置索引
 
+### 9.1 核心策略与流程
+
 | 功能模块 | 文件位置 | 行号 |
 |---------|----------|------|
 | 税务策略枚举 | `saleor/tax/__init__.py` | 1-6 |
@@ -531,6 +611,29 @@ _calculate_and_add_tax()
 | Webhook 路径税费计算 | `saleor/order/calculations.py` | 426-457 |
 | 固定税率计算 | `saleor/tax/calculations/order.py` | 26-71 |
 | 税务数据应用 | `saleor/order/calculations.py` | 553-612 |
-| 税务豁免管理 | `saleor/graphql/tax/mutations/tax_exemption_manage.py` | 109-114 |
-| 配送方式失效处理 | `saleor/shipping/tasks.py` | 29-33 |
-| 凭证码失效处理 | `saleor/discount/tasks.py` | 313-316 |
+
+### 9.2 `invalidate_order_prices` 调用位置（主要）
+
+| 调用场景 | 文件位置 | 行号 | 调用方式 |
+|---------|----------|------|----------|
+| 创建草稿订单 | `saleor/graphql/order/mutations/draft_order_create.py` | 439 | `invalidate_order_prices(instance)` |
+| 更新草稿订单 | `saleor/graphql/order/mutations/draft_order_update.py` | 286 | `invalidate_order_prices(instance)` |
+| 添加订单行 | `saleor/graphql/order/mutations/order_lines_create.py` | 219 | `invalidate_order_prices(order)` |
+| 更新订单行 | `saleor/graphql/order/mutations/order_line_update.py` | 112 | `invalidate_order_prices(order)` |
+| 删除订单行 | `saleor/graphql/order/mutations/order_line_delete.py` | 105 | `invalidate_order_prices(order)` |
+| 添加订单折扣 | `saleor/graphql/order/mutations/order_discount_add.py` | 85 | `invalidate_order_prices(order, save=True)` |
+| 删除订单折扣 | `saleor/graphql/order/mutations/order_discount_delete.py` | 69 | `invalidate_order_prices(order)` |
+| 更新行折扣 | `saleor/graphql/order/mutations/order_line_discount_update.py` | 85 | `invalidate_order_prices(order, save=True)` |
+| 移除行折扣 | `saleor/graphql/order/mutations/order_line_discount_remove.py` | 62 | `invalidate_order_prices(order, save=True)` |
+| 更新配送方式 | `saleor/graphql/order/mutations/utils.py` | 134 | `invalidate_order_prices(order)` |
+| 清除配送方式 | `saleor/graphql/order/mutations/utils.py` | 116 | `invalidate_order_prices(order)` |
+| 更新订单信息 | `saleor/graphql/order/mutations/order_update.py` | 156 | `invalidate_order_prices(instance)` |
+| 订单重算任务 | `saleor/order/tasks.py` | 44 | `invalidate_order_prices(order)` |
+
+### 9.3 其他刷新标记设置位置
+
+| 调用场景 | 文件位置 | 行号 | 设置方式 |
+|---------|----------|------|----------|
+| 税务豁免管理 | `saleor/graphql/tax/mutations/tax_exemption_manage.py` | 111 | 直接 `order.should_refresh_prices = True` |
+| 配送方法失效处理 | `saleor/shipping/tasks.py` | 33 | 批量 `update(..., should_refresh_prices=True)` |
+| 凭证码失效处理 | `saleor/discount/tasks.py` | 315 | 直接赋值 + `bulk_update()` |

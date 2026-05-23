@@ -333,12 +333,17 @@ def invalidate_order_prices(order: Order, *, save: bool = False) -> None:
 ```
 
 **两种调用模式**:
-1. **`invalidate_order_prices(order)`** - 仅设置内存属性，需后续手动调用 `order.save()` 或 `bulk_update()`
-2. **`invalidate_order_prices(order, save=True)`** - 设置属性后立即保存到数据库
+1. **`invalidate_order_prices(order)`**（`save=False`，共 10 处）
+   - 仅设置内存属性，需后续手动调用 `order.save()`（9 处）或 `bulk_update()`（1 处）
+2. **`invalidate_order_prices(order, save=True)`**（共 3 处）
+   - 设置属性后立即保存到数据库
 
 **调用分布（共 13 处非测试调用）**:
-- GraphQL Mutations: 11 处
-- 异步任务: 2 处
+- GraphQL Mutations: 12 处
+  - `save=False`: 9 处（7 处直接 mutation + 2 处 Mixin 方法）
+  - `save=True`: 3 处（折扣相关）
+- 异步任务: 1 处
+  - `save=False`: 1 处（后续 `bulk_update()`）
 
 ---
 
@@ -371,11 +376,12 @@ def invalidate_order_prices(order: Order, *, save: bool = False) -> None:
 | 11 | **update_shipping_method** | `saleor/graphql/order/mutations/utils.py` | 134 | `ShippingMethodUpdateMixin` 方法，调用方后续负责保存 |
 | 12 | **clear_shipping_method_from_order** | `saleor/graphql/order/mutations/utils.py` | 116 | `ShippingMethodUpdateMixin` 方法，调用方后续负责保存 |
 
-#### 模式 D：直接设置 `should_refresh_prices = True`（共 1 处）
+#### 模式 D：直接设置 `should_refresh_prices = True`（共 2 处）
 
 | 序号 | 触发场景 | 文件位置 | 行号 | 说明 |
 |------|----------|----------|------|------|
-| 13 | **TaxExemptionManage** | `saleor/graphql/tax/mutations/tax_exemption_manage.py` | 111 | 直接设置属性后 `order.save()` |
+| 13 | **TaxExemptionManage** | `saleor/graphql/tax/mutations/tax_exemption_manage.py` | 111 | GraphQL mutation，直接设置属性后 `order.save()` |
+| 16 | **disconnect_voucher_codes_from_draft_orders_task** | `saleor/discount/tasks.py` | 315 | 异步任务，遍历订单直接设置属性后 `bulk_update()` 批量保存 |
 
 ---
 
@@ -387,12 +393,11 @@ def invalidate_order_prices(order: Order, *, save: bool = False) -> None:
 |------|----------|----------|------|------|
 | 14 | **recalculate_orders_task** | `saleor/order/tasks.py` | 44 | 遍历订单调用 `invalidate_order_prices()` 后，`bulk_update()` 批量保存 |
 
-#### 模式 F：直接批量 `update()`（共 2 处）
+#### 模式 F：直接批量 `update()`（共 1 处）
 
 | 序号 | 触发场景 | 文件位置 | 行号 | 说明 |
 |------|----------|----------|------|------|
 | 15 | **drop_invalid_shipping_methods_relations_for_given_channels** | `saleor/shipping/tasks.py` | 33 | 直接 `update(shipping_method=None, should_refresh_prices=True)` 批量更新 |
-| 16 | **disconnect_voucher_codes_from_draft_orders_task** | `saleor/discount/tasks.py` | 315 | 遍历订单直接设置属性后，`bulk_update()` 批量保存 |
 
 ---
 
@@ -423,35 +428,62 @@ def invalidate_order_prices(order: Order, *, save: bool = False) -> None:
 
 | 设置方式 | 数量 | 占比 | 典型场景 |
 |----------|------|------|----------|
-| `invalidate_order_prices()` + 手动 save | 8 | 50% | 大部分 mutations（需要同时更新其他字段时） |
+| `invalidate_order_prices()` + 手动 `save()` | 9 | 56.25% | 大部分 mutations（需要同时更新其他字段时，含 2 个 Mixin 方法） |
 | `invalidate_order_prices(save=True)` | 3 | 18.75% | 折扣相关 mutation（仅需更新刷新标记时） |
-| 直接设置 `should_refresh_prices = True` + save | 2 | 12.5% | `TaxExemptionManage`、凭证码失效任务 |
-| 批量 `update()` / `bulk_update()` | 3 | 18.75% | 异步任务批量处理 |
+| `invalidate_order_prices()` + `bulk_update()` | 1 | 6.25% | `recalculate_orders_task` 异步任务 |
+| 直接设置 `should_refresh_prices = True` + save/bulk_update | 2 | 12.5% | `TaxExemptionManage`、凭证码失效任务 |
+| 直接批量 `update()` | 1 | 6.25% | 配送方法失效异步任务 |
 | **总计** | **16** | **100%** | |
+
+**按调用函数分类**:
+| 调用方式 | GraphQL | 异步任务 | 总计 |
+|----------|---------|----------|------|
+| 通过 `invalidate_order_prices()` 函数 | 12 | 1 | **13** |
+| 直接赋值/批量更新 | 1 | 2 | **3** |
+| **总计** | **13** | **3** | **16** |
+
+**按模块分类**（`invalidate_order_prices()` 的 13 处调用）:
+| 模块 | 数量 | 具体文件 |
+|------|------|----------|
+| GraphQL Mutations | 12 | `draft_order_create.py`、`draft_order_update.py`、`order_lines_create.py`、`order_line_update.py`、`order_line_delete.py`、`order_discount_add.py`、`order_discount_delete.py`、`order_line_discount_update.py`、`order_line_discount_remove.py`、`order_update.py`、`utils.py` (2 处) |
+| 异步任务 | 1 | `order/tasks.py` |
 
 ---
 
 ### 4.5 关键调用链说明
 
-**典型 Mutation 调用链（以 OrderLineUpdate 为例）**:
+**典型 Mutation 调用链 - `save=False` 模式（以 OrderLineUpdate 为例，共 9 处）**:
 ```
 OrderLineUpdate.save()
     ↓
 change_order_line_quantity()  # 修改订单行数量
     ↓
-invalidate_order_prices(order)  # 设置 should_refresh_prices = True（内存）
+invalidate_order_prices(order)  # save=False，仅设置内存属性
     ↓
-order.save(update_fields=["should_refresh_prices", "weight", "updated_at"])
+order.save(update_fields=["should_refresh_prices", "weight", "updated_at"])  # 手动保存
     ↓
 后续 GraphQL 解析时触发 fetch_order_prices_if_expired() 实际重算
 ```
 
-**典型异步任务调用链（以 recalculate_orders_task 为例）**:
+**典型 Mutation 调用链 - `save=True` 模式（以 OrderDiscountAdd 为例，共 3 处）**:
+```
+OrderDiscountAdd.perform_mutation()
+    ↓
+create_manual_order_discount()  # 创建折扣
+    ↓
+order_discount_added_event()  # 记录事件
+    ↓
+invalidate_order_prices(order, save=True)  # save=True，内部自动保存
+    ↓
+后续 GraphQL 解析时触发 fetch_order_prices_if_expired() 实际重算
+```
+
+**典型异步任务调用链（以 recalculate_orders_task 为例，共 1 处）**:
 ```
 recalculate_orders_task(order_ids)
     ↓
 for order in orders:
-    invalidate_order_prices(order)  # 设置内存属性
+    invalidate_order_prices(order)  # save=False，仅设置内存属性
     ↓
 Order.objects.bulk_update(orders, ["should_refresh_prices"])  # 批量保存
     ↓
@@ -543,8 +575,11 @@ _apply_tax_data() 应用税务数据到订单和订单行
 4. **错误**: 未说明哪些业务入口会设置刷新标记
    **修正**: 补充了 4.1-4.5 节，详细列出了所有 16 个业务入口及其具体调用方式。
 
-5. **错误**: 未区分 `invalidate_order_prices()` 的两种调用模式
-   **修正**: 明确了 `save=True`（3 处，折扣相关）和 `save=False`（10 处，需后续手动保存）两种调用模式的区别和使用场景。
+5. **错误**: `invalidate_order_prices()` 调用分类错误（GraphQL 11 次、异步任务 2 次）
+   **修正**: 实际为 GraphQL 12 次、异步任务 1 次。`discount/tasks.py` 和 `shipping/tasks.py` 不调用 `invalidate_order_prices()`，而是直接赋值或批量更新。
+
+6. **错误**: 未区分 `invalidate_order_prices()` 的两种调用模式
+   **修正**: 明确了 `save=True`（3 处，折扣相关）和 `save=False`（10 处，含 9 处手动 save 和 1 处 bulk_update）两种调用模式的区别和使用场景。
 
 ### 7.2 三种策略实际生效位置
 

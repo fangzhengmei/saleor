@@ -871,11 +871,90 @@ for line in lines:
             # 逐行失败逐行抛错
 ```
 
-**逐行调用的后果**:
-1. **生成器 bug 被隐藏**：每次调用 `allocate_stocks` 时 `stocks` 都是新的查询结果，`stocks_id` 生成器每次都是新的，不会出现重复消费问题
+**逐行调用的后果**（⚠️ 含修正结论）:
+
+1. **✅ 跨调用复用问题不存在，但单次调用内部 bug 仍然存在**：
+   - 每次循环都会重新查询 stocks，创建新的 `stocks_id` 生成器，所以**跨调用复用问题不存在**
+   - 但是！**单次 `allocate_stocks` 调用内部的生成器两次消费问题仍然存在**
+   - 如果 `check_reservations=True`（预留功能开启），**每一行的分配都会独立触发 bug**，导致 `quantity_allocation_for_stocks = {}`，可用量被高估
+   - 如果 `check_reservations=False`（预留功能关闭），bug 被隐藏（生成器只在 Allocation 查询时消费一次）
+
 2. **性能较差**：N 行商品 → N 次事务 + N 次库存查询 + N 次分配写入
-3. **部分成功风险**：前几行分配成功，某一行失败时已成功的分配不会回滚（因为每行独立事务）
-4. **可用量计算偏差**：前一行分配成功会扣减库存，后一行查询时看到的是扣减后的库存，与批量计算的结果可能不一致
+
+3. **❌ 修正：部分成功风险不存在，任何失败全量回滚**：
+   - 之前结论错误："前几行分配成功，某一行失败时已成功的分配不会回滚"
+   - ✅ **正确结论**：任何一行分配失败，**整个外层事务都会回滚**，所有已分配的都会被撤销
+   - **原因分析**：
+     ```python
+     try:
+         with traced_atomic_transaction():  # 内层事务
+             allocate_stocks(...)
+     except InsufficientStock as e:
+         raise ValidationError(...) from e  # 🔴 重新抛出异常！
+     ```
+     a. 内层 `InsufficientStock` 异常被捕获后，**重新抛出** `ValidationError`
+     b. 新异常没有被外层捕获，传播到最外层的 `traced_atomic_transaction()`（line 153）
+     c. 外层事务捕获异常后执行回滚，所有已分配的 Allocation 和 Stock 更新都会被撤销
+     d. 另外，Django 嵌套事务特性：内层 atomic 抛出异常会将整个事务标记为 rollback-only，即使捕获也无法提交
+
+4. **可用量计算偏差**：前一行分配成功会扣减 `Stock.quantity_allocated`，后一行查询时在同一事务内能看到扣减后的值，与批量计算（基于查询开始时的快照）结果可能不一致
+
+---
+
+#### 9.2.2.1 嵌套事务回滚边界深度分析
+
+**事务结构** (`draft_order_complete.py:153-234`):
+```
+外层事务（line 153）: traced_atomic_transaction()
+    ├─ order.save()  # 更新订单状态
+    ├─ handle_order_voucher()  # 处理优惠券
+    └─ for line in lines:
+           try:
+               内层事务（line 213）: traced_atomic_transaction()
+                   ├─ allocate_stocks()  # 写入 Allocation + 更新 Stock
+                   └─ allocate_preorders()
+           except InsufficientStock:
+               raise ValidationError(...)  # 🔴 异常向外传播
+```
+
+**回滚边界矩阵**:
+
+| 异常位置 | 异常是否被捕获 | 内层事务 | 外层事务 | 已成功的分配 |
+|---------|---------------|---------|---------|-------------|
+| 内层 allocate_stocks | 是，但重新抛出 | 回滚 | 🔴 **回滚** | ❌ 全部撤销 |
+| 内层 allocate_stocks | 是，不重新抛出 | 回滚 | ⚠️ 标记为 rollback-only | ❌ 最终提交失败 |
+| 外层 order.save() | 否 | - | 🔴 回滚 | ❌ 全部撤销 |
+
+**关键 Django 事务特性**:
+> 当嵌套的 `atomic()` 块中抛出异常时，Django 会将整个事务标记为需要回滚。即使外层捕获了异常，当尝试提交外层事务时，Django 会抛出 `TransactionManagementError`。唯一安全的做法是让异常向外传播，由最外层 `atomic()` 处理回滚。
+
+---
+
+#### 9.2.2.2 逐行调用下的 stocks_id 行为分析
+
+**每次循环的执行流程**:
+```python
+for line in lines:
+    line_data = OrderLineInfo(...)
+    allocate_stocks([line_data], check_reservations=...)
+        ├─ stocks = Stock.objects.for_channel_or_country(...)  # 全新查询
+        ├─ stocks_id = (stock.pop("id") for stock in stocks)   # 全新生成器
+        ├─ _prepare_stock_to_reserved_quantity_map(..., stocks_id)  # 第1次消费
+        └─ Allocation.objects.filter(stock_id__in=stocks_id, ...)   # 第2次消费
+```
+
+**行为对比**:
+
+| 场景 | check_reservations | 第1次消费（Reservation） | 第2次消费（Allocation） | 结果 |
+|------|-------------------|-------------------------|------------------------|------|
+| 批量调用（正常结账） | True | ✅ 消费 `[1,2,3]` | ❌ 空 `[]` | 🔴 触发 bug，可用量高估 |
+| 逐行调用（草稿单） | True | ✅ 消费 `[1]` | ❌ 空 `[]` | 🔴 **每行独立触发 bug** |
+| 批量调用（正常结账） | False | 不执行 | ✅ 消费 `[1,2,3]` | ✅ 正常 |
+| 逐行调用（草稿单） | False | 不执行 | ✅ 消费 `[1]` | ✅ 正常 |
+
+**⚠️ 关键修正结论**：
+- ❌ 之前错误："逐行调用隐藏生成器 bug"
+- ✅ **正确结论**：逐行调用不会隐藏 bug，只是将 bug 的影响范围从"整个订单"缩小到"单行"。如果 `check_reservations=True`，**每一行的分配都会独立触发 bug**，导致每一行的可用量计算都忽略已分配量。
 
 #### 9.2.3 check_reservations 参数差异的业务影响
 
@@ -938,21 +1017,22 @@ def test_draft_order_complete_channel_with_shipping_zones_excluded_from_stock_ca
 | `test_draft_order_complete_product_without_inventory_tracking` | 无库存跟踪商品 | line 743 |
 | `test_draft_order_complete_with_preorder_lines` | 预购商品 | line 820 |
 
-#### 9.3.2 严重遗漏的测试覆盖点
+#### 9.3.2 严重遗漏的测试覆盖点（⚠️ 含修正结论）
 
 | 遗漏场景 | 风险等级 | 说明 |
 |---------|---------|------|
 | 🔴 **`action_required=True` 路径** | P0 | Reservation 保留，voucher 释放的不一致性 |
 | 🔴 **`_is_refund_ongoing=True` 路径** | P0 | Reservation 保留，订单不创建 |
+| 🔴 **`check_reservations=True` 时逐行 bug** | P0 | 草稿单转正时每行独立触发生成器 bug |
 | 🔴 **`check_reservations=True/False` 差异** | P1 | 草稿单转正与正常结账的可用量计算差异 |
-| 🟠 **逐行分配部分成功** | P1 | 前 N-1 行成功，第 N 行失败，已分配的不回滚 |
+| 🟠 **逐行分配失败全量回滚** | P1 | 第 N 行失败，前 N-1 行已分配的全部回滚 |
 | 🟠 **多仓分配在草稿单中的行为** | P1 | 逐行调用 vs 批量调用的多仓分配结果差异 |
 | 🟠 **草稿单转正时现有 Reservation 冲突** | P1 | 其他 checkout 已预留该商品库存时的处理 |
 | 🟡 **`delete_checkout=False` 路径** | P2 | Reservation 与 Allocation 双重占用 |
 | 🟡 **失败处理分支的 Reservation 状态** | P2 | `_complete_checkout_fail_handler` 不释放 Reservation |
-| 🟡 **生成器 bug 在草稿单链路中的免疫性** | P2 | 逐行调用为何不会触发生成器 bug |
+| 🟡 **嵌套事务回滚边界验证** | P2 | 内层异常重新抛出导致外层全量回滚的行为 |
 
-#### 9.3.3 建议补充的测试用例
+#### 9.3.3 建议补充的测试用例（⚠️ 含修正）
 
 **P0 级测试**:
 ```python
@@ -967,12 +1047,19 @@ def test_draft_order_complete_check_reservations_enabled():
 
 def test_draft_order_complete_check_reservations_disabled():
     # 验证 is_reservation_enabled=False 时不扣除其他 checkout 的预留
+
+def test_draft_order_complete_generator_bug_per_line():
+    # 验证草稿单转正时每行独立触发生成器 bug
+    # 准备：已有 allocation 占用部分库存
+    # 预期：如果 check_reservations=True，由于 bug 可用量被高估，可能超卖
 ```
 
 **P1 级测试**:
 ```python
-def test_draft_order_complete_partial_success_no_rollback():
-    # 验证多行分配时，某一行失败不影响已成功的行
+def test_draft_order_complete_any_failure_full_rollback():
+    # 修正：之前的"部分成功不回滚"结论错误
+    # 验证：多行分配时，第 N 行失败，前 N-1 行已分配的全部回滚
+    # 断言：Allocation.objects.count() == 0
 
 def test_draft_order_complete_multi_warehouse_allocation():
     # 验证草稿单转正的多仓分配结果与正常结账一致
@@ -989,6 +1076,18 @@ def test_create_order_from_checkout_keep_reservation():
 def test_complete_checkout_fail_keeps_reservation():
     # 验证 InsufficientStock 异常时 Reservation 保留
 
-def test_allocate_stocks_generator_bug_hidden_in_draft_order():
-    # 验证逐行调用不会触发生成器 bug（用于文档化和回归）
+def test_allocate_stocks_generator_bug_triggered_per_line_in_draft_order():
+    # 修正：之前的"逐行调用隐藏 bug"结论错误
+    # 验证：草稿单转正逐行调用时，每一行都会独立触发生成器 bug
+    # 断言：每次 allocate_stocks 调用内部，stocks_id 生成器被消费两次
 ```
+
+---
+
+### 9.4 修正结论汇总表
+
+| 之前结论 | 修正后结论 | 影响范围 |
+|---------|-----------|---------|
+| 逐行调用隐藏生成器 bug | 逐行调用每行独立触发 bug | 草稿单转正链路超卖风险 |
+| 逐行分配部分成功不回滚 | 任何失败全量回滚 | 事务一致性（实际更安全） |
+| stocks_id 是复用问题 | 是单次调用内部两次消费问题 | 所有 `check_reservations=True` 场景 |

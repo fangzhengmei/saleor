@@ -1028,7 +1028,8 @@ transaction.on_commit(
 | **支付前准备失败** | ❌ 未创建 | ❌ 未创建 | ❌ 未创建 | ⚠️ 视时机而定<br>• 早期失败：未增加<br>• 后期失败：已增加但**不回滚**（调用未传 voucher） | ⚠️ 尝试退款（传入了 payment）<br>但受 `can_refund()`/`can_void()` 限制，可能不执行 | ❌ 不触发 | 提交 |
 | **临时预占后崩溃** | ❌ 未创建 | ✅ 已创建<br>等待过期 | ❌ 未创建 | ⚠️ 可能已增加<br>`is_voucher_usage_increased=True` | ❌ 未处理 | ❌ 不触发 | 已提交 |
 | **支付处理失败** | ❌ 未创建 | ✅ 已创建<br>等待过期 | ❌ 未创建 | ⚠️ 已增加但**不回滚**<br>（调用未传 voucher） | ⚠️ **不退款/不取消**<br>（调用未传 payment + 前置条件可能不满足） | ❌ 不触发 | 提交 |
-| **action_required** | ❌ 未创建<br>等待重试 | ✅ 已创建<br>等待过期 | ❌ 未创建 | ✅ 释放（直接调用释放函数） | ⚠️ 不退款，等待验证<br>`Transaction.action_required=True` | ❌ 不触发 | 提交 |
+| **action_required** | ❌ 未创建<br>等待重试 | ✅ 已创建<br>⚠️ **会导致重试时唯一约束冲突** | ❌ 未创建 | ✅ 释放（直接调用释放函数） | ⚠️ 不退款，等待验证<br>`Transaction.action_required=True` | ❌ 不触发 | 提交 |
+| **⚠️ action_required 重试失败** | ❌ 未创建 | ❌ 新预占未创建<br>⚠️ **旧预占仍存在**（不在当前事务，不回滚） | ❌ 未创建 | ⚠️ 已增加但**回滚**<br>（DatabaseError 导致事务回滚） | ❌ 未处理（还没到支付阶段） | ❌ 不触发 | **回滚** |
 | **支付变为inactive** | ❌ 未创建 | ✅ 已创建<br>等待过期 | ❌ 未创建 | ⚠️ 可能回滚（取决于 `order_data["voucher"]` 是否存在） | ⚠️ 尝试退款（传入了 payment）<br>但受前置条件限制 | ❌ 不触发 | 提交 |
 | **订单创建前失败（路径A）** | ❌ 未创建 | ✅ 已创建<br>等待过期 | ❌ 未创建 | ✅ 回滚（传入了 voucher） | ⚠️ 尝试退款（传入了 payment）<br>但受前置条件限制 | ❌ 不触发 | 回滚 |
 | **订单创建前失败（路径B）** | ❌ 未创建 | ❌ 无临时预占 | ❌ 未创建 | ✅ 回滚（传入了 voucher） | ❌ 不退款（未传 payment） | ❌ 不触发 | 回滚 |
@@ -1072,7 +1073,9 @@ transaction.on_commit(
    - 失败时不主动删除临时预占，依赖过期机制
    - 简化了失败处理逻辑，避免分布式事务问题
    - 代价是库存可能被"锁定"一段时间（`RESERVE_DURATION`）
-   - ⚠️ **收敛**：这是**最终一致**而非**强一致**，失败后短时间内库存仍显示被占用
+   - ⚠️ **收敛1**：这是**最终一致**而非**强一致**，失败后短时间内库存仍显示被占用
+   - ⚠️ **收敛2**：定时任务默认每天运行一次，物理删除可能延迟 **24小时**
+   - ⚠️ **收敛3**：唯一约束不考虑过期时间，导致 **action_required 重试 100% 失败**
 
 3. **事件驱动的最终一致性**：
    - 所有事件和通知通过 `transaction.on_commit` 注册
@@ -1098,6 +1101,13 @@ transaction.on_commit(
    - `can_refund()` 需要特定的 `charge_status`
    - 如果支付在授权阶段就失败，两个条件都不满足，什么也不做
    - 失败交易的支付状态不会更新（`gateway_postprocess` 对失败交易直接 return）
+
+7. **⚠️ 严重缺陷：action_required 重试时的预占唯一约束冲突（新发现）**：
+   - `_reserve_stocks_without_availability_check()` 缺少 `replace` 逻辑
+   - 定时任务默认每天运行一次，冲突窗口长达 **24小时**
+   - 唯一约束冲突触发 `DatabaseError`，导致整个事务回滚
+   - 旧预占不在当前事务中，无法被回滚，形成"死锁"
+   - 用户完成 3D Secure 后 100% 会遇到此问题
 
 ---
 
@@ -1235,31 +1245,35 @@ T=31s complete_checkout_with_payment()
 
 #### 冲突概率分析
 
-1. **定时任务运行频率**：
+1. **⚠️ 定时任务运行频率（已修正）**：
    - `delete_expired_reservations_task` 是 Celery 任务
-   - 默认运行频率取决于 Celery Beat 配置（通常每分钟或每 5 分钟）
-   - 如果每分钟运行一次，最长有 60 秒的冲突窗口
+   - **默认运行频率：每天一次**（`datetime.timedelta(days=1)`）
+   - 代码位置：`saleor/settings.py:675-678`
+   - 这意味着最长有约 **24小时** 的冲突窗口！
 
 2. **用户行为分析**：
    - 3D Secure 验证通常需要 10-30 秒
    - 大部分用户会在 45 秒内完成验证
-   - **结论**：高概率命中场景 A，发生冲突
+   - **结论**：几乎 100% 命中场景 A，发生冲突
 
-3. **冲突窗口**：
+3. **⚠️ 冲突窗口（已修正）**：
    - 最小冲突窗口：`0 ~ RESERVE_DURATION` = 45 秒
-   - 最大冲突窗口：`0 ~ RESERVE_DURATION + 定时任务间隔` = 45s ~ 345s
-   - 平均冲突窗口：约 75 秒（假设定时任务每分钟运行）
+   - 最大冲突窗口：`0 ~ RESERVE_DURATION + 定时任务间隔` = 45s ~ **86445s（约24小时）**
+   - 平均冲突窗口：约 **12小时45秒**（假设定时任务在午夜运行）
 
 #### 唯一性冲突的影响
 
 1. **对用户**：
    - 完成了 3D Secure 验证，但结账仍然失败
    - 看到的错误信息可能是不友好的"服务器内部错误"
-   - 需要重新发起整个结账流程
+   - **最长可能需要等待24小时**才能再次尝试结账
+   - 用户体验极差
 
 2. **对库存**：
-   - 预占会存在 45+ 秒，直到过期清理
-   - 其他用户可能看到"库存不足"
+   - 预占会存在 45 秒后逻辑过期
+   - 但物理记录会存在最长 24 小时，直到定时任务清理
+   - 其他用户在查询库存时，`.not_expired()` 会过滤掉已过期的预占，所以不会影响库存可用性
+   - 但同一 checkout 的重试会被唯一约束阻止
 
 3. **对数据一致性**：
    - 支付可能已成功授权（3D Secure 验证通过）
@@ -1329,7 +1343,121 @@ def delete_expired_reservations_task():
 
 ---
 
-### 10.6 关键代码引用（预占冲突）
+### 10.6 唯一约束冲突时的预占写入结果
+
+#### bulk_create 的原子性
+
+`bulk_create()` 在遇到唯一约束冲突时的行为：
+
+1. **默认行为（`ignore_conflicts=False`）**：
+   - 只要有一条记录冲突，**整个操作失败**
+   - 抛出 `IntegrityError` 异常
+   - **没有任何新记录被写入**
+   - 旧记录保持不变
+
+2. **如果使用 `ignore_conflicts=True`**：
+   - 跳过冲突的记录，只写入不冲突的记录
+   - 不会抛出异常
+   - **但 Saleor 当前代码没有使用这个参数**
+
+**代码验证**（`_reserve_stocks_without_availability_check`）：
+```python
+# saleor/checkout/complete_checkout.py:1992
+Reservation.objects.bulk_create(reservations)  # ⚠️ 没有 ignore_conflicts=True
+```
+
+> **结论**：发生唯一约束冲突时，**新预占完全没有写入数据库**，旧预占记录保持不变。
+
+---
+
+### 10.7 数据库约束异常后的事务回滚影响
+
+#### 事务包装器的异常处理逻辑
+
+**代码位置**：`saleor/core/transactions.py:8-20`
+
+```python
+@contextmanager
+def transaction_with_commit_on_errors():
+    """Perform transaction and raise an error in any occurred."""
+    error = None
+    with traced_atomic_transaction():  # 内部是 transaction.atomic()
+        try:
+            yield
+        except DatabaseError:
+            raise  # ⚠️ DatabaseError 直接抛出，事务回滚
+        except Exception as e:
+            error = e  # 其他异常先捕获，提交事务后再抛出
+    if error:
+        raise error
+```
+
+#### IntegrityError 属于 DatabaseError
+
+```python
+# Django 异常继承关系
+DatabaseError
+└── IntegrityError
+    └── UniqueViolation (PostgreSQL)
+```
+
+#### 完整的回滚链条
+
+```
+T=30s  第二次调用 checkoutComplete
+         ↓
+       complete_checkout_with_payment()
+         ├─ 第一个事务块（transaction_with_commit_on_errors）
+         │   ├─ Checkout.objects.select_for_update().get(pk=checkout_pk)
+         │   ├─ checkout.completing_started_at = timezone.now()
+         │   ├─ checkout.save()
+         │   ├─ complete_checkout_pre_payment_part()
+         │   │   └─ _increase_checkout_voucher_usage()  # 增加优惠券使用量
+         │   └─ _reserve_stocks_without_availability_check()
+         │       └─ Reservation.objects.bulk_create(reservations)
+         │           └─ ❌ IntegrityError: 唯一约束冲突！
+         │               ↓
+         │           DatabaseError 被直接 raise
+         │           事务回滚！
+         │
+         ├─ 回滚内容：
+         │   ├─ checkout.completing_started_at → 回滚为 None
+         │   ├─ 优惠券使用量增加 → 回滚
+         │   └─ 新预占创建 → 回滚（本来就没成功）
+         │
+         ├─ 不回滚的内容：
+         │   └─ 旧预占记录（上一次请求创建的，不在当前事务中）
+         │
+         └─ 异常向上抛出，流程终止
+```
+
+#### 回滚后的系统状态
+
+| 数据项 | 状态 | 说明 |
+|--------|------|------|
+| `checkout.completing_started_at` | `None` | 已回滚，其他用户可以处理 |
+| 优惠券使用量 | 未增加 | 已回滚 |
+| 新预占 | 未创建 | `bulk_create` 失败 |
+| 旧预占（T=0s创建） | **仍存在** | 不在当前事务中，不受影响 |
+| 支付状态 | 未变化 | 还没到支付处理阶段 |
+| 订单 | 未创建 | 流程提前终止 |
+
+> **关键问题**：旧预占是上一次请求创建的，属于不同的数据库事务，因此 **不会被当前事务的回滚影响**。它会一直存在，直到 24 小时后定时任务清理。
+
+#### 对后续重试的影响
+
+只要旧预占记录还在数据库中，任何对同一 checkout 的重试都会：
+1. 进入第一个事务块
+2. 执行到 `_reserve_stocks_without_availability_check()`
+3. 触发 `bulk_create` 唯一约束冲突
+4. 事务回滚，异常抛出
+5. 回到步骤 1，无限循环...
+
+> **除非**：等待 24 小时，让定时任务删除旧预占记录。
+
+---
+
+### 10.8 关键代码引用（预占冲突）
 
 | 功能 | 文件位置 | 关键函数 |
 |------|---------|---------|
@@ -1337,29 +1465,38 @@ def delete_expired_reservations_task():
 | 预占创建（有 replace） | `saleor/warehouse/reservations.py:91` | `reserve_stocks()` |
 | 预占创建（无 replace） | `saleor/checkout/complete_checkout.py:1961` | `_reserve_stocks_without_availability_check()` |
 | 过期预占清理 | `saleor/warehouse/tasks.py:27` | `delete_expired_reservations_task()` |
+| 清理任务调度（每天一次） | `saleor/settings.py:675` | `CELERY_BEAT_SCHEDULE` |
 | not_expired 过滤 | `saleor/warehouse/models.py:623` | `ReservationQuerySet.not_expired()` |
 | RESERVE_DURATION 配置 | `saleor/settings.py:938` | `RESERVE_DURATION = 45` |
+| 事务包装器 | `saleor/core/transactions.py:8` | `transaction_with_commit_on_errors()` |
+| 原子事务 | `saleor/core/tracing.py:10` | `traced_atomic_transaction()` |
 
 ---
 
-### 10.7 结论与建议
+### 10.9 结论与建议
 
 #### 已确认的风险
 
-1. **高概率的唯一约束冲突**：
+1. **极高概率的唯一约束冲突**：
    - `_reserve_stocks_without_availability_check()` 缺少 `replace` 逻辑
-   - 在 `RESERVE_DURATION + 定时任务间隔` 时间内重试都会失败
-   - 这是一个 **代码缺陷**（与 `reserve_stocks()` 的设计不一致）
+   - 默认清理频率是每天一次，冲突窗口长达 **24小时**
+   - 这是一个 **严重的代码缺陷**
 
-2. **唯一约束的局限性**：
-   - 约束不考虑 `reserved_until` 是否过期
-   - 逻辑过期 ≠ 物理删除
-   - 定时任务的运行频率直接影响冲突窗口大小
+2. **事务回滚的局限性**：
+   - 只能回滚当前事务内的操作
+   - 上一次请求创建的旧预占不在当前事务中，无法回滚
+   - 形成"死锁"状态，除非手动删除旧预占或等待定时任务
 
-3. **不一致的用户体验**：
-   - 用户完成了额外验证步骤（如 3D Secure）
+3. **bulk_create 的原子性问题**：
+   - 没有使用 `ignore_conflicts=True`
+   - 一条冲突导致全部失败
+   - 没有部分成功的可能
+
+4. **极差的用户体验**：
+   - 用户完成了 3D Secure 等额外验证步骤
    - 但因后端技术问题导致结账失败
-   - 错误信息可能不友好
+   - 错误信息不友好（通常是 500 错误）
+   - 可能需要等待 24 小时才能重试
 
 #### 修复建议
 
@@ -1375,7 +1512,7 @@ def _reserve_stocks_without_availability_check(
     
     checkout_lines = [line.line for line in lines]
     
-    # ✅ 添加：先删除旧预占
+    # ✅ 添加：先删除旧预占（解决重试冲突）
     Reservation.objects.filter(
         checkout_line__in=checkout_lines
     ).delete()
@@ -1400,6 +1537,21 @@ Reservation.objects.bulk_create(
 
 #### 临时缓解方案
 
-1. 增加 `RESERVE_DURATION`（但会增加库存锁定时间）
-2. 提高 `delete_expired_reservations_task` 的运行频率（如每 15 秒一次）
-3. 前端在收到 `confirmation_needed=True` 后，延迟 `RESERVE_DURATION` 秒再允许用户重试
+1. **⚠️ 增加定时任务频率**：
+   - 将 `delete_expired_reservations_task` 从每天一次改为每分钟一次
+   - 可以将冲突窗口从 24 小时缩短到约 75 秒
+   - 修改位置：`saleor/settings.py:675-678`
+   ```python
+   "delete-expired-reservations": {
+       "task": "saleor.warehouse.tasks.delete_expired_reservations_task",
+       "schedule": datetime.timedelta(minutes=1),  # 从 days=1 改为 minutes=1
+   },
+   ```
+
+2. **前端重试延迟**：
+   - 前端在收到 `confirmation_needed=True` 后，延迟 `RESERVE_DURATION + 缓冲时间`（如 60 秒）再允许用户重试
+   - 但这会影响用户体验
+
+3. **手动清理脚本**：
+   - 提供一个管理命令或接口，允许手动删除特定 checkout 的预占记录
+   - 用于紧急情况处理

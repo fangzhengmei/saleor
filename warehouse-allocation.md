@@ -428,3 +428,216 @@ order/actions.py:cancel_order()
 | `delete_empty_allocations_task` | 定期 | 清理零分配量记录 |
 | `update_stocks_quantity_allocated_task` | 定期 | 修正 Stock.quantity_allocated 与实际分配的不一致 |
 | `expire_orders_task` | 定期 | 过期未支付订单并释放库存 |
+
+---
+
+## 八、关键遗漏深度分析
+
+### 8.1 Checkout 分支下预留记录的释放时机
+
+#### 8.1.1 级联删除机制
+
+**模型定义** (`saleor/warehouse/models.py:665-670`):
+```python
+class Reservation(models.Model):
+    checkout_line = models.ForeignKey(
+        CheckoutLine,
+        on_delete=models.CASCADE,  # 级联删除
+        related_name="reservations",
+    )
+```
+
+当 `CheckoutLine` 被删除时，关联的 `Reservation` 会自动级联删除。
+
+#### 8.1.2 完整释放时序
+
+**调用链** (`saleor/checkout/complete_checkout.py:1138-1187`):
+
+```
+complete_checkout_post_payment_part()
+    │
+    ├─ _create_order()  # 在事务内创建订单
+    │   │
+    │   └─ _handle_allocations_of_order_lines()  [line 1265-1295]
+    │       └─ allocate_stocks(
+    │           check_reservations=True,
+    │           checkout_lines=[line.line for line in checkout_lines]  # 传入当前 checkout lines
+    │       )
+    │           │
+    │           ├─ _prepare_stock_to_reserved_quantity_map()
+    │           │   └─ Reservation.objects.filter(...)
+    │           │       .not_expired()
+    │           │       .exclude_checkout_lines(checkout_lines)  # 🔑 排除当前 checkout 的预留
+    │           │
+    │           └─ _create_allocations()  # 创建 Allocation，此时 Reservation 仍存在
+    │
+    └─ ✅ 订单创建成功后
+        └─ delete_checkouts([checkout_info.checkout.pk])  [line 1186]
+            │
+            └─ checkout/utils.py:148-162 delete_checkouts()
+                ├─ 先删除 CheckoutLine (CASCADE → Reservation 被删除)
+                └─ 再删除 Checkout
+```
+
+#### 8.1.3 关键设计细节
+
+| 时间点 | 状态 | 说明 |
+|--------|------|------|
+| `allocate_stocks` 调用时 | Reservation 存在 | 用于计算其他 checkout 的预留占用 |
+| `exclude_checkout_lines()` | 逻辑排除 | 自身的预留不计入占用（即将被删除） |
+| `delete_checkouts()` 调用 | 物理删除 | CheckoutLine 删除 → Reservation 级联删除 |
+
+**设计意图**: 在分配计算时排除自身预留，确保"预留→分配"的平滑过渡，不会因为自身预留导致"自己占了自己的库存"。
+
+---
+
+### 8.2 check_reservations 与库存范围开关对多仓分配的影响
+
+#### 8.2.1 check_reservations 参数
+
+**参数传递** (`saleor/checkout/complete_checkout.py:1278-1288`):
+```python
+allocate_stocks(
+    ...
+    check_reservations=True,  # 🔑 始终为 True
+    checkout_lines=[line.line for line in checkout_lines],
+)
+```
+
+**在 `_prepare_stock_to_reserved_quantity_map` 中的作用** (`saleor/warehouse/management.py:243-265`):
+
+```python
+if check_reservations:
+    # 计算其他 checkout 的预留占用
+    quantity_reservation = (
+        Reservation.objects.filter(stock_id__in=stocks_id)
+        .not_expired()
+        .exclude_checkout_lines(checkout_lines or [])  # 排除自身
+        .values("stock")
+        .annotate(quantity_reserved=Sum("quantity_reserved"))
+    )
+    # 结果存入 quantity_reservation_for_stocks
+```
+
+**对可用量计算的影响** (`_create_allocations`):
+```python
+available = stock_data.quantity 
+available -= quantity_allocation_for_stocks.get(stock_data.pk, 0)  # 已分配
+if check_reservations:
+    available -= quantity_reservation_for_stocks.get(stock_data.pk, 0)  # 🔑 其他预留
+available = max(available, 0)
+```
+
+| check_reservations | 可用量公式 | 适用场景 |
+|-------------------|-----------|---------|
+| `True` | `quantity - allocation - other_reservations` | 订单创建时（严格防止超卖） |
+| `False` | `quantity - allocation` | 后台手动操作、履约扣减 |
+
+#### 8.2.2 库存范围开关 `calculate_stocks_with_shipping_zones`
+
+**参数传递** (`saleor/warehouse/management.py:138-143`):
+```python
+stocks = Stock.objects.for_channel_or_country(
+    channel_slug,
+    country_code,
+    include_shipping_zones=calculate_stocks_with_shipping_zones,  # 🔑
+)
+```
+
+**控制库存查询范围**:
+- `True`: 考虑配送区域关联的仓库 → 更多候选仓库
+- `False`: 只考虑渠道直接关联的仓库 → 更少候选仓库
+
+#### 8.2.3 协同影响多仓分配结果
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  多仓分配结果 = f(仓库范围 × 各仓库可用量)                   │
+│                                                             │
+│  仓库范围 = for_channel_or_country(include_shipping_zones)   │
+│  各仓库可用量 = quantity - allocation - (reservation if check_reservations) │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**场景对比**:
+
+| 场景 | calculate_stocks_with_shipping_zones | check_reservations | 分配结果 |
+|------|-------------------------------------|--------------------|---------|
+| 订单创建 | True | True | 最严格：仓库最多 + 可用量最少 |
+| 后台补货 | False | False | 最宽松：仓库最少 + 可用量最多 |
+| 自提订单 | N/A（走 click_and_collect 分支） | True | 只考虑自提点仓库 |
+
+---
+
+### 8.3 allocate_stocks 中 stocks_id 迭代器重复消费问题
+
+#### 8.3.1 问题代码
+
+**位置**: `saleor/warehouse/management.py:150-163`
+
+```python
+# 🔴 BUG: 使用生成器表达式 (generator expression)
+stocks_id = (stock.pop("id") for stock in stocks)  # line 150
+
+# 第一次消费：查询 Reservation
+quantity_reservation_for_stocks: dict = _prepare_stock_to_reserved_quantity_map(
+    checkout_lines, check_reservations, stocks_id  # line 153
+)
+
+# 第二次消费：查询 Allocation
+quantity_allocation_list = list(
+    Allocation.objects.filter(
+        stock_id__in=stocks_id,  # line 158 - 🔴 生成器已耗尽！
+        quantity_allocated__gt=0,
+    )
+    .values("stock")
+    .annotate(quantity_allocated_sum=Sum("quantity_allocated"))
+)
+```
+
+#### 8.3.2 根本原因
+
+Python 中**生成器表达式 `(...)` 只能被迭代一次**：
+- 第一次在 `_prepare_stock_to_reserved_quantity_map` 中迭代时，`stock.pop("id")` 被执行，生成器耗尽
+- 第二次在 `Allocation.objects.filter(stock_id__in=stocks_id, ...)` 中使用时，生成器返回空列表 `[]`
+- Django ORM 中 `stock_id__in=[]` 等同于**没有过滤条件**，返回所有匹配的记录
+
+#### 8.3.3 实际后果
+
+| 阶段 | 预期行为 | 实际行为 | 影响 |
+|------|---------|---------|------|
+| Reservation 查询 | `stock_id__in=[1,2,3]` | ✅ 正确 | 第一次消费正常 |
+| Allocation 查询 | `stock_id__in=[1,2,3]` | `stock_id__in=[]` → 全表扫描 | 🔴 **严重** |
+
+**具体危害**:
+1. **错误的分配量统计**: `quantity_allocation_for_stocks` 包含了**所有**相关 variant 的 allocation，而非仅限于当前查询的 stocks
+2. **可用量被高估或低估**:
+   - 如果其他 stock 有 allocation，会被错误计入 → 可用量被低估
+   - 可能导致"明明有库存却提示不足"
+3. **性能问题**: `stock_id__in=[]` 触发全表扫描，数据量大时严重影响性能
+4. **跨仓库污染**: 其他 variant 的 allocation 可能被错误计入
+
+#### 8.3.4 修复方案
+
+将生成器改为**列表推导式**:
+
+```python
+# 🟢 FIX: 使用列表推导式 (list comprehension)
+stocks_id = [stock.pop("id") for stock in stocks]  # 用 [] 代替 ()
+```
+
+#### 8.3.5 验证对比
+
+```python
+# 生成器表达式 - 只能迭代一次
+gen = (x for x in [1, 2, 3])
+print(list(gen))  # [1, 2, 3]
+print(list(gen))  # [] - 已耗尽
+
+# 列表推导式 - 可多次迭代
+lst = [x for x in [1, 2, 3]]
+print(list(lst))  # [1, 2, 3]
+print(list(lst))  # [1, 2, 3] - 仍然可用
+```
+
+**注意**: `reservations.py` 中 `reserve_stocks()` 函数存在**相同问题**（line 127-147），需要一并修复。

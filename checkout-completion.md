@@ -1098,3 +1098,308 @@ transaction.on_commit(
    - `can_refund()` 需要特定的 `charge_status`
    - 如果支付在授权阶段就失败，两个条件都不满足，什么也不做
    - 失败交易的支付状态不会更新（`gateway_postprocess` 对失败交易直接 return）
+
+---
+
+## 十、action_required 重试时的库存预占分析
+
+### 10.1 唯一约束与写入路径
+
+#### Reservation 模型的唯一约束
+
+**代码位置**：`saleor/warehouse/models.py:664-689`
+
+```python
+class Reservation(models.Model):
+    checkout_line = models.ForeignKey(CheckoutLine, ...)
+    stock = models.ForeignKey(Stock, ...)
+    quantity_reserved = models.PositiveIntegerField(default=0)
+    reserved_until = models.DateTimeField()
+
+    class Meta:
+        unique_together = [["checkout_line", "stock"]]  # ⚠️ 唯一约束
+        indexes = [
+            models.Index(fields=["checkout_line", "reserved_until"]),
+        ]
+```
+
+> **关键点**：唯一约束 `(checkout_line, stock)` 是数据库层面的约束，**与 `reserved_until` 无关**。即使预占已过期，只要记录还在数据库中，就会阻止相同组合的新预占写入。
+
+#### 两个预占写入函数的对比
+
+| 函数 | 位置 | replace 逻辑 | 适用场景 |
+|------|------|-------------|---------|
+| `reserve_stocks()` | `saleor/warehouse/reservations.py:91` | ✅ 有 `replace=True`，先删除再创建 | 普通库存预占（购物车、结账修改时） |
+| `_reserve_stocks_without_availability_check()` | `saleor/checkout/complete_checkout.py:1961` | ❌ 无，直接 `bulk_create` | 结账完成时的临时预占（支付前） |
+
+**`reserve_stocks()` 的安全写法**：
+```python
+if reservations:
+    if replace:
+        Reservation.objects.filter(checkout_line__in=checkout_lines).delete()
+    Reservation.objects.bulk_create(reservations)
+```
+
+**`_reserve_stocks_without_availability_check()` 的问题写法**：
+```python
+# ⚠️ 没有先删除旧预占！
+reservations = []
+for line in lines:
+    if line.variant.id in variants_stocks_map:
+        reservations.append(
+            Reservation(
+                quantity_reserved=line.line.quantity,
+                reserved_until=timezone.now() + timedelta(seconds=settings.RESERVE_DURATION),
+                stock=variants_stocks_map[line.variant.id],
+                checkout_line=line.line,
+            )
+        )
+Reservation.objects.bulk_create(reservations)  # 可能唯一约束冲突！
+```
+
+---
+
+### 10.2 action_required 重试的完整时序
+
+#### 正常流程（第一次提交）
+
+```
+T=0s  用户调用 checkoutComplete
+        ↓
+T=1s  complete_checkout_with_payment()
+        ├─ 第一个事务块
+        │   ├─ 锁定 checkout
+        │   ├─ 设置 completing_started_at
+        │   ├─ complete_checkout_pre_payment_part()
+        │   │   ├─ _prepare_checkout_with_payment()
+        │   │   └─ _get_order_data() → _prepare_order_data() → _process_voucher_data_for_order()
+        │   │       └─ _increase_checkout_voucher_usage()  # 增加优惠券
+        │   └─ _reserve_stocks_without_availability_check()  # ⚠️ 创建预占
+        │       └─ bulk_create(...)
+        │          reserved_until = T+45s
+        │
+        ├─ 支付处理事务块
+        │   ├─ 锁定 checkout 和 payment
+        │   ├─ _process_payment()
+        │   │   ├─ gateway.process_payment()  # 调用支付网关
+        │   │   └─ txn.action_required = True  # 需要 3D Secure
+        │   └─ 检查 payment.is_active
+        │
+        └─ 第三个事务块
+            ├─ 重新锁定 checkout
+            └─ complete_checkout_post_payment_part()
+                ├─ action_required = True
+                ├─ _release_checkout_voucher_usage()  # 释放优惠券
+                ├─ 不调用 _create_order()
+                └─ return (None, True, action_data)
+
+T=5s  返回给前端：confirmation_needed=True, confirmation_data={...}
+```
+
+> **此时的残留状态**：
+> - Reservation 记录存在，`reserved_until=T+45s`
+> - `checkout.is_voucher_usage_increased=False`（已释放）
+> - `checkout.completing_started_at=None`（已清理）
+> - `Transaction.action_required=True`
+> - `Payment.to_confirm=True`
+
+#### 重试流程（用户完成验证后第二次提交）
+
+```
+T=30s 用户完成 3D Secure，再次调用 checkoutComplete
+       ↓
+T=31s complete_checkout_with_payment()
+        ├─ 第一个事务块
+        │   ├─ 锁定 checkout
+        │   ├─ 设置 completing_started_at
+        │   ├─ complete_checkout_pre_payment_part()
+        │   └─ _reserve_stocks_without_availability_check()  # ⚠️ 再次尝试创建预占！
+        │       └─ bulk_create(...)
+        │          尝试创建相同 (checkout_line, stock) 的预占
+        │          ❌ IntegrityError: 唯一约束冲突！
+        │
+        └─ 异常抛出，流程终止
+```
+
+---
+
+### 10.3 冲突风险评估
+
+#### 三种重试场景
+
+| 场景 | 重试时机 | 旧预占状态 | 结果 |
+|------|---------|-----------|------|
+| **场景 A** | T < 45s（用户快速完成验证） | 未过期，记录存在 | ❌ `IntegrityError` 唯一约束冲突 |
+| **场景 B** | 45s < T < 定时任务运行 | 已过期但记录未清理 | ❌ `IntegrityError` 唯一约束冲突 |
+| **场景 C** | T > 定时任务运行 | 记录已被物理删除 | ✅ 成功创建新预占 |
+
+#### 冲突概率分析
+
+1. **定时任务运行频率**：
+   - `delete_expired_reservations_task` 是 Celery 任务
+   - 默认运行频率取决于 Celery Beat 配置（通常每分钟或每 5 分钟）
+   - 如果每分钟运行一次，最长有 60 秒的冲突窗口
+
+2. **用户行为分析**：
+   - 3D Secure 验证通常需要 10-30 秒
+   - 大部分用户会在 45 秒内完成验证
+   - **结论**：高概率命中场景 A，发生冲突
+
+3. **冲突窗口**：
+   - 最小冲突窗口：`0 ~ RESERVE_DURATION` = 45 秒
+   - 最大冲突窗口：`0 ~ RESERVE_DURATION + 定时任务间隔` = 45s ~ 345s
+   - 平均冲突窗口：约 75 秒（假设定时任务每分钟运行）
+
+#### 唯一性冲突的影响
+
+1. **对用户**：
+   - 完成了 3D Secure 验证，但结账仍然失败
+   - 看到的错误信息可能是不友好的"服务器内部错误"
+   - 需要重新发起整个结账流程
+
+2. **对库存**：
+   - 预占会存在 45+ 秒，直到过期清理
+   - 其他用户可能看到"库存不足"
+
+3. **对数据一致性**：
+   - 支付可能已成功授权（3D Secure 验证通过）
+   - 但订单未创建
+   - 需要依赖支付网关的异步通知或后续对账
+
+---
+
+### 10.4 其他相关冲突场景
+
+#### 并发结账同一商品
+
+两个用户同时结账同一商品：
+```
+T=0s  用户 A 创建预占（stock=123, checkout_line=456）
+T=1s  用户 B 创建预占（stock=123, checkout_line=789）
+        ↓
+    ✅ 成功！因为 (checkout_line, stock) 不同
+```
+> 唯一约束不会阻止不同 checkout_line 预占同一 stock，这是正确的设计。
+
+#### 同一 checkout 内修改购物车后重试
+
+用户在同一 checkout 中修改商品数量后重新结账：
+```
+T=0s  创建预占（checkout_line=456, stock=123, quantity=1）
+T=5s  修改商品数量为 2
+T=6s  调用 checkoutComplete
+        ↓
+    _reserve_stocks_without_availability_check()
+        尝试创建（checkout_line=456, stock=123, quantity=2）
+        ❌ 唯一约束冲突！
+```
+> 这也是一个潜在冲突点，但修改购物车后通常会刷新页面，可能触发 `reserve_stocks(replace=True)` 来刷新预占。
+
+---
+
+### 10.5 过期清理机制
+
+#### 逻辑过期 vs 物理删除
+
+| 机制 | 触发时机 | 作用 |
+|------|---------|------|
+| **逻辑过期** | 查询时通过 `.not_expired()` 过滤 | 不影响数据库记录，仅影响查询结果 |
+| **物理删除** | 定时任务 `delete_expired_reservations_task` | 从数据库中删除过期记录 |
+
+**`not_expired()` 实现**：
+```python
+class ReservationQuerySet(models.QuerySet[T]):
+    def not_expired(self):
+        return self.filter(reserved_until__gt=timezone.now())
+```
+
+**定时任务清理**：
+```python
+# saleor/warehouse/tasks.py:27-37
+def delete_expired_reservations_task():
+    stock_reservations, _ = Reservation.objects.filter(
+        reserved_until__lt=timezone.now()
+    ).delete()
+    preorder_reservations, _ = PreorderReservation.objects.filter(
+        reserved_until__lt=timezone.now()
+    ).delete()
+```
+
+> **关键问题**：唯一约束检查发生在数据库层面，不经过 `not_expired()` 过滤。因此，**即使预占已逻辑过期，只要记录还在数据库中，就会阻止新预占的创建**。
+
+---
+
+### 10.6 关键代码引用（预占冲突）
+
+| 功能 | 文件位置 | 关键函数 |
+|------|---------|---------|
+| Reservation 模型定义 | `saleor/warehouse/models.py:664` | `Reservation` 类 |
+| 预占创建（有 replace） | `saleor/warehouse/reservations.py:91` | `reserve_stocks()` |
+| 预占创建（无 replace） | `saleor/checkout/complete_checkout.py:1961` | `_reserve_stocks_without_availability_check()` |
+| 过期预占清理 | `saleor/warehouse/tasks.py:27` | `delete_expired_reservations_task()` |
+| not_expired 过滤 | `saleor/warehouse/models.py:623` | `ReservationQuerySet.not_expired()` |
+| RESERVE_DURATION 配置 | `saleor/settings.py:938` | `RESERVE_DURATION = 45` |
+
+---
+
+### 10.7 结论与建议
+
+#### 已确认的风险
+
+1. **高概率的唯一约束冲突**：
+   - `_reserve_stocks_without_availability_check()` 缺少 `replace` 逻辑
+   - 在 `RESERVE_DURATION + 定时任务间隔` 时间内重试都会失败
+   - 这是一个 **代码缺陷**（与 `reserve_stocks()` 的设计不一致）
+
+2. **唯一约束的局限性**：
+   - 约束不考虑 `reserved_until` 是否过期
+   - 逻辑过期 ≠ 物理删除
+   - 定时任务的运行频率直接影响冲突窗口大小
+
+3. **不一致的用户体验**：
+   - 用户完成了额外验证步骤（如 3D Secure）
+   - 但因后端技术问题导致结账失败
+   - 错误信息可能不友好
+
+#### 修复建议
+
+`_reserve_stocks_without_availability_check()` 应该添加类似 `reserve_stocks()` 的 replace 逻辑：
+
+```python
+def _reserve_stocks_without_availability_check(
+    checkout_info: CheckoutInfo,
+    lines: list[CheckoutLineInfo],
+    calculate_stocks_with_shipping_zones: bool,
+):
+    # ... [现有代码获取 stocks] ...
+    
+    checkout_lines = [line.line for line in lines]
+    
+    # ✅ 添加：先删除旧预占
+    Reservation.objects.filter(
+        checkout_line__in=checkout_lines
+    ).delete()
+    
+    reservations = []
+    for line in lines:
+        # ... [现有代码创建 Reservation 对象] ...
+    
+    Reservation.objects.bulk_create(reservations)
+    return reservations
+```
+
+或者在 `bulk_create` 时使用 `update_conflicts`（Django 4.0+ 支持）：
+```python
+Reservation.objects.bulk_create(
+    reservations,
+    update_conflicts=True,
+    update_fields=["quantity_reserved", "reserved_until"],
+    unique_fields=["checkout_line", "stock"],
+)
+```
+
+#### 临时缓解方案
+
+1. 增加 `RESERVE_DURATION`（但会增加库存锁定时间）
+2. 提高 `delete_expired_reservations_task` 的运行频率（如每 15 秒一次）
+3. 前端在收到 `confirmation_needed=True` 后，延迟 `RESERVE_DURATION` 秒再允许用户重试

@@ -24,8 +24,10 @@ create_deliveries_for_subscriptions() → 生成 EventDelivery (PENDING)
 │ • 每个 delivery 一个任务      │   │ • 按 app 批量处理 PENDING delivery  │
 │ • Celery 内置重试             │   │ • 自调度轮询，无 Celery 重试         │
 │ • 指数退避：约 5 分钟耗尽     │   │ • 无退避：约 10 秒耗尽               │
-│ • 失败立即标记 FAILED         │   │ • 失败保持 PENDING                   │
-│ • MaxRetriesExceeded → 死信  │   │ • attempt_count >= 5 → 死信          │
+│ • 3xx/4xx → 立即 FAILED     │   │ • 所有错误 → 保持 PENDING              │
+│ • 5xx/网络错误 → 保持 PENDING  │   │ • 不检查 is_active                  │
+│ • 检查 is_active              │   │ • attempt_count >= 5 → 死信          │
+│ • MaxRetriesExceeded → 死信  │   │                                      │
 └──────────────┬───────────────┘   └───────────────┬──────────────────────┘
                │                                    │
                └──────────────────┬─────────────────┘
@@ -233,16 +235,42 @@ def send_webhook_request_async(self, event_delivery_id, ...):
     # ... 投递逻辑 ...
     
     if response.status == FAILED:
-        attempt_update(attempt, response)
+        attempt_update(attempt, response)  # 1. attempt 先保存（总是执行）
         if retry_on_failure:
-            handle_webhook_retry(self, webhook, response, delivery, attempt)
-        delivery_update(delivery, FAILED)  # 立即标记为 FAILED
+            handle_webhook_retry(self, webhook, response, delivery, attempt)  # 2. 可能抛出异常
+        delivery_update(delivery, FAILED)  # ⚠️ 触发重试时这行不会执行！
     elif SUCCESS:
         delivery.status = SUCCESS
         attempt_update(attempt, response, with_save=False)
     
     clear_successful_delivery(delivery)  # 单条清理
 ```
+
+#### 3.5.1.1 Retry 抛出后的关键时序
+
+**⚠️ 重要修正**：之前的理解存在严重偏差。实际执行时序如下：
+
+```
+response.status == FAILED
+    ↓
+attempt_update(attempt, response)  ✅ 执行，attempt 落盘（状态=FAILED）
+    ↓
+retry_on_failure == True
+    ↓
+handle_webhook_retry()
+    ├─ 检查状态码：3xx/4xx → return False → 继续执行 delivery_update
+    └─ 5xx/网络错误 → celery_task.retry()
+           ├─ 抛出 Retry 异常
+           ├─ 捕获后上报可观测性
+           └─ 重新抛出 Retry 异常 → 函数终止 ⚠️
+    ↓
+delivery_update(delivery, FAILED)  ❌ 触发重试时永远不会执行！
+```
+
+**关键结论**：
+- 当 **触发重试**（5xx/网络错误）时：`delivery.status` 始终保持 `PENDING`，只有 `attempt` 被标记为 `FAILED`
+- 当 **不触发重试**（3xx/4xx）时：`handle_webhook_retry()` 返回 `False`，继续执行 `delivery_update(delivery, FAILED)`
+- 当 **超过最大重试**：`handle_webhook_retry()` 捕获 `MaxRetriesExceededError` 后返回 `False`，继续执行 `delivery_update(delivery, FAILED)`
 
 **核心机制**：
 
@@ -251,11 +279,12 @@ def send_webhook_request_async(self, event_delivery_id, ...):
 | **重试计数** | Celery 内置 `self.request.retries`，存储在 Celery 消息元数据中 | [transport.py:793](saleor/webhook/transport/asynchronous/transport.py#L793) |
 | **重试触发** | `handle_webhook_retry()` → `celery_task.retry()` 抛出 `Retry` 异常，由 Celery 调度器重入队 | [utils.py:451](saleor/webhook/transport/utils.py#L451) |
 | **重试节奏** | 指数退避 `countdown = 10 * (2^retries)`，共 5 次重试 | [utils.py:451](saleor/webhook/transport/utils.py#L451) |
-| **失败标记** | 每次失败立即调用 `delivery_update(delivery, FAILED)` 标记状态 | [transport.py:830](saleor/webhook/transport/asynchronous/transport.py#L830) |
-| **死信判定** | 捕获 `MaxRetriesExceededError` 后，状态停留在 `FAILED` | [utils.py:457](saleor/webhook/transport/utils.py#L457) |
+| **失败标记** | 3xx/4xx 立即标记 FAILED；5xx/网络错误触发重试时保持 PENDING，重试耗尽后才标记 FAILED | [transport.py:830](saleor/webhook/transport/asynchronous/transport.py#L830) |
+| **死信判定** | 捕获 `MaxRetriesExceededError` 后返回 False，继续执行 `delivery_update(delivery, FAILED)` | [utils.py:457](saleor/webhook/transport/utils.py#L457) |
 | **成功清理** | `clear_successful_delivery(delivery)` 单条删除 | [transport.py:843](saleor/webhook/transport/asynchronous/transport.py#L843) |
 | **Attempt 创建** | `create_attempt(delivery, task_id)` 立即单条保存 | [transport.py:780](saleor/webhook/transport/asynchronous/transport.py#L780) |
 | **禁用 webhook/app 处理** | `get_multiple_deliveries_for_webhooks()` 中检查 `is_active`，非活跃的立即标记 FAILED，**不创建 attempt，不触发重试** | [utils.py:529](saleor/webhook/transport/utils.py#L529) |
+| **重试时 delivery 状态** | 始终保持 PENDING，直到重试耗尽或成功 | 代码时序分析 |
 
 #### 3.5.2 路径二：按应用批量路径 (`send_webhooks_async_for_app`)
 
@@ -295,6 +324,27 @@ def send_webhooks_async_for_app(self, app_id, ...):
     send_webhooks_async_for_app.apply_async(kwargs={"app_id": app_id, ...})
 ```
 
+#### 3.5.2.1 4xx 场景下的重试与终态判断
+
+**⚠️ 重要修正**：之前的理解存在严重偏差。`process_failed_deliveries()` **完全不检查 HTTP 状态码**！
+
+```python
+# [saleor/webhook/transport/utils.py:647](saleor/webhook/transport/utils.py#L647)
+def process_failed_deliveries(failed_deliveries_attempts, max_webhook_retries):
+    for delivery, attempt, attempt_count in failed_deliveries_attempts:
+        # ⚠️ 没有任何状态码检查！4xx 和 5xx 一视同仁
+        if attempt_count >= max_webhook_retries:
+            delivery.status = EventDeliveryStatus.FAILED
+            deliveries_to_update.append(delivery)
+        deliveries_attempts_to_update.append(attempt)
+```
+
+**关键结论**：
+- 批量路径中 **没有针对 4xx 错误的特殊处理**
+- 4xx 错误和 5xx 错误一视同仁，都会被重试
+- 直到 `attempt_count >= 5` 才会被标记为死信
+- 这意味着批量路径下 4xx 错误也会产生 **6 个 attempt 记录**，约 10 秒耗尽重试
+
 **核心机制**：
 
 | 机制 | 实现方式 | 代码位置 |
@@ -303,10 +353,11 @@ def send_webhooks_async_for_app(self, app_id, ...):
 | **重试触发** | 不使用 Celery 重试，通过自调度持续轮询 `PENDING` 状态的 delivery | [transport.py:939](saleor/webhook/transport/asynchronous/transport.py#L939) |
 | **重试节奏** | **无指数退避**，任务执行完立即重新调度，重试间隔取决于任务执行时间 | [transport.py:939](saleor/webhook/transport/asynchronous/transport.py#L939) |
 | **失败标记** | 不立即标记 FAILED，保持 PENDING，`process_failed_deliveries()` 中当 `attempt_count >= 5` 才批量标记 | [utils.py:654](saleor/webhook/transport/utils.py#L654) |
-| **死信判定** | `attempt_count >= MAX_WEBHOOK_RETRIES` 时批量标记为 `FAILED` | [utils.py:654](saleor/webhook/transport/utils.py#L654) |
+| **死信判定** | `attempt_count >= MAX_WEBHOOK_RETRIES` 时批量标记为 `FAILED`，**不区分 4xx/5xx** | [utils.py:654](saleor/webhook/transport/utils.py#L654) |
 | **成功清理** | `clear_successful_deliveries(deliveries)` 批量删除 | [transport.py:937](saleor/webhook/transport/asynchronous/transport.py#L937) |
 | **Attempt 创建** | `create_attempts_for_deliveries()` 批量创建，最后 bulk_update | [utils.py:677](saleor/webhook/transport/utils.py#L677) |
 | **禁用 webhook/app 处理** | `get_deliveries_for_app()` **不检查** `is_active`，非活跃的仍会被选中，**正常创建 attempt，正常发送请求，失败后正常重试**，直到 `attempt_count >= 5` 才标记死信 | [utils.py:482](saleor/webhook/transport/utils.py#L482) |
+| **4xx 错误处理** | **与 5xx 完全相同**，都会重试 5 次（共 6 次尝试） | [utils.py:654](saleor/webhook/transport/utils.py#L654) |
 
 #### 3.5.3 两条路径的失败处理流程对比
 
@@ -328,31 +379,34 @@ def process_failed_deliveries(failed_deliveries_attempts, max_webhook_retries):
 
 #### 3.5.4 两条路径的重试节奏对比
 
-**单条任务路径（指数退避）**：
+**单条任务路径（区分错误类型）**：
 
-| 尝试次数 | 重试次数 | 等待时间 | 累计时间 |
-|---------|---------|---------|---------|
-| 第1次 | 0 | 0 | 0 |
-| 第2次 | 1 | 10 秒 | 10 秒 |
-| 第3次 | 2 | 20 秒 | 30 秒 |
-| 第4次 | 3 | 40 秒 | 70 秒 |
-| 第5次 | 4 | 80 秒 | 150 秒 |
-| 第6次 | 5 | 160 秒 | 310 秒 |
+| 错误类型 | 尝试次数 | 重试次数 | 等待时间 | 累计时间 | 最终状态 |
+|---------|---------|---------|---------|---------|---------|
+| 4xx/3xx | 1 | 0 | 0 | 0 | FAILED（不重试） |
+| 5xx/网络错误 | 1 | 0 | 0 | 0 | PENDING |
+| 5xx/网络错误 | 2 | 1 | 10 秒 | 10 秒 | PENDING |
+| 5xx/网络错误 | 3 | 2 | 20 秒 | 30 秒 | PENDING |
+| 5xx/网络错误 | 4 | 3 | 40 秒 | 70 秒 | PENDING |
+| 5xx/网络错误 | 5 | 4 | 80 秒 | 150 秒 | PENDING |
+| 5xx/网络错误 | 6 | 5 | 160 秒 | 310 秒 | FAILED（重试耗尽） |
 
-**批量路径（无退避）**：
+**批量路径（不区分错误类型）**：
 
 假设每次任务执行耗时 2 秒，批量大小 100：
 
-| 尝试次数 | attempt_count | 等待时间 | 累计时间 |
-|---------|---------------|---------|---------|
-| 第1次 | 0 | ~0 | ~0 |
-| 第2次 | 1 | ~2 秒 | ~2 秒 |
-| 第3次 | 2 | ~2 秒 | ~4 秒 |
-| 第4次 | 3 | ~2 秒 | ~6 秒 |
-| 第5次 | 4 | ~2 秒 | ~8 秒 |
-| 第6次 | 5 | ~2 秒 | ~10 秒 |
+| 错误类型 | 尝试次数 | attempt_count | 等待时间 | 累计时间 | 最终状态 |
+|---------|---------|---------------|---------|---------|---------|
+| 4xx/3xx/5xx | 1 | 0 | ~0 | ~0 | PENDING |
+| 4xx/3xx/5xx | 2 | 1 | ~2 秒 | ~2 秒 | PENDING |
+| 4xx/3xx/5xx | 3 | 2 | ~2 秒 | ~4 秒 | PENDING |
+| 4xx/3xx/5xx | 4 | 3 | ~2 秒 | ~6 秒 | PENDING |
+| 4xx/3xx/5xx | 5 | 4 | ~2 秒 | ~8 秒 | PENDING |
+| 4xx/3xx/5xx | 6 | 5 | ~2 秒 | ~10 秒 | FAILED（attempt_count >= 5） |
 
-> **注意**：批量路径在第 6 次尝试时 `attempt_count` 达到 5，才会被标记为死信。总耗时仅约 10 秒，远快于单条路径的 5 分钟。
+> **重要差异**：
+> - 单条路径：4xx/3xx 立即死信（1 次尝试），5xx 约 5 分钟死信（6 次尝试）
+> - 批量路径：所有错误类型都约 10 秒死信（6 次尝试），**不区分 4xx/5xx**
 
 #### 3.5.5 禁用 webhook/app 的完整流转对比
 
@@ -572,13 +626,19 @@ query GetDeadLetterDeliveries {
 ```
 
 **死信类型判断逻辑**：
-| status | attempts 数量 | webhook.isActive | app.isActive | 死信类型 |
-|--------|--------------|-----------------|--------------|----------|
-| FAILED | 0 | false | - | webhook 被禁用导致 |
-| FAILED | 0 | true | false | app 被禁用导致 |
-| FAILED | 6 | true | true | 重试耗尽导致（单条路径） |
-| FAILED | 6 | true | true | 重试耗尽导致（批量路径） |
-| PENDING | >= 5 | true | true | 即将成为死信（批量路径） |
+| status | attempts 数量 | webhook.isActive | app.isActive | 首次 attempt 状态码 | 死信类型 |
+|--------|--------------|-----------------|--------------|----------------|----------|
+| FAILED | 0 | false | - | - | webhook 被禁用导致 |
+| FAILED | 0 | true | false | - | app 被禁用导致 |
+| FAILED | 1 | true | true | 3xx/4xx | 客户端错误（单条路径，不重试） |
+| FAILED | 6 | true | true | - | 重试耗尽导致（单条路径 5xx/网络错误） |
+| FAILED | 6 | true | true | - | 重试耗尽导致（批量路径，不区分错误类型） |
+| PENDING | >= 5 | true | true | - | 即将成为死信（批量路径） |
+
+> **判断技巧**：
+> - `attempts == 1 且 `status == FAILED` 且状态码 3xx/4xx → 单条路径的客户端错误
+> - `attempts == 6` 且 `status == FAILED` → 重试耗尽（需结合状态码和路径判断
+> - `attempts` 列表中首次尝试的状态码可以帮助区分错误类型
 
 #### 4.2.3 应用侧的最佳实践
 
@@ -640,19 +700,23 @@ if inactive_delivery_ids:
 3. `attempt_count >= 5` 时通过 `process_failed_deliveries()` 标记死信
 4. **死信特征**：`status=FAILED`, `attempts=6`
 
-#### 场景三：4xx 客户端错误（不重试）
+#### 场景三：4xx 客户端错误
 
-**单条任务路径**：
-1. `handle_webhook_retry()` 中检测到 3xx/4xx 状态码
+**⚠️ 重要修正**：两条路径的处理方式完全不同。
+
+**单条任务路径**（不重试）：
+1. `handle_webhook_retry()` 中检测到 `300 <= code < 500`
 2. `return False` 不触发重试
-3. 任务结束，`delivery.status=FAILED`
-4. **死信特征**：`status=FAILED`, `attempts=1`
+3. 继续执行 `delivery_update(delivery, FAILED)`
+4. 任务结束
+5. **死信特征**：`status=FAILED`, `attempts=1`, 状态码 3xx/4xx
 
-**批量路径**：
-1. 不会立即标记，保持 PENDING
-2. 继续被选中重试，每次失败增加 attempt_count
-3. 直到 `attempt_count >= 5` 才标记死信
-4. **死信特征**：`status=FAILED`, `attempts=6`
+**批量路径**（与 5xx 完全相同，会重试）：
+1. `process_failed_deliveries()` **不检查状态码**，所有失败一视同仁
+2. 保持 PENDING，`attempt_count += 1`
+3. 下一轮自调度继续选中处理
+4. 直到 `attempt_count >= 5` 才标记死信
+5. **死信特征**：`status=FAILED`, `attempts=6`, 状态码 3xx/4xx
 
 ### 4.4 数据保留策略
 
@@ -898,17 +962,21 @@ WEBHOOK_ASYNC_BATCH_SIZE = 100
 
 | 场景 | 单条任务路径处理 | 按应用批量路径处理 |
 |-----|-----------------|-------------------|
-| 网络连接错误 | 标记 FAILED，触发 Celery 指数退避重试 | 保持 PENDING，下一轮自调度重试 |
-| 5xx 服务器错误 | 触发指数退避重试（10/20/40/80/160s） | 无退避，立即重试（约2秒间隔） |
-| 4xx 客户端错误 | 不重试，直接标记 FAILED | 不重试，下一轮 attempt_count 达 5 后标记 FAILED |
-| 3xx 重定向 | 不重试，直接标记 FAILED | 不重试，下一轮标记 FAILED |
-| 无效 IP 地址（SSRF） | 不重试，标记 FAILED | 不重试，下一轮标记 FAILED |
-| payload 解析失败 | 不重试，标记 FAILED | 不重试，下一轮标记 FAILED |
-| **webhook/app 被禁用** | ✅ `get_multiple_deliveries_for_webhooks()` 中检查 `is_active`，立即标记 FAILED，**不创建 attempt，不触发重试** | ❌ `get_deliveries_for_app()` **不检查** `is_active`，**仍会被选中**，正常创建 attempt，正常发送请求，失败后正常重试，直到 `attempt_count >= 5` 才标记死信 |
+| 网络连接错误 | 保持 PENDING，触发 Celery 指数退避重试 | 保持 PENDING，下一轮自调度重试 |
+| 5xx 服务器错误 | 保持 PENDING，触发指数退避重试（10/20/40/80/160s） | 保持 PENDING，无退避立即重试（约2秒间隔） |
+| **4xx 客户端错误** | ✅ 不重试，立即标记 FAILED，`attempts=1` | ❌ **与 5xx 完全相同**，保持 PENDING，重试 5 次（共 6 次尝试），`attempt_count >= 5` 才标记 FAILED |
+| 3xx 重定向 | ✅ 不重试，立即标记 FAILED，`attempts=1` | ❌ **与 5xx 完全相同**，保持 PENDING，重试 5 次（共 6 次尝试），`attempt_count >= 5` 才标记 FAILED |
+| 无效 IP 地址（SSRF） | ✅ 不重试，立即标记 FAILED，`attempts=1` | ❌ **与 5xx 完全相同**，保持 PENDING，重试 5 次（共 6 次尝试），`attempt_count >= 5` 才标记 FAILED |
+| payload 解析失败 | ✅ 不重试，立即标记 FAILED，`attempts=1` | ❌ **与 5xx 完全相同**，保持 PENDING，重试 5 次（共 6 次尝试），`attempt_count >= 5` 才标记 FAILED |
+| **webhook/app 被禁用** | ✅ `get_multiple_deliveries_for_webhooks()` 中检查 `is_active`，立即标记 FAILED，**不创建 attempt，不触发重试**，`attempts=0` | ❌ `get_deliveries_for_app()` **不检查** `is_active`，**仍会被选中**，正常创建 attempt，正常发送请求，失败后正常重试，直到 `attempt_count >= 5` 才标记死信，`attempts=6` |
 | 数据库事务未提交 | `call_event` 自动延迟到 `on_commit` | `call_event` 自动延迟到 `on_commit` |
 | 主从延迟（延迟 payload） | 最多 12 次重试等待从库同步 | 最多 12 次重试等待从库同步 |
 
-> **注意**：对于 4xx 错误和 webhook/app 被禁用场景，单条路径立即标记死信，而批量路径会继续尝试 5 次才标记死信，这意味着批量路径下应用会收到 5 次相同的错误通知。
+> **⚠️ 关键差异总结**：
+> - **单条路径**：智能区分错误类型，3xx/4xx/SSRF/payload 错误立即死信（1 次尝试），5xx/网络错误指数退避重试（6 次尝试，约 5 分钟）
+> - **批量路径**：所有错误类型一视同仁，全部重试 5 次（共 6 次尝试），约 10 秒耗尽
+> - **禁用 webhook/app**：单条路径立即死信（0 次尝试），批量路径完整重试 6 次
+> - **批量路径风险**：4xx 错误（如 404、403）会产生 6 次重复请求，可能触发告警风暴
 
 ---
 

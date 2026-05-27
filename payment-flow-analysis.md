@@ -221,21 +221,34 @@ def _recalculate_charge_amounts(transaction, charge_events):
 
 ### 3.3 状态流转示例
 
-一次完整的支付流程可能产生如下事件序列：
+一次完整的支付流程可能产生如下事件序列（授权和扣款使用不同 psp_reference，如 Braintree 模式）：
 
 ```
-1. AUTHORIZATION_REQUEST (amount=100)
-   → authorize_pending_value = 100
+1. AUTHORIZATION_REQUEST (amount=100, include_in_calculations=False)
+   → 不参与计算，仅作为占位
 
-2. AUTHORIZATION_SUCCESS (psp_ref=xxx, amount=100)
-   → authorized_value = 100, authorize_pending_value = 0
+2. AUTHORIZATION_SUCCESS (psp_ref=auth_xxx, amount=100)
+   → 授权组（auth_xxx）：只有 SUCCESS，无 REQUEST/FAILURE
+   → authorized_value = 100
+   → authorize_pending_value = 0
 
-3. CHARGE_REQUEST (psp_ref=yyy, amount=100)
-   → charge_pending_value = 100, authorized_value = 0
+3. CHARGE_REQUEST (psp_ref=charge_yyy, amount=100)
+   → 扣款组（charge_yyy）：只有 REQUEST，无 SUCCESS/FAILURE
+   → charge_pending_value = 100
+   → authorized_value = 100 - 100 = 0  ✅ 从授权金额扣减
 
-4. CHARGE_SUCCESS (psp_ref=yyy, amount=100)
-   → charged_value = 100, charge_pending_value = 0
+4. CHARGE_SUCCESS (psp_ref=charge_yyy, amount=100)
+   → 扣款组（charge_yyy）：REQUEST + SUCCESS
+   → charged_value = 100
+   → authorized_value = 0 - 100 = -100？ ❓ 不，先归零再计算
+   → 重新计算：
+   → 授权组：authorized_value = 100
+   → 扣款组：charged_value = 100, authorized_value = 100 - 100 = 0
+
+最终：authorized_value=0, charged_value=100
 ```
+
+> **关键**：计算前所有字段归零，然后按 psp_reference 分组累加和扣减。同一组内 REQUEST 和 SUCCESS 互斥（只取最终状态），但扣减都是从 authorized_value 中扣。
 
 ### 3.4 事件去重机制
 
@@ -337,10 +350,14 @@ mutation {
    → amount 必填性检查
    → amount 精度格式化
 
-3. 事务内处理
-   → 对 TransactionItem 加行级锁 (select_for_update)
-   → 检查事件是否已存在（去重）
-   → 保存新 TransactionEvent
+3. 事务内处理（traced_atomic_transaction）
+   → 步骤 1：对 TransactionItem 加行级锁
+      transaction_item_qs_select_for_update().filter(pk=transaction.pk).first()
+   → 步骤 2：调用 get_already_existing_event() 去重
+      去重键：(transaction_id, psp_reference, type)
+   → 步骤 3：额外检查 AUTHORIZATION_SUCCESS 唯一性
+      authorization_success_already_exists()
+   → 步骤 4：不重复则保存新 TransactionEvent
 
 4. 更新 TransactionItem
    → 调用 recalculate_transaction_amounts() 重算金额
@@ -351,6 +368,8 @@ mutation {
    → 订单：process_order_with_transaction()
    → 购物车：transaction_amounts_for_checkout_updated()
 ```
+
+> **关键确认**：事务内直接调用 `get_already_existing_event()`，**不经过 `deduplicate_event()` 函数**。
 
 ### 4.3 订单金额更新
 
@@ -376,11 +395,13 @@ def updates_amounts_for_order(order, save=True):
 
 ### 4.4 幂等性保证
 
-系统通过多层机制保证幂等：
+`transactionEventReport` 的幂等性通过以下机制保证（仅行锁 + `get_already_existing_event()` 路径，不调用 `deduplicate_event()`）：
 
-1. **数据库唯一约束**：`TransactionEvent` 的 `(transaction_id, idempotency_key)` 唯一约束 (`models.py:266`)
-2. **应用层去重**：`deduplicate_event()` 基于 `psp_reference` + `type` 去重
-3. **幂等性key**：`TransactionItem.idempotency_key` 用于防止重复请求
+1. **行级锁**：在行锁事务内处理，防止并发写入（`transaction_event_report.py:398`）
+2. **应用层去重**：`get_already_existing_event()` 基于 `(transaction_id, psp_reference, type)` 查询（`utils.py:1131`）
+3. **幂等性 key**：`TransactionEvent` 的唯一约束 `(transaction_id, idempotency_key)`（`models.py:266`）
+
+> 注意：`deduplicate_event()` 函数不用于 `transactionEventReport` 路径，仅用于 `transactionRequestAction` 等其他场景。
 
 ---
 
@@ -561,7 +582,11 @@ def capture(payment_information, config):
 - `auto_capture=True` 时，`authorize()` 直接返回 `kind=CAPTURE`，一步完成
 - `auto_capture=False` 时，`authorize()` 返回 `kind=AUTH`，需要后续调用 `capture()` 提交结算
 - **Braintree 网关目录中没有 webhook 处理实现**，所有状态变更依赖同步调用结果
-- **Braintree 侧幂等边界**：Saleor 代码中未向 Braintree SDK 传递幂等键，同 token 重复调用 `submit_for_settlement` 的幂等性完全依赖 Braintree SDK 内部行为。测试显示：对已结算的 transaction 重复调用 submit_for_settlement 会返回成功，但不会产生新的扣款。
+
+**Braintree 侧可验证幂等边界**（基于代码分析）：
+1. **Saleor 侧未传递幂等键**：代码中 `sale()` 和 `submit_for_settlement()` 调用均未传入幂等参数，幂等性完全依赖 Braintree SDK 内部机制
+2. **同一 transaction_id 重复提交**：`capture()` 使用授权返回的 `transaction_id` 调用 `submit_for_settlement`，理论上 Braintree 应对已结算交易的重复提交返回成功但不产生新扣款
+3. **幂等性验证建议**：需要通过 Braintree API 文档或实际集成测试确认具体行为，仓内代码无相关断言
 
 #### 7.1.3 网关差异对比表
 
@@ -641,7 +666,7 @@ class DeprecatedBraintreeGatewayPlugin(BasePlugin):
 | 网关 | 处理方式 | 代码位置 |
 |------|----------|----------|
 | Stripe | 按 `psp_reference + kind + is_success` 查询，已存在则跳过 | `webhooks.py:226` |
-| Braintree | **无 webhook 处理**，同步调用天然幂等（同一 token 重复调用 Braintree SDK 返回同一结果） | N/A |
+| Braintree | **无 webhook 处理**，幂等性完全依赖 Braintree SDK 内部机制 | N/A |
 
 **场景 2：webhook 先于同步响应到达**
 
@@ -1014,19 +1039,22 @@ HTTP: POST /payments/stripe/webhook/
 GraphQL: transactionEventReport
   → saleor/graphql/payment/mutations/transaction/transaction_event_report.py:65
     → 权限检查
-    → 对 TransactionItem 加行级锁
-    → deduplicate_event()  [去重检查]
+    → traced_atomic_transaction 事务
+    → transaction_item_qs_select_for_update()  [对 TransactionItem 加行级锁]
+    → get_already_existing_event()  [去重检查，直接调用]
     → TransactionEvent.objects.create(type=CHARGE_SUCCESS, psp_ref=pi_3Nq...L4X)
     → recalculate_transaction_amounts()
       → 按 psp_reference 分组事件
       → 找到 CHARGE_REQUEST 和 CHARGE_SUCCESS
       → charged_value = 100
-      → authorized_value = 0  [因为 CHARGE_REQUEST 消耗了授权]
+      → authorized_value = 0  [因为 CHARGE_SUCCESS 消耗了授权]
     → process_order_with_transaction()
       → updates_amounts_for_order()  [更新订单金额]
         → Order.total_charged_amount = 100
         → Order.charge_status = FULLY_CHARGED
 ```
+
+> **注意**：`transactionEventReport` 直接调用 `get_already_existing_event()` 去重，**不经过 `deduplicate_event()` 函数**。
 
 **数据库变化**（新模型）：
 - `TransactionEvent` 新增 CHARGE_SUCCESS 事件

@@ -652,3 +652,318 @@ def delete_event_payloads_task(expiration_date=None):
       ↓
 6. 后续流程同上
 ```
+
+---
+
+## 9. 按业务渠道筛选 Webhook
+
+**文件位置**: `saleor/webhook/utils.py:202`
+
+### 9.1 触发条件
+
+| 触发条件 | 说明 |
+|---------|------|
+| Webhook 存在 `subscription_query` | 说明是 subscription webhook，可能包含 channel 过滤条件 |
+| 事件关联具体 channel | 如 order.created 事件关联 order.channel.slug |
+| `filterable_channel_slugs` 数组已填充 | Webhook 保存时解析 subscription_query 提取的 channel 列表 |
+
+### 9.2 处理动作
+
+```python
+def filter_webhooks_for_channel(
+    webhooks: Iterable[Webhook],
+    channel_slug: str,
+) -> list[Webhook]:
+    for webhook in webhooks:
+        # 1. Legacy webhook（无 subscription_query）直接通过
+        if not webhook.subscription_query:
+            filtered.append(webhook)
+            continue
+        # 2. 有 subscription_query 但无 channel 过滤条件
+        filterable_channel_slugs = list(webhook.filterable_channel_slugs)
+        if not filterable_channel_slugs:
+            filtered.append(webhook)
+            continue
+        # 3. 有 channel 过滤条件，匹配当前 channel
+        if channel_slug in filterable_channel_slugs:
+            filtered.append(webhook)
+```
+
+**筛选流程**:
+```
+webhook
+  ├─ 无 subscription_query → 通过
+  ├─ 有 subscription_query
+  │    ├─ filterable_channel_slugs 为空 → 通过
+  │    └─ filterable_channel_slugs 非空
+  │         ├─ 当前 channel 在列表中 → 通过
+  │         └─ 当前 channel 不在列表中 → 过滤
+```
+
+### 9.3 结果
+
+- **通过筛选**: Webhook 保留，后续会为其创建 EventDelivery 并入队
+- **被过滤**: Webhook 被排除，不触发任何通知
+- **设计意图**: 允许用户通过 subscription query 精确控制哪些 channel 的事件需要通知，避免不必要的 Webhook 调用
+
+---
+
+## 10. 队列决策顺序与回退机制
+
+**关键函数**: `get_queue_name_for_webhook` (`saleor/webhook/transport/asynchronous/transport.py:322`)
+
+### 10.1 触发条件
+
+| 触发条件 | 说明 |
+|---------|------|
+| 事件触发时传入 `queue` 参数 | WebhookPlugin 中为不同事件类型指定专用队列 |
+| Webhook.target_url scheme | 决定是否使用协议专用队列 |
+| Settings 中各队列的环境变量配置 | 决定各队列是否有独立配置 |
+
+### 10.2 处理动作
+
+**队列决策优先级（从高到低）**:
+
+```
+1. 协议专用队列（目标地址驱动）
+   ├─ scheme == "awssqs" → WEBHOOK_SQS_CELERY_QUEUE_NAME
+   └─ scheme == "gcpubsub" → WEBHOOK_PUBSUB_CELERY_QUEUE_NAME
+
+2. 事件专用队列（业务类型驱动，作为协议队列的 default_queue）
+   ├─ ORDER_* → ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME
+   └─ CHECKOUT_* → CHECKOUT_WEBHOOK_EVENTS_CELERY_QUEUE_NAME
+
+3. 默认队列回退（最终兜底）
+   └─ 所有未配置的队列 → WEBHOOK_CELERY_QUEUE_NAME
+```
+
+**代码中的实际调用**:
+```python
+# 在 process_deliveries 中
+send_webhook_request_async.apply_async(
+    kwargs={"event_delivery_id": delivery.pk, ...},
+    queue=get_queue_name_for_webhook(
+        delivery.webhook,
+        # default_queue 优先级：传入的 queue > 默认队列
+        default_queue=queue or settings.WEBHOOK_CELERY_QUEUE_NAME,
+    ),
+)
+```
+
+**Settings 中的回退链** (`saleor/settings.py:1043-1055`):
+```python
+# SQS 队列默认回退到 WEBHOOK_CELERY_QUEUE_NAME
+WEBHOOK_SQS_CELERY_QUEUE_NAME = os.environ.get(
+    "WEBHOOK_SQS_CELERY_QUEUE_NAME", WEBHOOK_CELERY_QUEUE_NAME
+)
+# PUBSUB 队列默认回退到 WEBHOOK_CELERY_QUEUE_NAME
+WEBHOOK_PUBSUB_CELERY_QUEUE_NAME = os.environ.get(
+    "WEBHOOK_PUBSUB_CELERY_QUEUE_NAME", WEBHOOK_CELERY_QUEUE_NAME
+)
+# CHECKOUT 事件队列默认回退到 WEBHOOK_CELERY_QUEUE_NAME
+CHECKOUT_WEBHOOK_EVENTS_CELERY_QUEUE_NAME = os.environ.get(
+    "CHECKOUT_WEBHOOK_EVENTS_CELERY_QUEUE_NAME", WEBHOOK_CELERY_QUEUE_NAME
+)
+# ORDER 事件队列默认回退到 WEBHOOK_CELERY_QUEUE_NAME
+ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME = os.environ.get(
+    "ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME", WEBHOOK_CELERY_QUEUE_NAME
+)
+```
+
+**决策示例**:
+```
+场景1: Order 事件 + HTTP Webhook
+  → 传入 queue = ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME
+  → scheme = "https"，不在协议队列映射中
+  → 最终队列 = ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME
+
+场景2: Order 事件 + SQS Webhook
+  → 传入 queue = ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME
+  → scheme = "awssqs"，匹配协议队列
+  → 最终队列 = WEBHOOK_SQS_CELERY_QUEUE_NAME
+
+场景3: Product 事件（无专用队列）+ HTTP Webhook
+  → 传入 queue = None
+  → scheme = "https"，不在协议队列映射中
+  → 最终队列 = WEBHOOK_CELERY_QUEUE_NAME
+```
+
+### 10.3 结果
+
+- **协议专用队列**: SQS/PubSub Webhook 使用独立队列，避免与 HTTP Webhook 竞争资源
+- **事件专用队列**: Order/Checkout 高频事件使用独立队列，隔离核心业务流量
+- **默认队列兜底**: 所有未明确配置的场景统一使用默认队列，确保系统可用性
+- **可扩展性**: 每个队列都可通过环境变量独立配置，支持按需拆分
+
+---
+
+## 11. Delivery 暂不可见时的快速重试
+
+**文件位置**: `saleor/webhook/transport/asynchronous/transport.py:772-776`
+
+### 11.1 触发条件
+
+| 触发条件 | 说明 |
+|---------|------|
+| `send_webhook_request_async` 任务执行 | Worker 从队列中取出任务开始执行 |
+| `get_delivery_for_webhook` 返回 `(None, True)` | delivery 在主库已创建但从库还未同步（主从延迟） |
+
+```python
+def get_delivery_for_webhook(event_delivery_id):
+    delivery, inactive_delivery_ids = get_multiple_deliveries_for_webhooks(...)
+    not_found = False
+    # delivery 不存在且不在 inactive 列表中 → 主从延迟
+    if not delivery and event_delivery_id not in inactive_delivery_ids:
+        not_found = True
+    return delivery, not_found
+```
+
+### 11.2 处理动作
+
+```python
+def send_webhook_request_async(self, event_delivery_id, ...):
+    delivery, not_found = get_delivery_for_webhook(event_delivery_id)
+    if not delivery:
+        if not_found:
+            # 快速重试：countdown=1，1秒后重试
+            raise self.retry(countdown=1)
+        return
+```
+
+**重试特点**:
+- **快速重试**: `countdown=1`，仅等待 1 秒
+- **无退避**: 不使用指数退避，因为主从延迟通常是短暂的
+- **复用重试预算**: 使用 `send_webhook_request_async` 自身的 `max_retries=5` 重试次数
+- **重试上下文**: 保留原始 task_id，便于追踪
+
+### 11.3 结果
+
+- **成功**: 1秒后 delivery 在从库可见，任务正常执行
+- **失败**: 如果多次重试后仍不可见，最终会因 `MaxRetriesExceededError` 标记为失败
+- **设计意图**: 针对主从复制延迟的常见场景，用最小代价（1秒等待）解决大部分临时性不可见问题
+
+---
+
+## 12. Deferred Payload 部分缺失时的补排队逻辑
+
+**文件位置**: `saleor/webhook/transport/asynchronous/transport.py:567-600`
+
+### 12.1 触发条件
+
+| 触发条件 | 说明 |
+|---------|------|
+| `generate_deferred_payloads` 任务执行 | 处理延迟 payload 生成 |
+| `confirm_event_delivery_availability` 返回部分缺失 | 某些 delivery 在从库已同步，某些还未同步 |
+
+```python
+def confirm_event_delivery_availability(
+    event_delivery_ids: list[int],
+    db_connection_name: str,
+) -> tuple[set[int], set[int]]:
+    available_delivery_pks = set(
+        EventDelivery.objects.using(db_connection_name)
+        .filter(pk__in=event_delivery_ids)
+        .values_list("pk", flat=True)
+    )
+    missing_delivery_pks = set(event_delivery_ids) - available_delivery_pks
+    return available_delivery_pks, missing_delivery_pks
+```
+
+### 12.2 处理动作
+
+```python
+def generate_deferred_payloads(self, event_delivery_ids, ...):
+    # 1. 检查哪些 delivery 在从库可用
+    available_delivery_pks, missing_delivery_pks = (
+        confirm_event_delivery_availability(event_delivery_ids, db_connection_name)
+    )
+
+    # 2. 全部缺失：指数退避重试等待主从同步
+    if not available_delivery_pks:
+        retry_backoff = 1
+        countdown = retry_backoff * (2**self.request.retries)
+        raise self.retry(countdown=countdown, ...)
+
+    # 3. 部分缺失：把缺失的单独重新入队（补排队）
+    if missing_delivery_pks:
+        request_kwargs = self.request.kwargs
+        generate_deferred_payloads.apply_async(
+            kwargs={
+                **request_kwargs,
+                "event_delivery_ids": list(missing_delivery_pks),
+            },
+            MessageGroupId=message_group_id,
+        )
+
+    # 4. 处理已可用的 delivery
+    _generate_deferred_payloads(
+        event_delivery_ids=available_delivery_pks,
+        ...
+    )
+```
+
+**全部缺失的退避策略**:
+- `max_retries=12`: 最多重试 12 次
+- 退避公式: `countdown = 1 * (2^retries)`
+- 重试序列: `1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 512s, 1024s, 2048s`
+- 总等待时间可达约 68 分钟，应对极端主从延迟场景
+
+**部分缺失的分流策略**:
+```
+输入: [1, 2, 3, 4, 5]
+  ├─ available: [1, 2, 3] → 立即处理，生成 payload 并入队发送
+  └─ missing: [4, 5] → 重新入队 generate_deferred_payloads
+        ↓ (下次执行)
+        ├─ available: [4] → 处理
+        └─ missing: [5] → 再次入队
+              ↓
+              (最终处理或失败)
+```
+
+### 12.3 结果
+
+- **已可用 delivery**: 立即生成 payload 并入队 `send_webhook_request_async`，不被缺失的 delivery 阻塞
+- **缺失 delivery**: 单独重新入队，享受独立的重试预算，不会影响已可用的 delivery
+- **全部缺失**: 指数退避重试，给予足够时间等待主从同步
+- **设计意图**: 分批处理避免批量任务因个别 delivery 未同步而全部阻塞，提高整体吞吐量
+
+---
+
+## 13. 核心决策逻辑汇总（触发条件 → 处理动作 → 结果）
+
+### 13.1 按渠道筛选 Webhook
+
+| 触发条件 | 处理动作 | 结果 |
+|---------|---------|------|
+| Webhook 无 subscription_query | 直接加入结果列表 | Webhook 保留 |
+| Webhook 有 subscription_query 但 filterable_channel_slugs 为空 | 直接加入结果列表 | Webhook 保留 |
+| Webhook 有 subscription_query 且当前 channel 在 filterable_channel_slugs 中 | 加入结果列表 | Webhook 保留 |
+| Webhook 有 subscription_query 且当前 channel 不在 filterable_channel_slugs 中 | 跳过 | Webhook 被过滤 |
+
+### 13.2 队列决策
+
+| 触发条件 | 处理动作 | 结果 |
+|---------|---------|------|
+| Webhook scheme 是 awssqs | 使用 WEBHOOK_SQS_CELERY_QUEUE_NAME | SQS 专用队列 |
+| Webhook scheme 是 gcpubsub | 使用 WEBHOOK_PUBSUB_CELERY_QUEUE_NAME | Pub/Sub 专用队列 |
+| Webhook scheme 是 http/https 且传入 queue=ORDER_* | 使用 ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME | Order 事件队列 |
+| Webhook scheme 是 http/https 且传入 queue=CHECKOUT_* | 使用 CHECKOUT_WEBHOOK_EVENTS_CELERY_QUEUE_NAME | Checkout 事件队列 |
+| Webhook scheme 是 http/https 且传入 queue=None | 使用 WEBHOOK_CELERY_QUEUE_NAME | 默认队列 |
+| 以上队列未配置环境变量 | 回退到 WEBHOOK_CELERY_QUEUE_NAME | 默认队列兜底 |
+
+### 13.3 Delivery 不可见重试
+
+| 触发条件 | 处理动作 | 结果 |
+|---------|---------|------|
+| get_delivery_for_webhook 返回 (None, True) | raise self.retry(countdown=1) | 1秒后快速重试 |
+| 重试后 delivery 可见 | 正常执行发送逻辑 | Webhook 发送成功或失败 |
+| 重试超过 max_retries=5 次 | MaxRetriesExceededError | EventDelivery 标记为 FAILED |
+
+### 13.4 Deferred Payload 补排队
+
+| 触发条件 | 处理动作 | 结果 |
+|---------|---------|------|
+| 全部 delivery 缺失 | 指数退避重试 (1s, 2s, 4s, ...) | 等待主从同步 |
+| 部分 delivery 缺失 | 缺失的重新入队，可用的立即处理 | 分批分流，不阻塞 |
+| 重试超过 max_retries=12 次 | MaxRetriesExceededError | 记录错误日志，放弃 |
+| delivery 最终可用 | 生成 payload 并入队发送 | Webhook 正常发送 |

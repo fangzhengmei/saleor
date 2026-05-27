@@ -104,6 +104,61 @@ class Fulfillment(ModelWithMetadata):
 
 校验分为三层：GraphQL 层、基类 `FulfillmentRefundAndReturnProductBase`、业务函数内部。
 
+### 3.0 replace 场景的错误码归属问题（Bug 分析）
+
+**问题定位**：`fulfillment_refund_and_return_product_base.py:129-136` 与 `fulfillment_refund_and_return_product_base.py:184-191`
+
+当 `replace=True` 且 `line.variant_id is None`（关联商品已被删除）时，代码调用 `_raise_error_for_line` 但**未传入 `code` 参数**，导致默认使用了错误的错误码。
+
+**证据材料**：
+
+```python
+# clean_fulfillment_lines 中（第 129-136 行）
+replace = line_data.get("replace", False)
+if replace and not line.order_line.variant_id:
+    cls._raise_error_for_line(
+        "Unable to replace line as the assigned product doesn't exist.",
+        "OrderLine",
+        line.pk,
+        "order_line_id",
+    )
+
+# clean_lines 中（第 184-191 行）
+replace = line_data.get("replace", False)
+if replace and not line.variant_id:
+    cls._raise_error_for_line(
+        "Unable to replace line as the assigned product doesn't exist.",
+        "OrderLine",
+        line.pk,
+        "order_line_id",
+    )
+
+# _raise_error_for_line 定义（第 63-75 行）
+@classmethod
+def _raise_error_for_line(cls, msg, type, line_id, field_name, code=None):
+    line_global_id = graphene.Node.to_global_id(type, line_id)
+    if not code:
+        code = OrderErrorCode.INVALID_QUANTITY.value  # ← 默认错误码！
+    raise ValidationError(...)
+```
+
+**Bug 分析**：
+- 实际错误：商品已删除 → 应为 `OrderErrorCode.NOT_FOUND`
+- 当前错误：使用了 `OrderErrorCode.INVALID_QUANTITY`
+- 影响：客户端无法正确识别错误原因，UI 可能提示"数量不正确"而非"商品已删除"
+
+**修复建议**：在两处调用 `_raise_error_for_line` 时显式传入 `code=OrderErrorCode.NOT_FOUND.value`。
+
+**`OrderErrorCode` 枚举定义**（`saleor/order/error_codes.py:4-24`）供参考：
+```python
+class OrderErrorCode(Enum):
+    INVALID_QUANTITY = "invalid_quantity"  # 数量错误
+    NOT_FOUND = "not_found"                # 未找到
+    CANNOT_REFUND = "cannot_refund"
+    GIFT_CARD_LINE = "gift_card_line"
+    INVALID = "invalid"
+```
+
 ### 3.1 Return 与 Refund 的校验差异
 
 | 校验项 | FulfillmentReturnProducts | FulfillmentRefundProducts |
@@ -206,9 +261,69 @@ def quantity_unfulfilled(self):
     ↓
 第三层：_process_refund 内部
   if amount is None → 自动计算
-  if amount and payment → 实际执行退款
-  amount=0 时静默跳过（不调用支付网关，不触发事件）
+  if amount and payment → 实际执行退款（支付网关 + order_refunded）
+  amount=0 时：不调用支付网关、不触发 order_refunded，但仍然触发 fulfillment_refunded_event
 ```
+
+### 4.1.1 amount 为 0 时事件触发的精确语义
+
+**关键发现**：`_process_refund` 函数（`actions.py:1993-2056`）中事件触发逻辑存在分支。
+
+**证据材料**：
+
+```python
+# actions.py:2020-2055
+if amount and payment:
+    # 仅当 amount > 0 时进入此分支
+    amount = min(payment.captured_amount, amount)
+    from ..payment.gateway import refund
+    refund(...)  # 调用支付网关
+    payment.refresh_from_db()
+    order_refunded(...)  # ← 触发 PAYMENT_REFUNDED、邮件、ORDER_REFUNDED Webhook
+
+# 注意：下面的 on_commit 在 if 块外！无条件执行！
+transaction.on_commit(
+    lambda: fulfillment_refunded_event(
+        order=order,
+        user=user,
+        app=app,
+        refunded_lines=list(lines_to_refund.values()),
+        amount=amount,  # amount 可能是 0
+        shipping_costs_included=refund_shipping_costs,
+    )
+)
+```
+
+**事件触发矩阵**：
+
+| 场景 | 支付网关调用 | `order_refunded()` | `fulfillment_refunded_event` | `lines_to_refund` 内容 |
+|-----|------------|-----------------|----------------------------|---------------------|
+| `amount > 0`（自动计算）| ✅ 是 | ✅ 是 | ✅ 是（延迟）| 非空（`_calculate_refund_amount` 已填充）|
+| `amount > 0`（手动指定）| ✅ 是 | ✅ 是 | ✅ 是（延迟）| **空列表**（`_calculate_refund_amount` 未调用）|
+| `amount = 0`（自动计算）| ❌ 否 | ❌ 否 | ✅ 是（延迟，amount=0）| 空列表（所有行已退款被跳过）|
+| `amount = 0`（手动指定）| ❌ 否 | ❌ 否 | ✅ 是（延迟，amount=0）| **空列表** |
+
+**`order_refunded()` 内部触发内容**（`actions.py:456-522`）：
+```python
+def order_refunded(...):
+    call_event(events.payment_refunded_event, ...)      # OrderEvent: PAYMENT_REFUNDED
+    call_event(send_order_refunded_confirmation, ...)    # 发送退款邮件
+    call_order_events(manager, [ORDER_REFUNDED, ...], ...)  # Webhook
+```
+
+**`fulfillment_refunded_event` 记录内容**（`events.py:650-672`）：
+```python
+{
+    "lines": [{quantity, line_pk, item}],  # ← 手动指定金额时为空
+    "amount": amount,
+    "shipping_costs_included": bool
+}
+```
+
+**边界条件含义**：
+- **手动指定金额场景**：`fulfillment_refunded_event` 的 `refunded_lines` 为空列表，审计记录缺少行级关联。这是设计上的取舍——手动金额不由行计算，因此无法自动关联。
+- **`amount=0` 场景**：虽然退款金额为 0，但仍然创建 `FULFILMENT_REFUNDED` OrderEvent。这使得"零元退款"操作在审计日志中可追溯。
+- **`order_refunded()` vs `fulfillment_refunded_event`**：前者是"支付层面的退款成功"，后者是"业务层面的退款标记"。两者可能不一致（如手动指定金额时）。
 
 ### 4.2 金额计算的两个分支
 
@@ -256,7 +371,74 @@ def _calculate_refund_amount(
 
 **关键边界**：
 - `REFUNDED_AND_RETURNED` 状态的行**不被跳过**，只有 `REFUNDED` 状态被跳过。这意味着"已退货且退款"的行如果再次出现在退货请求中，金额会被重复计算——但这种情况在正常业务中不应发生，因为 `clean_fulfillment_lines` 的白名单在 Return 中不含 `REFUNDED_AND_RETURNED`
-- **折扣不影响退款金额**：退款使用 `unit_price_gross_amount`（含税原价），不考虑 `unit_discount_amount`。这是一个容易混淆的点：虽然订单行有折扣字段，但退款计算并未引用它。如果订单使用了折扣，退款金额可能**大于**客户实际支付的金额
+
+### 4.3.1 退款金额与折扣字段之间的关系（纠正之前的错误）
+
+**之前的错误**：之前文档称"折扣不影响退款金额"——这是**错误的**。需要澄清价格字段的精确含义。
+
+**OrderLine 价格字段模型**（`saleor/order/models.py:583-719`）：
+
+| 字段 | 含义 | 是否参与退款计算 |
+|-----|------|----------------|
+| `unit_price_gross_amount` | **折后含税单价**（含 promotion 折扣，不含 voucher）| ✅ 是，退款计算使用此字段 |
+| `unit_price_net_amount` | 折后净价（不含税） | ❌ 否 |
+| `undiscounted_unit_price_gross_amount` | **原价**（含税，无任何折扣） | ❌ 否 |
+| `unit_discount_amount` | 行级折扣金额 = `undiscounted_unit_price_gross_amount - unit_price_gross_amount` | ❌ 否（但 `unit_price_gross_amount` 已体现） |
+| `unit_discount_type` | 折扣类型（`PERCENTAGE` / `FIXED` / `MANUAL`） | ❌ 否 |
+| `unit_discount_value` | 折扣值（如 20 表示 20% 或 20 元） | ❌ 否 |
+
+**证据材料**（`saleor/order/utils.py:230-327`）：
+
+```python
+# create_order_line 中的价格计算逻辑
+# 1. 折后价（含 promotion 规则）
+untaxed_unit_price = variant.get_price(
+    channel_listing,
+    price_override=price_override,
+    promotion_rules=[rule_info.rule for rule_info in rules_info],
+)
+# 2. 原价（不含 promotion）
+untaxed_undiscounted_price = variant.get_base_price(
+    channel_listing,
+    price_override=price_override,
+)
+# 3. 设置 OrderLine 字段
+unit_price = TaxedMoney(net=untaxed_unit_price, gross=untaxed_unit_price)
+# unit_price.gross.amount 就是 unit_price_gross_amount（已折后）
+
+# 4. 计算行级折扣并保存
+unit_discount = line.undiscounted_unit_price - line.unit_price
+if unit_discount.gross and rules_info:
+    line_discounts = create_order_line_discount_objects_for_catalogue_promotions(...)
+    update_unit_discount_data_on_order_line(line, line_discounts)
+    # 这里设置 unit_discount_amount = unit_discount.gross.amount
+```
+
+**退款计算**（`actions.py:1967, 1981`）：
+```python
+refund_amount += line_data.quantity * line_data.line.unit_price_gross_amount
+```
+
+**正确结论**：
+1. ✅ **行级 promotion 折扣已被考虑**：因为 `unit_price_gross_amount` 就是折后价（`variant.get_price(promotion_rules=...)` 的结果）
+2. ⚠️ **优惠券（Voucher）折扣未被考虑**：优惠券通常作为 `OrderDiscount`（订单级折扣），不影响 `unit_price_gross_amount`。如果订单使用了优惠券，退款金额可能**大于**客户实际支付的金额
+3. ⚠️ **`unit_discount_amount` 不参与退款计算**：这是正确的设计，因为折扣已经体现在 `unit_price_gross_amount` 中
+4. ✅ **手动折扣（MANUAL）已被考虑**：手动折扣会影响 `unit_price_gross_amount`
+
+**边界场景**：
+| 折扣类型 | 退款是否考虑 | 原因 |
+|---------|------------|------|
+| Catalogue Promotion（目录促销）| ✅ 是 | 影响 `unit_price_gross_amount` |
+| Order Line Manual Discount（行级手动折扣）| ✅ 是 | 影响 `unit_price_gross_amount` |
+| Voucher（优惠券）| ❌ 否 | 订单级折扣，不影响 `unit_price_gross_amount` |
+| Free Shipping（免邮）| ❌ 否 | 订单级折扣，运费退款需单独指定 |
+
+**退款金额公式**：
+```
+退款金额 = Σ(退款数量 × unit_price_gross_amount)
+        + [退款运费]
+```
+其中 `unit_price_gross_amount` 已扣除行级促销折扣，但未扣除订单级优惠券折扣。
 
 ### 4.4 金额封顶与静默行为
 
@@ -391,8 +573,8 @@ Saleor 的事件系统分为两层：**OrderEvent**（内部审计记录）和 *
 | 事件类型 | 触发函数 | 触发时机 | 参数 | 关联对象 |
 |---------|---------|---------|------|---------|
 | `FULFILLMENT_RETURNED` | `order_returned_event` | `create_return_fulfillment` 事务提交后（`transaction.on_commit`） | `{lines: [{quantity, line_pk, item}]}` | 写入**原订单** |
-| `FULFILLMENT_REFUNDED` | `fulfillment_refunded_event` | `_process_refund` 事务提交后（`transaction.on_commit`） | `{lines: [{quantity, line_pk, item}], amount, shipping_costs_included}` | 写入**原订单** |
-| `PAYMENT_REFUNDED` | `payment_refunded_event` | `order_refunded` 中（同步） | `{parameters: {amount, payment_id, payment_gateway}}` | 写入**原订单** |
+| `FULFILLMENT_REFUNDED` | `fulfillment_refunded_event` | `_process_refund` 中**无条件触发**（`transaction.on_commit`），即使 `amount=0` | `{lines: [{quantity, line_pk, item}], amount, shipping_costs_included}` | 写入**原订单** |
+| `PAYMENT_REFUNDED` | `payment_refunded_event` | `order_refunded` 中（同步），**仅 `amount > 0` 时触发** | `{parameters: {amount, payment_id, payment_gateway}}` | 写入**原订单** |
 | `FULFILLMENT_REPLACED` | `fulfillment_replaced_event` | `process_replace` 中（同步） | `{lines: [{quantity, line_pk, item}]}` | 写入**原订单** |
 | `DRAFT_CREATED_FROM_REPLACE` | `draft_order_created_from_replace_event` | `process_replace` 中（同步） | `{related_order_pk, lines}` | 写入**新 Draft Order** |
 | `ORDER_REPLACEMENT_CREATED` | `order_replacement_created` | `process_replace` 中（同步） | `{related_order_pk}` | 写入**原订单** |
@@ -462,6 +644,11 @@ Saleor 的事件系统分为两层：**OrderEvent**（内部审计记录）和 *
 | 触发方式 | 同步 | `transaction.on_commit`（延迟） |
 
 **重要**：在退货+退款场景中，`FULFILLMENT_REFUNDED` 和 `FULFILLMENT_RETURNED` 都会被触发。前者在退款事务提交后，后者在退货 Fulfillment 创建事务提交后。两者记录的行可能不同——`FULFILLMENT_REFUNDED` 的 `lines_to_refund` 排除了 `replace=True` 的换货行，而 `FULFILLMENT_RETURNED` 的 `returned_lines` 包含所有非换货行。
+
+**额外边界**：
+- **手动指定金额时**：`FULFILLMENT_REFUNDED` 的 `lines` 参数为空列表，因为 `_calculate_refund_amount` 未被调用，`lines_to_refund` 字典始终为空。这是一个已知的设计取舍。
+- **换货行（`replace=True`）**：换货行**不参与退款计算**，也不会出现在 `fulfillment_refunded_event` 或 `payment_refunded_event` 中。换货行只触发 `fulfillment_replaced_event`。
+- **`amount=0` 时**：仍然触发 `fulfillment_refunded_event`，但 `amount=0`，且 `order_refunded()` 不会被调用（因此不触发 `PAYMENT_REFUNDED`、不发送邮件、不触发 `ORDER_REFUNDED` Webhook）。
 
 ### 6.4 Webhook 事件层
 
@@ -601,8 +788,8 @@ create_fulfillments_for_returned_products()
     │   └─ replace_order_lines / replace_fulfillment_lines (replace=True)
     │
     ├─ [refund=True AND payment≠None] _process_refund()
-    │   ├─ [amount=None] _calculate_refund_amount()
-    │   │   ├─ 未发货行: quantity × unit_price_gross_amount
+    │   ├─ [amount=None] _calculate_refund_amount() → 填充 lines_to_refund
+    │   │   ├─ 未发货行: quantity × unit_price_gross_amount (折后含税价)
     │   │   └─ 已发货行: 跳过 REFUNDED 状态, quantity × unit_price_gross_amount
     │   ├─ [amount=None AND refund_shipping_costs] += shipping_price_gross_amount
     │   ├─ amount = min(amount, payment.captured_amount)
@@ -613,7 +800,8 @@ create_fulfillments_for_returned_products()
     │   │   ├─ payment_refunded_event (OrderEvent, 同步)
     │   │   ├─ send_order_refunded_confirmation (邮件)
     │   │   └─ call_order_events(ORDER_REFUNDED, [ORDER_FULLY_REFUNDED]) (Webhook)
-    │   └─ on_commit: fulfillment_refunded_event (OrderEvent, 延迟)
+    │   └─ on_commit: fulfillment_refunded_event (OrderEvent, 延迟, **无条件触发**)
+    │       └─ 注意: 手动指定金额或 amount=0 时, lines 参数为空列表
     │
     ├─ [replace 非空] process_replace()
     │   ├─ _move_lines_to_replace_fulfillment (status=REPLACED)
@@ -650,6 +838,8 @@ create_fulfillments_for_returned_products()
 | FulfillmentLineData 定义 | `saleor/order/__init__.py:306` | `FulfillmentLineData` |
 | RefundData 定义 | `saleor/payment/interface.py:368` | `RefundData` |
 | 校验基类 | `saleor/graphql/order/mutations/fulfillment_refund_and_return_product_base.py` | `FulfillmentRefundAndReturnProductBase` |
+| 错误抛出辅助 | `saleor/graphql/order/mutations/fulfillment_refund_and_return_product_base.py:63` | `_raise_error_for_line` |
+| 错误码枚举 | `saleor/order/error_codes.py:4` | `OrderErrorCode` |
 | 退货 Mutation | `saleor/graphql/order/mutations/fulfillment_return_products.py` | `FulfillmentReturnProducts` |
 | 退款 Mutation | `saleor/graphql/order/mutations/fulfillment_refund_products.py` | `FulfillmentRefundProducts` |
 | 退货主逻辑 | `saleor/order/actions.py:1864` | `create_fulfillments_for_returned_products` |
@@ -660,6 +850,8 @@ create_fulfillments_for_returned_products()
 | 已退款行退货分离 | `saleor/order/actions.py:1678` | `_move_lines_to_return_fulfillment` |
 | 退款金额计算 | `saleor/order/actions.py:1960` | `_calculate_refund_amount` |
 | 退款处理 | `saleor/order/actions.py:1993` | `_process_refund` |
+| order_refunded 事件函数 | `saleor/order/actions.py:456` | `order_refunded` |
+| 订单行创建（价格字段） | `saleor/order/utils.py:230` | `create_order_line` |
 | 支付网关退款 | `saleor/payment/gateway.py:391` | `refund` |
 | 退款金额二次校验 | `saleor/payment/gateway.py:539` | `_validate_refund_amount` |
 | 运费退款计算 | `saleor/order/actions.py:1496` | `__get_shipping_refund_amount` |
@@ -676,3 +868,5 @@ create_fulfillments_for_returned_products()
 | Fulfillment 模型 | `saleor/order/models.py:750` | `Fulfillment` |
 | FulfillmentStatus | `saleor/order/__init__.py:56` | `FulfillmentStatus` |
 | quantity_unfulfilled 属性 | `saleor/order/models.py:746` | `OrderLine.quantity_unfulfilled` |
+| unit_price_gross_amount 字段 | `saleor/order/models.py:613` | `OrderLine.unit_price_gross_amount` |
+| undiscounted_base_unit_price 字段 | `saleor/order/models.py:692` | `OrderLine.undiscounted_base_unit_price_amount` |

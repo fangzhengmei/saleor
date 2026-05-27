@@ -407,59 +407,83 @@ def handle_authorized_payment_intent(payment_intent, gateway_config, channel_slu
 
 **核心特性**：
 - 使用 `Payment` + `Transaction` 的旧模型
-- 同步调用为主，部分场景支持 webhook
+- 纯同步调用，**无 webhook 处理实现**（目录中只有 `__init__.py`、`plugin.py`、`errors.py`，无 webhook 相关文件）
 - `authorize()` 和 `capture()` 是两个独立的 API 调用
-- 授权和扣款使用不同的 `transaction_id`
+- **授权和自动扣款共用同一个 Braintree transaction_id**，手动 capture 也是在同一 transaction 上操作
 
-**先授权后扣款流程**（`saleor/payment/gateways/braintree/__init__.py:134`）：
+**auto_capture 行为与 transaction_id 关系**（`saleor/payment/gateways/braintree/__init__.py:134`）：
+
+Braintree 的 `authorize()` 函数内部调用 `gateway.transaction.sale()`，这是 Braintree 的"创建交易"API。`submit_for_settlement` 参数控制是否自动扣款：
 
 ```python
 def authorize(payment_information, config):
-    # 1. 创建 Braintree transaction，submit_for_settlement=False
+    # 根据 auto_capture 设置 submit_for_settlement
+    submit_for_settlement = config.auto_capture  # True=自动扣款，False=仅授权
+    
     result = gateway.transaction.sale({
         "amount": str(payment_information.amount),
         "payment_method_nonce": payment_information.token,
         "options": {
-            "submit_for_settlement": False,  # 仅授权，不扣款
+            "submit_for_settlement": submit_for_settlement,
+            "store_in_vault_on_success": payment_information.reuse_source,
+            "three_d_secure": {"required": config.require_3d_secure},
         },
     })
-    # 2. 返回 GatewayResponse，kind=AUTH
+    
+    # 根据 auto_capture 决定返回的 kind
+    kind = TransactionKind.CAPTURE if config.auto_capture else TransactionKind.AUTH
+    
     return GatewayResponse(
         is_success=result.is_success,
-        kind=TransactionKind.AUTH,
-        transaction_id=result.transaction.id,  # 授权交易ID
-        ...
-    )
-
-def capture(payment_information, config):
-    # 1. 调用 Braintree submit_for_settlement
-    result = gateway.transaction.submit_for_settlement(
-        transaction_id=payment_information.token,  # 使用授权返回的ID
-        amount=str(payment_information.amount),
-    )
-    # 2. 返回 GatewayResponse，kind=CAPTURE
-    return GatewayResponse(
-        is_success=result.is_success,
-        kind=TransactionKind.CAPTURE,
-        transaction_id=result.transaction.id,  # 扣款交易ID（与授权不同！）
+        kind=kind,
+        transaction_id=result.transaction.id,  # 始终是同一个 Braintree transaction.id
         ...
     )
 ```
 
-**关键差异**：Braintree 的授权和扣款产生两个不同的 `transaction_id`，而 Stripe 使用同一个 `PaymentIntent ID`。
+**先授权后手动扣款流程**（当 `auto_capture=False` 时）：
+
+```python
+# 阶段 1：仅授权
+# authorize() 调用 gateway.transaction.sale(submit_for_settlement=False)
+# → Braintree 创建 transaction，status="authorized"
+# → 返回 kind=AUTH, transaction_id="bt_123"
+
+# 阶段 2：手动扣款
+def capture(payment_information, config):
+    # payment_information.token 是阶段 1 返回的 transaction_id（"bt_123"）
+    result = gateway.transaction.submit_for_settlement(
+        transaction_id=payment_information.token,  # 复用授权的 transaction_id
+        amount=str(payment_information.amount),
+    )
+    # submit_for_settlement 返回同一个 transaction 对象，status 变为 "submitted_for_settlement"
+    return GatewayResponse(
+        is_success=result.is_success,
+        kind=TransactionKind.CAPTURE,
+        transaction_id=result.transaction.id,  # 仍是 "bt_123"，同一个 transaction
+        ...
+    )
+```
+
+**关键事实**：
+- 授权和扣款（无论自动还是手动）始终在 Braintree 的**同一个 transaction** 上操作，`transaction_id` 不变
+- `auto_capture=True` 时，`authorize()` 直接返回 `kind=CAPTURE`，一步完成
+- `auto_capture=False` 时，`authorize()` 返回 `kind=AUTH`，需要后续调用 `capture()` 提交结算
+- **Braintree 网关目录中没有 webhook 处理实现**，所有状态变更依赖同步调用结果
 
 #### 7.1.3 网关差异对比表
 
 | 对比项 | Stripe | Braintree |
 |--------|--------|-----------|
 | **交易模型** | TransactionItem + TransactionEvent | Payment + Transaction |
-| **psp_reference** | 授权和扣款共用 PaymentIntent ID | 授权和扣款各有独立 transaction_id |
-| **状态通知** | 主要通过 webhook 异步通知 | 主要同步返回，可选 webhook |
+| **psp_reference** | 授权和扣款共用 PaymentIntent ID | 授权和扣款共用 Braintree transaction.id |
+| **状态通知** | 主要通过 webhook 异步通知 | 纯同步调用，无 webhook 处理 |
 | **3D Secure** | 原生支持，requires_action 状态 | 通过 three_d_secure 参数配置 |
-| **自动捕获** | capture_method=automatic | submit_for_settlement=True |
-| **部分扣款** | 支持，capture_amount < authorized_amount | 支持，submit_for_settlement 可指定金额 |
-| **幂等键** | 客户端生成 idempotency_key | 由 Braintree SDK 内部处理 |
-| **webhook 签名** | Stripe-Signature 头部 | Braintree webhook 签名验证 |
+| **自动捕获** | `capture_method=automatic` | `submit_for_settlement=True`，`kind=CAPTURE` |
+| **手动捕获** | 单独调用 capture API | `submit_for_settlement=False` + 后续 `capture()` |
+| **部分扣款** | 支持，capture_amount < authorized_amount | 支持，`submit_for_settlement` 可指定金额 |
+| **幂等键** | 客户端生成 `idempotency_key` | 由 Braintree SDK 内部处理 |
+| **webhook 签名** | Stripe-Signature 头部 | **无 webhook 处理实现** |
 
 ### 7.2 异步回调补事件的分歧处理
 
@@ -501,16 +525,22 @@ def _finalize_checkout(checkout, payment, payment_intent, kind, amount, currency
         order, _, _ = complete_checkout(...)
 ```
 
-#### 7.2.2 Braintree webhook 处理（简化版）
+#### 7.2.2 Braintree 无 webhook 处理
 
-Braintree 网关的 webhook 处理相对简单，主要依赖同步调用结果：
+经核对 `saleor/payment/gateways/braintree/` 目录结构（仅含 `__init__.py`、`plugin.py`、`errors.py` 和测试文件），**Braintree 网关没有 webhook 处理实现**。所有支付状态变更依赖同步调用的返回值：
 
 ```python
-# Braintree 的 webhook 主要用于：
-# 1. 结算状态变更（transaction_settled）
-# 2. 退款状态变更（transaction_refunded）
-# 3. 争议处理（dispute_opened）
+# Braintree plugin.py 仅暴露同步方法，无 handle_webhook
+class DeprecatedBraintreeGatewayPlugin(BasePlugin):
+    def authorize_payment(...): return authorize(...)
+    def capture_payment(...): return capture(...)
+    def refund_payment(...): return refund(...)
+    def void_payment(...): return void(...)
+    def process_payment(...): return process_payment(...)
+    # 没有 handle_webhook 方法
 ```
+
+因此 Braintree 的状态流转完全依赖同步调用返回的 `GatewayResponse.is_success` 和 `kind`，不存在异步回调补事件的场景。
 
 #### 7.2.3 常见分歧场景及处理
 
@@ -519,7 +549,7 @@ Braintree 网关的 webhook 处理相对简单，主要依赖同步调用结果�
 | 网关 | 处理方式 | 代码位置 |
 |------|----------|----------|
 | Stripe | 按 `psp_reference + kind + is_success` 查询，已存在则跳过 | `webhooks.py:226` |
-| Braintree | 同步调用时已处理，webhook 仅更新状态 | N/A |
+| Braintree | **无 webhook 处理**，同步调用天然幂等（同一 token 重复调用 Braintree SDK 返回同一结果） | N/A |
 
 **场景 2：webhook 先于同步响应到达**
 
@@ -557,6 +587,213 @@ Payment.captured_amount = 0
 Payment.charge_status = NOT_CHARGED
 ```
 
+### 7.3 transactionProcess 的请求事件机制与门禁链路
+
+#### 7.3.1 include_in_calculations=false 的请求事件生命周期
+
+`transactionInitialize` 和 `transactionProcess` 之间通过 `include_in_calculations` 标志位实现"请求-确认"两阶段模式：
+
+**阶段 1：transactionInitialize 创建占位事件**（`saleor/payment/utils.py:1885-1902`）
+
+```python
+request_event, _ = TransactionEvent.objects.get_or_create(
+    idempotency_key=idempotency_key,
+    transaction=transaction_item,
+    type=event_type,  # AUTHORIZATION_REQUEST 或 CHARGE_REQUEST
+    currency=transaction_item.currency,
+    amount_value=amount,
+    defaults={
+        "include_in_calculations": False,  # ⚠️ 关键：不参与金额计算
+        "type": ...,
+        "currency": ...,
+        "amount_value": amount,
+        "idempotency_key": idempotency_key,
+    },
+)
+```
+
+此时 `include_in_calculations=False` 的含义：
+- 该事件仅作为"意图声明"，不影响 `TransactionItem` 的金额字段
+- `recalculate_transaction_amounts()` 会跳过 `include_in_calculations=False` 的事件
+- 这样初始化阶段不会产生虚假的 pending 金额
+
+**阶段 2：transactionProcess 查找并确认请求事件**（`saleor/graphql/payment/mutations/transaction/transaction_process.py:112-146`）
+
+```python
+@classmethod
+def get_request_event(cls, events: QuerySet) -> payment_models.TransactionEvent:
+    """查找 include_in_calculations=False 的请求事件"""
+    for event in events:
+        if (
+            event.type in [
+                TransactionEventType.AUTHORIZATION_REQUEST,
+                TransactionEventType.CHARGE_REQUEST,
+            ]
+            and not event.include_in_calculations  # ⚠️ 只找 False 的
+        ):
+            return event
+    raise ValidationError("Missing call of transactionInitialize mutation.")
+
+@classmethod
+def get_already_processed_event(cls, events) -> TransactionEvent | None:
+    """检查是否已存在 include_in_calculations=True 的最终状态事件"""
+    for event in events:
+        if (
+            event.type in get_final_session_statuses()
+            and event.include_in_calculations  # ⚠️ 只找 True 的
+        ):
+            return event
+    return None
+```
+
+`get_final_session_statuses()` 定义（`saleor/payment/utils.py:788`）：
+```python
+def get_final_session_statuses():
+    return [
+        TransactionEventType.AUTHORIZATION_FAILURE,
+        TransactionEventType.AUTHORIZATION_SUCCESS,
+        TransactionEventType.AUTHORIZATION_REQUEST,
+        TransactionEventType.CHARGE_FAILURE,
+        TransactionEventType.CHARGE_SUCCESS,
+        TransactionEventType.CHARGE_REQUEST,
+    ]
+```
+
+**阶段 3：网关响应后升级请求事件**（`saleor/payment/utils.py:1448-1474`）
+
+```python
+def create_transaction_event_for_transaction_session(...):
+    response_event = transaction_request_response.event
+
+    if response_event.type in [
+        TransactionEventType.AUTHORIZATION_REQUEST,
+        TransactionEventType.CHARGE_REQUEST,
+    ]:
+        # 网关响应也是 REQUEST 类型 → 升级原来的 request_event
+        request_event.type = response_event.type
+        request_event.amount_value = response_event.amount
+        request_event.psp_reference = response_event.psp_reference
+        request_event.include_in_calculations = True  # ⚠️ 升级为 True，参与计算
+        ...
+        event = request_event
+    else:
+        # 网关响应是 SUCCESS/FAILURE 类型 → 创建新事件
+        event, error_message = _create_event_from_response(
+            response_event, app=app, ...
+        )
+        request_event.psp_reference = event.psp_reference
+```
+
+**完整状态转换表**：
+
+| 步骤 | 事件类型 | include_in_calculations | 说明 |
+|------|----------|------------------------|------|
+| 1. Initialize | AUTHORIZATION_REQUEST | `False` | 占位事件，不参与计算 |
+| 2. Process（网关返回 REQUEST） | AUTHORIZATION_REQUEST | `True` | 升级占位事件，psp_reference 填入 |
+| 2. Process（网关返回 SUCCESS） | AUTHORIZATION_SUCCESS | `True` | 创建新事件，request_event 仅更新 psp_reference |
+
+#### 7.3.2 default_transaction_flow_strategy 的作用链路
+
+`default_transaction_flow_strategy` 定义在 `Channel` 模型上（`saleor/channel/models.py:29`）：
+
+```python
+class Channel(models.Model):
+    default_transaction_flow_strategy = models.CharField(
+        max_length=255,
+        choices=TransactionFlowStrategy.CHOICES,
+        default=TransactionFlowStrategy.CHARGE,  # 默认直接扣款
+    )
+```
+
+`TransactionFlowStrategy` 有两个值（`saleor/channel/__init__.py:39`）：
+- `AUTHORIZATION = "authorization"` — 先授权再扣款
+- `CHARGE = "charge"` — 直接扣款（默认）
+
+**作用链路**：
+
+1. **transactionInitialize** 中决定创建哪种请求事件（`transaction_initialize.py:100-114`）：
+```python
+@classmethod
+def clean_action(cls, info, action, channel, payment_gateway):
+    if payment_gateway.app_identifier == GIFT_CARD_PAYMENT_GATEWAY_ID:
+        return TransactionFlowStrategyEnum.AUTHORIZATION.value
+    if not action:
+        return channel.default_transaction_flow_strategy  # ⬅️ 使用 channel 默认值
+    # 有权限的 app 可以覆盖
+    app = get_app_promise(info.context).get()
+    if not app or not app.has_perm(PaymentPermissions.HANDLE_PAYMENTS):
+        raise PermissionDenied(...)
+    return action
+```
+
+2. **handle_transaction_initialize_session** 中使用 action 决定事件类型（`saleor/payment/utils.py:1880-1883`）：
+```python
+if action == TransactionFlowStrategy.CHARGE:
+    event_type = TransactionEventType.CHARGE_REQUEST
+else:
+    event_type = TransactionEventType.AUTHORIZATION_REQUEST
+```
+
+3. **transactionProcess** 中从请求事件推断 action（`transaction_process.py:85-90`）：
+```python
+@classmethod
+def get_action(cls, event, channel):
+    if event.type == TransactionEventType.AUTHORIZATION_REQUEST:
+        return TransactionFlowStrategy.AUTHORIZATION
+    if event.type == TransactionEventType.CHARGE_REQUEST:
+        return TransactionFlowStrategy.CHARGE
+    return channel.default_transaction_flow_strategy  # ⬅️ fallback
+```
+
+#### 7.3.3 cancel_active_payments / activate_payments 门禁
+
+这对函数用于在新旧支付模型之间切换时防止同一 checkout 使用两种支付流程（`saleor/checkout/utils.py:882`）：
+
+```python
+def cancel_active_payments(checkout: Checkout) -> list[int]:
+    """将 checkout 上所有激活的 Payment 标记为非活跃"""
+    payments = checkout.payments.filter(is_active=True)
+    payment_ids = list(payments.values_list("id", flat=True))
+    payments.update(is_active=False)
+    return payment_ids
+
+def activate_payments(payment_ids: list[int]) -> None:
+    """恢复之前被取消的 Payment"""
+    Payment.objects.filter(id__in=payment_ids).update(is_active=True)
+```
+
+**调用时机**：
+
+在 `transactionInitialize` 和 `transactionProcess` 的 perform_mutation 中：
+
+```python
+# transaction_initialize.py:197-200
+if isinstance(source_object, checkout_models.Checkout):
+    # 取消旧模型的活跃 Payment，避免混用两种流程
+    payment_ids = cancel_active_payments(source_object)
+try:
+    transaction, event, data = handle_transaction_initialize_session(...)
+except TransactionItemIdempotencyUniqueError as e:
+    if payment_ids:
+        activate_payments(payment_ids)  # 回滚：恢复 Payment
+    raise
+
+# transaction_process.py:207-210
+if isinstance(source_object, checkout_models.Checkout):
+    payment_ids = cancel_active_payments(source_object)
+
+event, data = handle_transaction_process_session(...)
+
+if event.type in FAILED_TRANSACTION_EVENTS and payment_ids:
+    activate_payments(payment_ids)  # 失败时恢复 Payment
+```
+
+**设计意图**：
+- 新支付模型（TransactionItem/TransactionEvent）和旧支付模型（Payment/Transaction）不能同时活跃
+- 每次使用新模型时，先将旧模型的 Payment 标记为 `is_active=False`
+- 如果新模型操作失败，再将 Payment 恢复为 `is_active=True`
+- 这样确保 checkout 在同一时间只有一种支付流程在生效
+
 ---
 
 ## 8. 完整追踪路径：用一组交易标识串起全链路
@@ -579,15 +816,24 @@ Payment.charge_status = NOT_CHARGED
 ```
 GraphQL: transactionInitialize
   → saleor/graphql/payment/mutations/transaction/transaction_initialize.py:155
+    → clean_source_object()  [解析 checkout/order]
+    → clean_action()  [确定使用 channel.default_transaction_flow_strategy]
+    → clean_idempotency_key()  [生成/校验幂等键]
+    → cancel_active_payments(checkout)  [saleor/checkout/utils.py:882]
+    →   ⬅️ 将旧模型 Payment 标记为 is_active=False
     → handle_transaction_initialize_session() [saleor/payment/utils.py:1858]
       → TransactionItem.objects.get_or_create(idempotency_key=uuid-1234...)
-      → TransactionEvent.objects.get_or_create(type=AUTHORIZATION_REQUEST)
-      → manager.transaction_initialize_session()  [调用支付应用]
+      → TransactionEvent.objects.get_or_create(
+      →     type=AUTHORIZATION_REQUEST, include_in_calculations=False)
+      → manager.transaction_initialize_session()  [调用支付应用 webhook]
       → create_transaction_event_for_transaction_session() [utils.py:1430]
         → 解析支付应用响应
-        → 更新 request_event 或创建新事件
+        → 如果响应为 REQUEST 类型：升级 request_event.include_in_calculations=True
+        → 如果响应为 SUCCESS/FAILURE 类型：创建新事件
         → recalculate_transaction_amounts()  [重算金额]
         → process_order_or_checkout_with_transaction()  [更新关联对象]
+    → except TransactionItemIdempotencyUniqueError:
+    →   activate_payments(payment_ids)  [回滚：恢复旧模型 Payment]
 ```
 
 **数据库变化**：
@@ -600,15 +846,28 @@ GraphQL: transactionInitialize
 GraphQL: transactionProcess
   → saleor/graphql/payment/mutations/transaction/transaction_process.py:177
     → get_transaction_item(id/token)  [查找 TransactionItem]
-    → get_request_event(events)  [查找初始化时创建的 request 事件]
+    → get_already_processed_event(events)
+    →   ⬅️ 检查是否已有 include_in_calculations=True 的最终状态事件
+    →   ⬅️ 如有则直接返回，幂等短路
+    → get_request_event(events)
+    →   ⬅️ 查找 include_in_calculations=False 的 AUTHORIZATION/CHARGE_REQUEST
+    →   ⬅️ 找不到则报错："Missing call of transactionInitialize"
+    → get_source_object()  [获取 checkout/order]
+    → clean_payment_app()  [验证支付 App 是否存在]
+    → get_action(request_event, channel)
+    →   ⬅️ 从请求事件类型推断 AUTHORIZATION 或 CHARGE
+    → cancel_active_payments(checkout)  [saleor/checkout/utils.py:882]
+    →   ⬅️ 将旧模型 Payment 标记为 is_active=False
     → handle_transaction_process_session() [saleor/payment/utils.py:1952]
-      → manager.transaction_process_session()  [调用 Stripe API 创建 PaymentIntent]
+      → manager.transaction_process_session()  [调用支付应用 webhook]
       → create_transaction_event_for_transaction_session() [utils.py:1430]
         → 根据网关响应创建 AUTHORIZATION_SUCCESS
         → psp_reference = pi_3Nq...L4X
         → recalculate_transaction_amounts()
           → authorized_value = 100
           → authorize_pending_value = 0
+    → if event.type in FAILED_TRANSACTION_EVENTS:
+    →   activate_payments(payment_ids)  [失败时恢复旧模型 Payment]
 ```
 
 **数据库变化**：
@@ -714,8 +973,15 @@ ORDER BY created_at;
 | 初始化会话处理 | `saleor/payment/utils.py` | 1858 |
 | 处理会话处理 | `saleor/payment/utils.py` | 1952 |
 | 创建交易会话事件 | `saleor/payment/utils.py` | 1430 |
+| get_request_event (查找 include_in_calculations=False) | `saleor/graphql/payment/mutations/transaction/transaction_process.py` | 112 |
+| get_already_processed_event (幂等短路) | `saleor/graphql/payment/mutations/transaction/transaction_process.py` | 138 |
+| get_final_session_statuses | `saleor/payment/utils.py` | 788 |
+| default_transaction_flow_strategy (Channel 模型) | `saleor/channel/models.py` | 29 |
+| TransactionFlowStrategy 枚举 | `saleor/channel/__init__.py` | 39 |
+| cancel_active_payments | `saleor/checkout/utils.py` | 882 |
+| activate_payments | `saleor/checkout/utils.py` | 889 |
 | Stripe webhook 入口 | `saleor/payment/gateways/stripe/webhooks.py` | 50 |
 | Stripe 成功支付处理 | `saleor/payment/gateways/stripe/webhooks.py` | 431 |
 | Stripe 授权成功处理 | `saleor/payment/gateways/stripe/webhooks.py` | 301 |
-| Braintree 授权 | `saleor/payment/gateways/braintree/__init__.py` | 134 |
-| Braintree 扣款 | `saleor/payment/gateways/braintree/__init__.py` | 227 |
+| Braintree authorize (auto_capture 逻辑) | `saleor/payment/gateways/braintree/__init__.py` | 134 |
+| Braintree capture (submit_for_settlement) | `saleor/payment/gateways/braintree/__init__.py` | 227 |

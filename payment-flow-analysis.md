@@ -144,33 +144,80 @@ Saleor 采用 **事件溯源（Event Sourcing）** 模式来管理交易状态�
 
 核心算法在 `saleor/payment/transaction_item_calculations.py:329` 的 `calculate_transaction_amount_based_on_events()`：
 
-**步骤**：
-1. 过滤出 `include_in_calculations=True` 的事件
-2. 按 `psp_reference` 分组事件
-3. 对每组事件进行计算：
-   - 只有 `request` 事件但无 `success/failure` → 增加 pending 金额
-   - 有 `success` 事件 → 增加对应金额（如 charged_value）
-   - `success` 和 `failure` 同时存在 → 比较 `created_at`，取较新的
-   - `adjustment` 事件 → 直接覆盖 authorized_value
-   - `charge_back` → 减少 charged_value
-   - `refund_reverse` → 增加 charged_value，减少 refunded_value
+**整体流程**：
+1. 过滤出 `include_in_calculations=True` 的事件，按 `created_at` 排序
+2. 调用 `_set_transaction_amounts_to_zero()` 将所有金额字段置零
+3. 按 `psp_reference` 分组事件，构建 `ActionEventMap`
+4. 按优先级依次计算：
+   - 无 psp_reference 的事件（直接累加）
+   - 授权事件（authorization）
+   - 扣款事件（charge）
+   - 退款事件（refund）
+   - 取消事件（cancel）
 
-**关键规则**（`transaction_item_calculations.py:64`）：
+**关键规则**：事件按 `psp_reference` 分组后，每组独立计算。同一 `psp_reference` 下的 request/success/failure 互斥。
+
+#### 3.2.1 authorized_value 在 CHARGE_REQUEST 下的扣减机制
+
+**核心函数**：`_recalculate_charge_amounts()` 调用 `_recalculate_base_amounts()` 时，传入 `previous_amount_field_name="authorized_value"`（`transaction_item_calculations.py:169`）。
+
 ```python
-def _should_increase_pending_amount(request, success, failure):
-    # 只有request且无success/failure时，才增加pending金额
-    if request and not failure and not success:
-        return True
-    return False
-
-def _should_increse_amount(success, failure):
-    if success and failure:
-        # 同时存在时，取时间较新的
-        return success.created_at > failure.created_at
-    elif success:
-        return True
-    return False
+def _recalculate_charge_amounts(transaction, charge_events):
+    _recalculate_base_amounts(
+        transaction,
+        request, success, failure,
+        pending_amount_field_name="charge_pending_value",
+        amount_field_name="charged_value",
+        previous_amount_field_name="authorized_value",  # ⚠️ 关键：从 authorized_value 扣减
+    )
 ```
+
+**触发条件与行为**：
+
+| 场景 | CHARGE_REQUEST | CHARGE_SUCCESS | CHARGE_FAILURE | 结果 |
+|------|----------------|----------------|----------------|------|
+| 1 | ✅ 存在 | ❌ 无 | ❌ 无 | `charge_pending_value += amount`<br>`authorized_value -= amount` |
+| 2 | ✅ 存在 | ✅ 存在（更新） | ❌ 无 | `charged_value += amount`<br>`authorized_value -= amount` |
+| 3 | ✅ 存在 | ❌ 无 | ✅ 存在（更新） | 都不变化<br>authorized_value 保持原值 |
+| 4 | ✅ 存在 | ✅ 存在 | ✅ 存在 | 比较 created_at<br>success 更新：charged_value 增加，authorized_value 减少<br>failure 更新：都不变 |
+
+**场景 1 详解**（只有 CHARGE_REQUEST）：
+```
+初始状态：authorized_value=100, charge_pending_value=0
+
+收到 CHARGE_REQUEST (psp_ref=xxx, amount=100)
+→ 满足 _should_increase_pending_amount() = True
+→ charge_pending_value = 0 + 100 = 100
+→ authorized_value = 100 - 100 = 0  ✅ 请求扣款时直接消耗授权
+
+最终：authorized_value=0, charge_pending_value=100
+```
+
+**场景 2 详解**（CHARGE_REQUEST + CHARGE_SUCCESS）：
+```
+初始状态：authorized_value=100
+
+收到 CHARGE_REQUEST (psp_ref=xxx, amount=100)
+→ charge_pending_value=100, authorized_value=0
+
+收到 CHARGE_SUCCESS (psp_ref=xxx, amount=100)
+→ 满足 _should_increse_amount() = True
+→ charged_value = 0 + 100 = 100
+→ authorized_value = 0 - 100 = -100？ ❓ 注意：先归零再计算，所以最终是 100 - 100 = 0
+
+最终：authorized_value=0, charged_value=100
+```
+
+> **注意**：`calculate_transaction_amount_based_on_events()` 开头会调用 `_set_transaction_amounts_to_zero()` 将所有金额置零，然后重新计算。所以 CHARGE_SUCCESS 直接从 authorized_value 扣减，而不是从 charge_pending_value 转移。
+
+#### 3.2.2 其他 previous_amount_field_name 映射
+
+| 操作类型 | previous_amount_field_name | 从何处扣减 |
+|----------|---------------------------|------------|
+| charge（扣款） | `"authorized_value"` | 从已授权金额扣减 |
+| refund（退款） | `"charged_value"` | 从已扣款金额扣减 |
+| cancel（取消授权） | `"authorized_value"` | 从已授权金额扣减 |
+| authorize（授权） | `None` | 不从任何地方扣减（净增加） |
 
 ### 3.3 状态流转示例
 
@@ -192,21 +239,65 @@ def _should_increse_amount(success, failure):
 
 ### 3.4 事件去重机制
 
-为防止网关重复上报，系统实现了完善的去重逻辑（`saleor/payment/utils.py:1154`）：
+系统提供了两层去重机制，但 `transactionEventReport` 和其他场景使用不同的路径：
 
-**去重规则**：
-1. 基于 `(transaction_id, psp_reference, type)` 唯一键
-2. `AUTHORIZATION_SUCCESS` 只能有一个（后续调整用 `AUTHORIZATION_ADJUSTMENT`）
-3. 金额不一致时创建失败事件并告警
+#### 3.4.1 transactionEventReport 实际去重路径（对账写入主路径）
 
-**代码**（`utils.py:1154`）：
+`transactionEventReport` mutation **不经过 `deduplicate_event()` 函数**，而是在行锁事务内直接调用 `get_already_existing_event()` 进行去重。
+
+**完整流程**（`transaction_event_report.py:398-432`）：
+
 ```python
-def deduplicate_event(event, app):
+with traced_atomic_transaction():
+    # 步骤 1：先对 TransactionItem 加行级锁
+    _transaction = (
+        transaction_item_qs_select_for_update()
+        .filter(pk=transaction.pk)
+        .first()
+    )
+
+    # 步骤 2：直接调用 get_already_existing_event() 去重
+    existing_event = get_already_existing_event(transaction_event)
+    
+    if existing_event and existing_event.amount != transaction_event.amount:
+        # 金额不一致 → 报错
+        error_code = INCORRECT_DETAILS
+    elif existing_event:
+        # 已存在且金额一致 → 标记已处理，不创建新事件
+        already_processed = True
+        transaction_event = existing_event
+    elif (
+        transaction_event.type == AUTHORIZATION_SUCCESS
+        and authorization_success_already_exists(transaction.pk)
+    ):
+        # AUTHORIZATION_SUCCESS 只能有一个 → 报错
+        error_code = ALREADY_EXISTS
+    else:
+        # 不重复 → 保存新事件
+        transaction_event.save()
+```
+
+**去重规则**（`saleor/payment/utils.py:1131`）：
+1. 基于 `(transaction_id, psp_reference, type)` 唯一键
+2. `ACTION_REQUIRED` 和 `INFO` 事件不参与去重
+3. `AUTHORIZATION_SUCCESS` 额外检查：只能有一个（后续调整用 `AUTHORIZATION_ADJUSTMENT`）
+4. 金额不一致时报错
+
+#### 3.4.2 deduplicate_event() 函数（其他场景使用）
+
+`deduplicate_event()` 是封装了 `get_already_existing_event()` 的上层函数，用于其他场景（如 transactionRequestAction 等），**不用于 transactionEventReport**：
+
+```python
+def deduplicate_event(event, app):  # utils.py:1154
     already_existing_event = get_already_existing_event(event)
     if already_existing_event:
         if already_existing_event.amount != event.amount:
             error_message = "金额不匹配"
         event = already_existing_event
+    elif event.type == AUTHORIZATION_SUCCESS:
+        # 额外检查 AUTHORIZATION_SUCCESS 唯一性
+        if authorization_success_already_exists(event.transaction_id):
+            error_message = "已存在 AUTHORIZATION_SUCCESS"
     return event, error_message
 ```
 
@@ -470,6 +561,7 @@ def capture(payment_information, config):
 - `auto_capture=True` 时，`authorize()` 直接返回 `kind=CAPTURE`，一步完成
 - `auto_capture=False` 时，`authorize()` 返回 `kind=AUTH`，需要后续调用 `capture()` 提交结算
 - **Braintree 网关目录中没有 webhook 处理实现**，所有状态变更依赖同步调用结果
+- **Braintree 侧幂等边界**：Saleor 代码中未向 Braintree SDK 传递幂等键，同 token 重复调用 `submit_for_settlement` 的幂等性完全依赖 Braintree SDK 内部行为。测试显示：对已结算的 transaction 重复调用 submit_for_settlement 会返回成功，但不会产生新的扣款。
 
 #### 7.1.3 网关差异对比表
 
@@ -567,24 +659,42 @@ Stripe 的处理逻辑天然支持：
 
 Stripe 事件流：
 ```
-1. AUTHORIZATION_SUCCESS (psp_ref=pi_xxx, amount=100)
-2. CHARGE_REQUEST (psp_ref=pi_xxx, amount=100)
-3. CHARGE_FAILURE (psp_ref=pi_xxx, amount=100)
+1. AUTHORIZATION_SUCCESS (psp_ref=pi_auth, amount=100)
+   → authorized_value = 100
 
-计算结果：
-authorized_value = 0  # 因为有 CHARGE_REQUEST，授权被消耗
-charged_value = 0     # CHARGE_FAILURE 不增加
+2. CHARGE_REQUEST (psp_ref=pi_charge, amount=100)
+   → 注意：不同的 psp_reference！
+   
+3. CHARGE_FAILURE (psp_ref=pi_charge, amount=100)
+```
+
+**按 psp_reference 分别计算**：
+
+- `pi_auth`（授权）：只有 SUCCESS → `authorized_value = 100`
+- `pi_charge`（扣款）：REQUEST + FAILURE
+  - `_should_increase_pending_amount` = False（因为有 failure）
+  - `_should_increse_amount` = False（因为没有 success）
+  - 所以 `charge_pending_value = 0`，`charged_value = 0`
+  - **authorized_value 不被扣减**（因为既不加 pending 也不加 charged）
+
+最终状态：
+```
+authorized_value = 100  ✅ 授权保留，可重新扣款
+charged_value = 0
 charge_pending_value = 0
 ```
 
-Braintree 事件流：
-```
-1. Transaction (AUTH, txn_id=auth_123, amount=100, success=True)
-2. Transaction (CAPTURE, txn_id=cap_456, amount=100, success=False)
+> **关键理解**：只有在「只有 REQUEST 无结果」或「有 SUCCESS」时，才从 `authorized_value` 扣减。`CHARGE_FAILURE` 意味着扣款失败，**授权会被释放回可用状态**，可以重新发起扣款。
 
-计算结果：
-Payment.captured_amount = 0
-Payment.charge_status = NOT_CHARGED
+Braintree 事件流（旧模型）：
+```
+1. Transaction (AUTH, txn_id=bt_123, amount=100, success=True)
+   → Payment.captured_amount = 0
+   → Payment.charge_status = NOT_CHARGED
+
+2. Transaction (CAPTURE, txn_id=bt_123, amount=100, success=False)
+   → Payment.captured_amount = 0
+   → Payment.charge_status = NOT_CHARGED
 ```
 
 ### 7.3 transactionProcess 的请求事件机制与门禁链路
@@ -970,9 +1080,17 @@ ORDER BY created_at;
 |------|------|------|
 | 交易初始化 mutation | `saleor/graphql/payment/mutations/transaction/transaction_initialize.py` | 155 |
 | 交易处理 mutation | `saleor/graphql/payment/mutations/transaction/transaction_process.py` | 177 |
+| 事件上报 mutation | `saleor/graphql/payment/mutations/transaction/transaction_event_report.py` | 65 |
+| 事件上报行锁与去重 | `saleor/graphql/payment/mutations/transaction/transaction_event_report.py` | 398 |
+| get_already_existing_event（去重核心） | `saleor/payment/utils.py` | 1131 |
+| deduplicate_event（其他场景） | `saleor/payment/utils.py` | 1154 |
 | 初始化会话处理 | `saleor/payment/utils.py` | 1858 |
 | 处理会话处理 | `saleor/payment/utils.py` | 1952 |
 | 创建交易会话事件 | `saleor/payment/utils.py` | 1430 |
+| 金额重计算入口 | `saleor/payment/transaction_item_calculations.py` | 329 |
+| 扣款金额计算（含 authorized_value 扣减） | `saleor/payment/transaction_item_calculations.py` | 151 |
+| 基础金额计算（previous_amount_field_name） | `saleor/payment/transaction_item_calculations.py` | 91 |
+| 金额置零 | `saleor/payment/transaction_item_calculations.py` | 317 |
 | get_request_event (查找 include_in_calculations=False) | `saleor/graphql/payment/mutations/transaction/transaction_process.py` | 112 |
 | get_already_processed_event (幂等短路) | `saleor/graphql/payment/mutations/transaction/transaction_process.py` | 138 |
 | get_final_session_statuses | `saleor/payment/utils.py` | 788 |

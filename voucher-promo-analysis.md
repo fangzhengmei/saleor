@@ -1,7 +1,8 @@
 # Saleor 优惠券(Voucher)与促销(Promotion)叠加与冲突分析
 
 > **文档更新历史**：
-> - **2026-05-27 第三次修订**：纠正 Draft Order 优惠券移除后的回切链路描述。原描述"仅清除 voucher_id"错误，实际通过 `clean_voucher`/`clean_voucher_code` 双向清理同步清空 `voucher` 和 `voucher_code` 两个字段，订单促销可正常回切。补充了 `clean_voucher` 函数代码分析与测试断言验证。
+> - **2026-05-27 第四次修订**：明确 `create_order_discount_objects_for_order_promotions` 中的双重门禁逻辑（`voucher_code` OR `DiscountType.MANUAL`），补充可回切/不可回切判定矩阵与状态图，修正 Checkout 侧/Order 侧门禁差异，补充测试断言验证。
+> - **2026-05-27 第三次修订**：纠正 Draft Order 优惠券移除后的回切链路描述。原描述"仅清除 voucher_id"错误，实际通过 `clean_voucher`/`clean_voucher_code` 双向清理同步清空 `voucher` 和 `voucher_code` 两个字段，订单促销可正常回切。
 > - **2026-05-27 第二次修订**：增加优惠券失效/移除后的状态转换分析，以及 ENTIRE_ORDER 与 apply_once_per_order 的类型分类和计价层级差异分析。
 > - **2026-05-27 初版**：基础分析文档，涵盖折扣类型、适用判定、价格叠加与冲突仲裁。
 
@@ -284,25 +285,48 @@ Step 3: calculate_prices(order, lines)
 
 **互斥依据说明：**
 
-- **行级优惠券 ❌ 订单促销**：`checkout.voucher_code` / `order.voucher_code` 在所有优惠券类型下均被设置，订单促销计算前统一检查此字段并跳过（`checkout.py:227`、`order.py:189`）
-- **运费优惠券 ❌ 订单促销**：同上，`voucher_code` 对运费优惠券同样被设置
-- **整单优惠券 ❌ 订单促销**：同上
+- **任意优惠券 ❌ 订单促销**：`checkout.voucher_code` / `order.voucher_code` 在所有优惠券类型下均被设置，订单促销计算前统一检查此字段并跳过（`checkout.py:227`、`order.py:189`）
+- **人工整单折扣 ❌ 订单促销**：Order 侧双重门禁 `order.discounts.filter(type=DiscountType.MANUAL)` 存在时跳过订单促销（`order.py:189`），Checkout 侧无此门禁
+- **人工整单折扣 ❌ 整单优惠券**：添加人工折扣时 `order.discounts.exclude(voucher__type=VoucherType.SHIPPING).delete()` 删除优惠券折扣（`order/utils.py:762`）；添加优惠券时 `is_manual_discount` 检查跳过优惠券折扣（`voucher.py:398`）
 - **目录促销 ✅ 所有优惠券**：目录促销作用于行级单价（通过 `VariantChannelListingPromotionRule.discounted_price_amount` 预计算），与订单促销的订单小计级检查不冲突；行级优惠券在 `calculate_base_line_total_price` 中基于已扣目录促销的价格继续扣减
 - **人工行折扣 ❌ 所有行级折扣**：`unique_type` 唯一约束 + 显式删除逻辑
 
 ### 4.2 冲突仲裁的实现机制
 
-#### 机制一：显式删除（添加时清除竞争方）
+#### 机制一：双重门禁（订单促销专属）
+
+Order 侧 `create_order_discount_objects_for_order_promotions`（`order.py:189`）：
+```python
+if order.voucher_code or order.discounts.filter(type=DiscountType.MANUAL):
+    _clear_order_discount(order, lines_info)
+    return
+```
+
+Checkout 侧 `create_checkout_discount_objects_for_order_promotions`（`checkout.py:227`）：
+```python
+if checkout.voucher_code:
+    _clear_checkout_discount(checkout_info, lines_info, save)
+    return None
+```
+
+| 门禁条件 | Checkout 侧 | Order 侧 |
+|---------|------------|---------|
+| `voucher_code` 非空 | ✅ 阻断 | ✅ 阻断 |
+| MANUAL 订单折扣存在 | 不适用 | ✅ 阻断 |
+
+#### 机制二：显式删除（添加时清除竞争方）
 
 - **添加优惠券 → 删除订单促销**：`checkout/utils.py:791` 添加优惠券时删除所有 `ORDER_PROMOTION` 类型的 CheckoutDiscount 和赠品行
-- **添加人工折扣 → 删除优惠券订单折扣**：`discount/utils/voucher.py:398` 如果人工折扣存在，删除优惠券订单折扣
+- **添加人工整单折扣 → 删除所有其他订单折扣**：`order/utils.py:762` `order.discounts.exclude(voucher__type=VoucherType.SHIPPING).delete()` 删除 VOUCHER、ORDER_PROMOTION、旧 MANUAL 折扣，仅保留运费优惠券
+- **添加人工行折扣 → 删除同行的目录促销和优惠券行折扣**：`order/utils.py:856` `_remove_invalid_discounts_for_adding_manual` 删除同行所有非 MANUAL 折扣
 
-#### 机制二：条件跳过（计算前判断资格）
+#### 机制三：条件跳过（计算前判断资格）
 
-- **订单促销计算前检查优惠券**：`discount/utils/order.py:189` 和 `discount/utils/checkout.py:227` 计算订单促销前检查 `voucher_code` 是否已设置
-- **订单级优惠券计算前检查人工折扣**：`discount/utils/voucher.py:398` 如果人工折扣存在，跳过整单优惠券
+- **订单促销计算前检查双重门禁**：`order.py:189` 检查 `voucher_code` 和 MANUAL 折扣
+- **Checkout 侧订单促销计算前检查优惠券**：`checkout.py:227` 仅检查 `voucher_code`
+- **订单级优惠券计算前检查人工折扣**：`voucher.py:398` `is_manual_discount` 为 True 时删除优惠券折扣
 
-#### 机制三：行级唯一约束
+#### 机制四：行级唯一约束
 
 - `OrderLineDiscount` 的 `unique_orderline_discount_type` 约束确保：同一行同一 `unique_type` 只有一条记录
 - `CheckoutLineDiscount` 的 `unique_checkoutline_discount_type` 约束同理
@@ -455,146 +479,230 @@ def recalculate_checkout_discount(manager, checkout_info, lines):
 | 添加/移除优惠券 | `checkout/utils.py:682` `add_promo_code_to_checkout` | ✅ 直接操作后回切 |
 | 优惠券过期 | `check_voucher_for_checkout` 中 `NotApplicable` | ✅ 校验失败自动回切 |
 
-### 5.2 Order 侧：显式操作清除字段后可回切
+### 5.2 Order 侧：双重门禁逻辑与回切
 
-与 Checkout 侧不同，Order 侧的 `voucher_code` **不会因优惠券校验失败而自动清空**。但通过 `draftOrderUpdate` mutation 显式移除优惠券时，`clean_voucher` 和 `clean_voucher_code` 函数会**同步清空 `voucher` 和 `voucher_code` 两个字段**，从而使订单促销能够正常回切。
+与 Checkout 侧不同，Order 侧的订单促销被**两个独立条件**阻断，任意一个满足即跳过：
 
-> **⚠️ 文档更正说明**：之前版本的文档错误地描述为"仅清除 voucher_id，不清除 voucher_code"。实际代码通过 `clean_voucher`/`clean_voucher_code` 的双向清理机制，会同步清空两个字段。测试用例 `test_draft_order_update_remove_entire_order_voucher`（`test_draft_order_update.py:2352`）中的断言 `assert order.voucher_code is None` 验证了这一行为。
-
-#### Order 侧的 `voucher_code` 持久化
-
-`order.voucher_code` 在以下场景被设置：
-- **结账转订单**（`complete_checkout.py:741`）：通过 `_process_voucher_data_for_order` 获取 `voucher_code`，写入 `Order.voucher_code`
-- **草稿订单更新**（`draft_order_update.py:428`）：通过 `handle_order_voucher` + `construct_instance` 设置或清除
-
-#### 草稿订单中的优惠券校验
-
-在 `graphql/order/utils.py:349` `_validate_voucher` 中：
 ```python
-def _validate_voucher(order, lines, channel, errors):
-    if channel.include_draft_order_in_voucher_usage:
-        try:
-            validate_voucher_in_order(order, lines, channel)
-        except NotApplicable as e:
-            errors["voucher"].append(...)
+# saleor/discount/utils/order.py:189
+if order.voucher_code or order.discounts.filter(type=DiscountType.MANUAL):
+    _clear_order_discount(order, lines_info)
+    return
 ```
 
-校验失败仅**记录错误**，不清除 `voucher_code`，不触发订单促销回切。
+- **门禁 1**：`order.voucher_code` 非空 — 任意类型优惠券阻断
+- **门禁 2**：`order.discounts` 中存在 `type=MANUAL` 的折扣对象 — 人工整单折扣阻断
 
-#### 草稿订单的回切路径
+两个条件是 **OR** 关系，必须**同时为假**时订单促销才能生效。
 
-**核心清理逻辑：`clean_voucher` 和 `clean_voucher_code` 的双向清理**
+#### Checkout 侧 vs Order 侧的门禁差异
 
-在 `draft_order_cleaner.py:46-105` 中，两个清理函数实现了双向同步：
+| 维度 | Checkout 侧 | Order 侧 |
+|------|------------|---------|
+| 门禁条件 | `checkout.voucher_code` 非空 | `order.voucher_code` 非空 **OR** 存在 MANUAL 订单折扣 |
+| MANUAL 折扣是否阻断 | ❌ 不阻断（Checkout 无 MANUAL 订单折扣） | ✅ 阻断 |
+| 门禁数量 | 1 个 | 2 个（双重门禁） |
+| 代码位置 | `checkout.py:227` | `order.py:189` |
 
+> **⚠️ 文档更正说明**：之前版本仅关注 `voucher_code` 门禁，忽略了 `DiscountType.MANUAL` 门禁。实际上，即使 `voucher_code` 为 None，只要存在人工整单折扣对象，订单促销同样无法回切。
+
+#### 双重门禁下的状态空间
+
+```
+                        voucher_code
+                     None      非空
+                 ┌──────────┬──────────┐
+  MANUAL折扣不存在 │ ✅ 可回切  │ ❌ 被门禁1阻断│
+                 ├──────────┼──────────┤
+  MANUAL折扣存在   │ ❌ 被门禁2阻断│ ❌ 被双重门禁阻断│
+                 └──────────┴──────────┘
+```
+
+> 注意：`voucher_code` 非空 + MANUAL 折扣存在这个组合在实际中不太可能出现，
+> 因为添加 MANUAL 折扣时会删除 VOUCHER 折扣对象（但不清除 `voucher_code`）。
+
+#### MANUAL 整单折扣的阻断机制
+
+**创建时：删除所有其他订单折扣对象**
+
+`create_manual_order_discount`（`order/utils.py:749`）：
 ```python
-def clean_voucher(voucher: Voucher | None, channel: Channel, cleaned_input: dict):
+def create_manual_order_discount(order, reason, value_type, value, ...):
+    with transaction.atomic():
+        # Manual order discount does not stack with other order-level discounts
+        order.discounts.exclude(voucher__type=VoucherType.SHIPPING).delete()
+        # ↑ 删除所有订单折扣对象（VOUCHER、ORDER_PROMOTION、MANUAL），仅保留运费优惠券
+        ...
+        order_discount = OrderDiscount.objects.create(
+            type=DiscountType.MANUAL, ...
+        )
+```
+
+**删除时：回切到优惠券（如有），否则回切到订单促销**
+
+`remove_order_discount_from_order`（`order/utils.py:787`）：
+```python
+def remove_order_discount_from_order(order, order_discount):
+    order_discount.delete()    # ← 删除 MANUAL 折扣对象，门禁2解除
+
+    # Manual discounts take precedence over vouchers, overriding them when applied.
+    # However, this does not entirely dissociate the voucher from the order.
+    # If the manual discount is removed, the voucher is reevaluated.
+    if order.voucher:
+        create_or_update_discount_object_from_order_level_voucher(order)
+        # ↑ 优惠券仍在 → 恢复优惠券折扣 → 但门禁1仍阻断订单促销
+```
+
+删除 MANUAL 折扣后通过 `invalidate_order_prices` 触发 `fetch_order_prices_if_expired`，完整链路如下：
+```
+OrderDiscountDelete mutation
+  → remove_order_discount_from_order()
+      ├─ 删除 MANUAL OrderDiscount → 门禁2解除
+      └─ 如果 order.voucher 存在 → 恢复 VOUCHER 折扣对象
+  → invalidate_order_prices() → should_refresh_prices = True
+  → fetch_order_prices_if_expired()
+      → create_order_discount_objects_for_order_promotions()
+          ├─ 如果 order.voucher_code 非空 → 门禁1仍阻断 → ❌ 订单促销不回切
+          └─ 如果 order.voucher_code 为空 → 门禁1解除 → ✅ 订单促销回切
+```
+
+#### 测试断言验证
+
+**场景 1：删除 MANUAL 折扣 → 回切到订单促销**（`test_order_discount.py:1021`）
+```python
+# 前置：order 有 MANUAL 折扣，无优惠券，存在 order_promotion_rule
+manual_discount = order.discounts.get()      # MANUAL 类型
+
+# 调用 OrderDiscountDelete mutation
+response = staff_api_client.post_graphql(ORDER_DISCOUNT_DELETE, variables)
+
+# 验证：MANUAL 折扣已删除，订单促销折扣生效
+with pytest.raises(manual_discount._meta.model.DoesNotExist):
+    manual_discount.refresh_from_db()
+order_discount = order.discounts.get()       # ORDER_PROMOTION 类型
+assert order_discount.value == reward_value
+```
+
+**场景 2：删除 MANUAL 折扣 → 回切到优惠券（不回切到订单促销）**（`test_order_discount.py:1107`）
+```python
+# 前置：order 有 MANUAL 折扣 + voucher_code 非空 + voucher 存在
+order.voucher_code = code
+order.voucher = voucher
+order.save()
+
+# 调用 OrderDiscountDelete mutation
+response = staff_api_client.post_graphql(ORDER_DISCOUNT_DELETE, variables)
+
+# 验证：MANUAL 折扣已删除，优惠券折扣恢复，订单促销被门禁1阻断
+voucher_discount = order.discounts.get()
+assert voucher_discount.type == DiscountType.VOUCHER
+```
+
+**场景 3：删除 MANUAL 折扣 → 回切到赠品促销**（`test_order_discount.py:1063`）
+```python
+# 前置：order 有 MANUAL 折扣，无优惠券，存在 gift_promotion_rule
+manual_discount = order.discounts.get()
+
+# 调用 OrderDiscountDelete mutation
+response = staff_api_client.post_graphql(ORDER_DISCOUNT_DELETE, variables)
+
+# 验证：MANUAL 折扣已删除，赠品行恢复，无 OrderDiscount
+assert not order.discounts.exists()
+gift_line = order.lines.filter(is_gift=True).first()
+assert gift_line is not None
+```
+
+#### 通过 draftOrderUpdate 移除优惠券时的回切
+
+> **文档更正说明**：之前版本错误地描述为"仅清除 voucher_id"。实际通过 `clean_voucher`/`clean_voucher_code` 双向清理机制同步清空两个字段。
+
+`draft_order_cleaner.py:46-105` 中实现了双向同步：
+```python
+def clean_voucher(voucher, channel, cleaned_input):
     if voucher is None:
-        cleaned_input["voucher_code"] = None   # ← voucher 为 None 时，voucher_code 同步置空
+        cleaned_input["voucher_code"] = None   # ← 同步清空
         return
-    # ... 其他验证逻辑 ...
 
-def clean_voucher_code(voucher_code: str | None, channel: Channel, cleaned_input: dict):
+def clean_voucher_code(voucher_code, channel, cleaned_input):
     if voucher_code is None:
-        cleaned_input["voucher"] = None        # ← voucher_code 为 None 时，voucher 同步置空
+        cleaned_input["voucher"] = None        # ← 双向同步
         return
-    # ... 其他验证逻辑 ...
 ```
 
-`clean_voucher_and_voucher_code` 函数（`draft_order_cleaner.py:26`）是入口，根据 `cleaned_input` 中是否有 `voucher` 或 `voucher_code` 键来决定调用哪个清理函数。两个字段的清理是同步的，**不存在只清一个而保留另一个的情况**。
+`construct_instance(instance, cleaned_input)` 将两个字段都设为 None → 门禁1解除 → 订单促销可回切。
 
-**路径 1：通过 draftOrderUpdate mutation 显式移除优惠券**（`draft_order_update.py:109-446`）：
-
-```
-用户调用 draftOrderUpdate mutation → 两种输入方式均可:
-  ├─ 方式 A: {"input": {"voucher": null}}
-  │     ↓
-  │     clean_input() 调用 draft_order_cleaner.clean_voucher_and_voucher_code
-  │       → "voucher" in cleaned_input → 调用 clean_voucher(voucher=None, ...)
-  │           → cleaned_input["voucher_code"] = None
-  │           → cleaned_input["voucher"] = None
-  │     ↓
-  │     construct_instance(instance, cleaned_input)
-  │       → instance.voucher_id = None
-  │       → instance.voucher_code = None
-  │
-  └─ 方式 B: {"input": {"voucherCode": null}}
-        ↓
-        clean_input() 调用 draft_order_cleaner.clean_voucher_and_voucher_code
-          → "voucher_code" in cleaned_input → 调用 clean_voucher_code(voucher_code=None, ...)
-              → cleaned_input["voucher"] = None
-              → cleaned_input["voucher_code"] = None
-        ↓
-        construct_instance(instance, cleaned_input)
-          → instance.voucher_id = None
-          → instance.voucher_code = None
-
-  ↓
-handle_order_voucher(cleaned_input, instance, old_voucher, old_voucher_code)
-  ├─ "voucher" in cleaned_input → 继续处理
-  ├─ voucher = None 且 old_voucher 存在 → 调用 release_voucher_code_usage
-  └─ create_or_update_voucher_discount_objects_for_order(instance)
-        └─ 删除 type=VOUCHER 的 OrderDiscount 对象
-
-  ↓
-order.save() → voucher_id 和 voucher_code 都保存为 None
-  ↓
-Order.should_refresh_prices = True
-  ↓
-fetch_order_prices_if_expired 被调用
-  ├─ prepare_order_lines_for_refresh
-  ├─ process_order_promotion → handle_order_promotion
-  │     └─ create_order_discount_objects_for_order_promotions
-  │           └─ 检查 order.voucher_code → 为 None → ✅ 订单促销正常生效！
-```
-
-**测试断言验证**（`test_draft_order_update.py:2402-2403`）：
+测试断言（`test_draft_order_update.py:2402`）：
 ```python
-order.refresh_from_db()
-assert order.voucher_code is None   # ✅ 两个字段都被清空
-assert order.voucher is None        # ✅
-with pytest.raises(OrderDiscount.DoesNotExist):
-    order_discount.refresh_from_db()  # ✅ 优惠券折扣对象被删除
+assert order.voucher_code is None
+assert order.voucher is None
 ```
 
-**路径 2：通过草稿订单更新替换优惠券**（`draft_order_update.py:323`）：
+#### Order 侧回切的完整判定矩阵
+
+| # | `voucher_code` | MANUAL 折扣 | `order.voucher` | 订单促销状态 | 回切路径 |
+|---|---------------|------------|----------------|------------|---------|
+| 1 | None | 不存在 | 任意 | ✅ 生效 | — |
+| 2 | 非空 | 不存在 | 非空 | ❌ 门禁1阻断 | 通过 draftOrderUpdate 设置 `voucher=null` 或 `voucherCode=null` |
+| 3 | None | 存在 | None | ❌ 门禁2阻断 | 通过 OrderDiscountDelete mutation 删除 MANUAL 折扣 |
+| 4 | None | 存在 | 非空 | ❌ 门禁2阻断 | 通过 OrderDiscountDelete 删除 MANUAL → 恢复优惠券折扣（但门禁1仍阻断订单促销） |
+| 5 | 非空 | 存在 | 非空 | ❌ 双重阻断 | 先 OrderDiscountDelete → 再 draftOrderUpdate 移除优惠券 |
+| 6 | 非空 | 不存在 | None | ❌ 门禁1阻断 | 需显式清空 `voucher_code`（`voucher_id` 为 None 不够） |
+
+#### 回切路径状态图
+
 ```
-用户调用 draftOrderUpdate mutation → 设置新 voucher/voucherCode
-  → clean_voucher 或 clean_voucher_code 验证新优惠券
-  → 验证通过 → cleaned_input["voucher"] 和 cleaned_input["voucher_code"] 都设为新值
-  → construct_instance 更新两个字段
-  → handle_order_voucher 处理：
-      ├─ 新 voucher 存在 → increase_voucher_usage
-      ├─ old_voucher 存在 → release_voucher_code_usage
-      └─ create_or_update_voucher_discount_objects_for_order 更新折扣对象
+                  ┌───────────────────────────────┐
+                  │   订单促销被阻断（不可回切）      │
+                  │   条件: voucher_code 非空        │
+                  │         OR MANUAL 折扣存在       │
+                  └───────────────┬───────────────┘
+                                  │
+              ┌───────────────────┼───────────────────┐
+              │                   │                   │
+    ┌─────────▼─────────┐  ┌─────▼──────┐  ┌────────▼────────┐
+    │ 仅门禁1阻断         │  │ 双重阻断    │  │ 仅门禁2阻断       │
+    │ voucher_code 非空   │  │            │  │ MANUAL 折扣存在   │
+    │ MANUAL 不存在       │  │            │  │ voucher_code 为空│
+    └─────────┬─────────┘  └─────┬──────┘  └────────┬────────┘
+              │                   │                   │
+    draftOrderUpdate    ① OrderDiscountDelete  OrderDiscountDelete
+    voucher=null         ② draftOrderUpdate      → 删除 MANUAL
+    或 voucherCode=null    voucher=null          → 若voucher存在:
+              │                   │              恢复 VOUCHER 折扣
+              │                   │              (进入门禁1状态)
+              ▼                   ▼                   │
+    ┌─────────────────────────────────────────────────┘
+    │
+    ▼ (当 voucher_code=None 且 MANUAL 不存在时)
+  ┌───────────────────┐
+  │ ✅ 订单促销可回切    │
+  │ fetch_order_prices │
+  │ → create_order_    │
+  │   discount_objects │
+  │   _for_order_      │
+  │   promotions()     │
+  │ → 两个门禁均为假    │
+  └───────────────────┘
 ```
 
-**路径 3：直接删除订单折扣对象**（不推荐）：
-```
-删除 OrderDiscount(type=VOUCHER) 
-  → order.voucher_code 仍非空 → 订单促销仍被跳过
-  → 需要同时显式设置 order.voucher_code = None 和 order.voucher = None 才能回切
-```
+#### 特殊场景：voucher_code 非空但 voucher_id 为 None
 
-#### Order 侧回切的条件总结
-
-| 条件 | 是否回切 | 说明 |
-|------|---------|------|
-| `order.voucher_code` 为 None | ✅ 回切 | 订单促销正常计算 |
-| `order.voucher_code` 非空 | ❌ 不回切 | 无论 `voucher_id` 是否为 None，只要 `voucher_code` 非空就阻断订单促销 |
-| 通过 draftOrderUpdate 设置 `voucher=null` | ✅ 回切 | `clean_voucher` 函数同步清空两个字段 |
-| 通过 draftOrderUpdate 设置 `voucherCode=null` | ✅ 回切 | `clean_voucher_code` 函数同步清空两个字段 |
-| `order.voucher_code` 非空 + 优惠券已过期 | ❌ 不回切 | 校验失败不清除 `voucher_code` |
-| 显式设置 `voucher_code = None` + 触发重算 | ✅ 回切 | 需要同时操作两个字段 |
+| voucher_code | voucher_id | MANUAL 折扣 | 订单促销 | 说明 |
+|-------------|-----------|------------|---------|------|
+| None | None | 不存在 | ✅ 生效 | 正常状态 |
+| 非空 | 非空 | 不存在 | ❌ 阻断 | 优惠券完整存在 |
+| 非空 | None | 不存在 | ❌ 阻断 | `voucher_code` 字段本身即为门禁条件，与 `voucher_id` 无关 |
+| None | 非空 | 不存在 | ✅ 生效 | 理论上不应出现（voucher 存在但 code 为空），但若出现则不阻断 |
 
 ### 5.3 状态转换的设计差异
 
 | 维度 | Checkout 侧 | Order 侧 |
 |------|------------|---------|
 | 优惠券校验失败 | 自动移除并回切订单促销 | 仅记录错误，不自动回切 |
-| `voucher_code` 语义 | 即时状态标记（有/无优惠券） | 历史记录（创建时的快照） |
+| 门禁条件 | 仅 `voucher_code` | `voucher_code` **OR** MANUAL 折扣 |
 | 显式移除优惠券 | 通过 `remove_voucher_from_checkout` 清空 `voucher_code` | 通过 `clean_voucher`/`clean_voucher_code` 同步清空两个字段 |
-| 订单促销回切 | 自动、无状态 | 需要显式触发 mutation 清除字段 |
+| 移除 MANUAL 折扣后 | 不适用（Checkout 无 MANUAL 订单折扣） | 通过 `OrderDiscountDelete` 删除折扣对象，然后 `invalidate_order_prices` 触发重算 |
+| 订单促销回切 | 自动、无状态 | 需要显式触发 mutation 清除门禁条件 |
 | 设计目标 | 实时计算，对用户友好 | 保持订单历史完整性，防止意外变更 |
 
 ---

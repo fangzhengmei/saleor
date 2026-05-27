@@ -354,3 +354,368 @@ charged_value = 100
 | Stripe插件 | `saleor/payment/gateways/stripe/plugin.py` | 56 |
 | 数据模型定义 | `saleor/payment/models.py` | 31, 206, 273 |
 | 事件类型枚举 | `saleor/payment/__init__.py` | 170 |
+
+---
+
+## 7. 多网关排障：先授权后扣款与异步回调的分歧处理
+
+### 7.1 两种支付网关对比
+
+#### 7.1.1 Stripe 网关（新交易模型）
+
+**核心特性**：
+- 使用 `TransactionItem` + `TransactionEvent` 的事件溯源模式
+- 通过 webhook 异步通知状态变更
+- 支持 3D Secure 等强认证流程
+- 授权和扣款可使用同一 `psp_reference`（PaymentIntent ID）
+
+**先授权后扣款流程**（`saleor/payment/gateways/stripe/plugin.py:56`）：
+
+```
+1. transactionInitialize → 创建 AUTHORIZATION_REQUEST
+2. transactionProcess → 调用 Stripe API 创建 PaymentIntent
+3. Stripe 返回 requires_capture → 创建 AUTHORIZATION_SUCCESS
+4. 业务侧调用 capture 接口 → 创建 CHARGE_REQUEST
+5. Stripe 处理扣款 → webhook 通知 payment_intent.succeeded
+6. webhook handler 创建 CHARGE_SUCCESS
+```
+
+**异步回调处理**（`saleor/payment/gateways/stripe/webhooks.py:50`）：
+
+```python
+webhook_handlers = {
+    "payment_intent.succeeded": handle_successful_payment_intent,
+    "payment_intent.amount_capturable_updated": handle_authorized_payment_intent,
+    "payment_intent.processing": handle_processing_payment_intent,
+    "payment_intent.payment_failed": handle_failed_payment_intent,
+    "payment_intent.canceled": handle_failed_payment_intent,
+    "charge.refunded": handle_refund,
+}
+```
+
+**关键处理逻辑**（`webhooks.py:301`）：
+```python
+def handle_authorized_payment_intent(payment_intent, gateway_config, channel_slug):
+    payment = _get_payment(payment_intent.id)  # 按 psp_reference 查询
+    checkout = _get_checkout(payment.id)       # 先锁 checkout 再锁 payment
+    # 幂等检查：是否已存在同类型 transaction
+    transaction = _get_or_create_transaction(payment, payment_intent, AUTH, ...)
+    # 如果支付已激活但关联了 checkout，触发 complete_checkout
+```
+
+#### 7.1.2 Braintree 网关（旧交易模型）
+
+**核心特性**：
+- 使用 `Payment` + `Transaction` 的旧模型
+- 同步调用为主，部分场景支持 webhook
+- `authorize()` 和 `capture()` 是两个独立的 API 调用
+- 授权和扣款使用不同的 `transaction_id`
+
+**先授权后扣款流程**（`saleor/payment/gateways/braintree/__init__.py:134`）：
+
+```python
+def authorize(payment_information, config):
+    # 1. 创建 Braintree transaction，submit_for_settlement=False
+    result = gateway.transaction.sale({
+        "amount": str(payment_information.amount),
+        "payment_method_nonce": payment_information.token,
+        "options": {
+            "submit_for_settlement": False,  # 仅授权，不扣款
+        },
+    })
+    # 2. 返回 GatewayResponse，kind=AUTH
+    return GatewayResponse(
+        is_success=result.is_success,
+        kind=TransactionKind.AUTH,
+        transaction_id=result.transaction.id,  # 授权交易ID
+        ...
+    )
+
+def capture(payment_information, config):
+    # 1. 调用 Braintree submit_for_settlement
+    result = gateway.transaction.submit_for_settlement(
+        transaction_id=payment_information.token,  # 使用授权返回的ID
+        amount=str(payment_information.amount),
+    )
+    # 2. 返回 GatewayResponse，kind=CAPTURE
+    return GatewayResponse(
+        is_success=result.is_success,
+        kind=TransactionKind.CAPTURE,
+        transaction_id=result.transaction.id,  # 扣款交易ID（与授权不同！）
+        ...
+    )
+```
+
+**关键差异**：Braintree 的授权和扣款产生两个不同的 `transaction_id`，而 Stripe 使用同一个 `PaymentIntent ID`。
+
+#### 7.1.3 网关差异对比表
+
+| 对比项 | Stripe | Braintree |
+|--------|--------|-----------|
+| **交易模型** | TransactionItem + TransactionEvent | Payment + Transaction |
+| **psp_reference** | 授权和扣款共用 PaymentIntent ID | 授权和扣款各有独立 transaction_id |
+| **状态通知** | 主要通过 webhook 异步通知 | 主要同步返回，可选 webhook |
+| **3D Secure** | 原生支持，requires_action 状态 | 通过 three_d_secure 参数配置 |
+| **自动捕获** | capture_method=automatic | submit_for_settlement=True |
+| **部分扣款** | 支持，capture_amount < authorized_amount | 支持，submit_for_settlement 可指定金额 |
+| **幂等键** | 客户端生成 idempotency_key | 由 Braintree SDK 内部处理 |
+| **webhook 签名** | Stripe-Signature 头部 | Braintree webhook 签名验证 |
+
+### 7.2 异步回调补事件的分歧处理
+
+#### 7.2.1 Stripe webhook 处理流程
+
+**处理顺序**（`webhooks.py:134-138`）：
+```python
+# 关键：先锁 checkout，再锁 payment，避免死锁
+checkout = _get_checkout(payment.id)       # select_for_update on checkout
+payment = _get_payment(payment_intent.id)  # select_for_update on payment
+```
+
+**幂等处理**（`webhooks.py:226-239`）：
+```python
+def _get_or_create_transaction(payment, stripe_object, kind, amount, currency):
+    # 按 token=psp_reference + kind + is_success 查询
+    transaction = payment.transactions.filter(
+        token=stripe_object.id,
+        action_required=False,
+        is_success=True,
+        kind=kind,
+    ).last()
+    if not transaction:
+        # 创建新 transaction
+        transaction = _update_payment_with_new_transaction(...)
+    return transaction
+```
+
+**业务补单逻辑**（`webhooks.py:143-224`）：
+```python
+def _finalize_checkout(checkout, payment, payment_intent, kind, amount, currency):
+    # 1. 检查是否已存在相同 transaction（防止重复处理）
+    if not transaction:
+        # 2. 创建 Transaction
+        transaction = create_transaction(...)
+        # 3. 更新 Payment charge_status
+        update_payment_charge_status(payment, transaction)
+        # 4. 调用 complete_checkout 创建订单
+        order, _, _ = complete_checkout(...)
+```
+
+#### 7.2.2 Braintree webhook 处理（简化版）
+
+Braintree 网关的 webhook 处理相对简单，主要依赖同步调用结果：
+
+```python
+# Braintree 的 webhook 主要用于：
+# 1. 结算状态变更（transaction_settled）
+# 2. 退款状态变更（transaction_refunded）
+# 3. 争议处理（dispute_opened）
+```
+
+#### 7.2.3 常见分歧场景及处理
+
+**场景 1：重复 webhook 通知**
+
+| 网关 | 处理方式 | 代码位置 |
+|------|----------|----------|
+| Stripe | 按 `psp_reference + kind + is_success` 查询，已存在则跳过 | `webhooks.py:226` |
+| Braintree | 同步调用时已处理，webhook 仅更新状态 | N/A |
+
+**场景 2：webhook 先于同步响应到达**
+
+Stripe 的处理逻辑天然支持：
+```python
+# 同步调用返回 requires_action
+# 用户完成 3D Secure
+# Stripe 发送 webhook（可能先于前端回调）
+# webhook handler 检查 payment 是否已存在
+# 如果已存在且关联 checkout，触发 complete_checkout
+# 前端回调时发现 order 已创建，直接返回
+```
+
+**场景 3：授权成功但扣款失败**
+
+Stripe 事件流：
+```
+1. AUTHORIZATION_SUCCESS (psp_ref=pi_xxx, amount=100)
+2. CHARGE_REQUEST (psp_ref=pi_xxx, amount=100)
+3. CHARGE_FAILURE (psp_ref=pi_xxx, amount=100)
+
+计算结果：
+authorized_value = 0  # 因为有 CHARGE_REQUEST，授权被消耗
+charged_value = 0     # CHARGE_FAILURE 不增加
+charge_pending_value = 0
+```
+
+Braintree 事件流：
+```
+1. Transaction (AUTH, txn_id=auth_123, amount=100, success=True)
+2. Transaction (CAPTURE, txn_id=cap_456, amount=100, success=False)
+
+计算结果：
+Payment.captured_amount = 0
+Payment.charge_status = NOT_CHARGED
+```
+
+---
+
+## 8. 完整追踪路径：用一组交易标识串起全链路
+
+### 8.1 统一追踪标识
+
+以 Stripe 网关的一笔完整支付为例，使用以下标识串起全链路：
+
+| 标识类型 | 示例值 | 说明 |
+|----------|--------|------|
+| **idempotency_key** | `uuid-1234-5678-abcd` | 客户端生成，用于防止重复初始化 |
+| **TransactionItem.token** | `uuid-abcd-1234-5678` | Saleor 内部交易 ID，全局唯一 |
+| **psp_reference** | `pi_3Nq...L4X` | Stripe PaymentIntent ID，网关侧唯一 |
+| **order_id** | `order-001` | 关联的订单 ID |
+
+### 8.2 完整调用链
+
+#### 阶段 1：初始化交易
+
+```
+GraphQL: transactionInitialize
+  → saleor/graphql/payment/mutations/transaction/transaction_initialize.py:155
+    → handle_transaction_initialize_session() [saleor/payment/utils.py:1858]
+      → TransactionItem.objects.get_or_create(idempotency_key=uuid-1234...)
+      → TransactionEvent.objects.get_or_create(type=AUTHORIZATION_REQUEST)
+      → manager.transaction_initialize_session()  [调用支付应用]
+      → create_transaction_event_for_transaction_session() [utils.py:1430]
+        → 解析支付应用响应
+        → 更新 request_event 或创建新事件
+        → recalculate_transaction_amounts()  [重算金额]
+        → process_order_or_checkout_with_transaction()  [更新关联对象]
+```
+
+**数据库变化**：
+- `TransactionItem` 新增记录，token=`uuid-abcd-1234-5678`
+- `TransactionEvent` 新增 AUTHORIZATION_REQUEST 事件
+
+#### 阶段 2：处理交易（调用网关）
+
+```
+GraphQL: transactionProcess
+  → saleor/graphql/payment/mutations/transaction/transaction_process.py:177
+    → get_transaction_item(id/token)  [查找 TransactionItem]
+    → get_request_event(events)  [查找初始化时创建的 request 事件]
+    → handle_transaction_process_session() [saleor/payment/utils.py:1952]
+      → manager.transaction_process_session()  [调用 Stripe API 创建 PaymentIntent]
+      → create_transaction_event_for_transaction_session() [utils.py:1430]
+        → 根据网关响应创建 AUTHORIZATION_SUCCESS
+        → psp_reference = pi_3Nq...L4X
+        → recalculate_transaction_amounts()
+          → authorized_value = 100
+          → authorize_pending_value = 0
+```
+
+**数据库变化**：
+- `TransactionEvent` 新增 AUTHORIZATION_SUCCESS 事件，psp_reference=`pi_3Nq...L4X`
+- `TransactionItem.authorized_value` 更新为 100
+
+#### 阶段 3：异步回调（webhook）
+
+```
+HTTP: POST /payments/stripe/webhook/
+  → saleor/payment/gateways/stripe/webhooks.py:50 (handle_webhook)
+    → construct_stripe_event()  [验证签名]
+    → handle_successful_payment_intent()  [webhooks.py:431]
+      → _get_payment(pi_3Nq...L4X)  [按 psp_reference 查询]
+      → _get_checkout(payment.id)  [锁 checkout]
+      → _get_payment(pi_3Nq...L4X, with_lock=True)  [锁 payment]
+      → _get_or_create_transaction()  [幂等检查]
+      → create_transaction()  [创建 CAPTURE transaction]
+      → gateway_postprocess()  [更新 Payment 状态]
+      → complete_checkout()  [创建订单]
+        → Order.objects.create(...)  order_id=`order-001`
+        → order_charged()  [触发 webhook]
+```
+
+**数据库变化**（旧模型）：
+- `Transaction` 新增 CAPTURE 记录，token=`pi_3Nq...L4X`
+- `Payment.captured_amount` 更新为 100
+- `Payment.charge_status` 更新为 FULLY_CHARGED
+- `Order` 新增记录，id=`order-001`
+
+#### 阶段 4：新模型事件上报（App 调用）
+
+```
+GraphQL: transactionEventReport
+  → saleor/graphql/payment/mutations/transaction/transaction_event_report.py:65
+    → 权限检查
+    → 对 TransactionItem 加行级锁
+    → deduplicate_event()  [去重检查]
+    → TransactionEvent.objects.create(type=CHARGE_SUCCESS, psp_ref=pi_3Nq...L4X)
+    → recalculate_transaction_amounts()
+      → 按 psp_reference 分组事件
+      → 找到 CHARGE_REQUEST 和 CHARGE_SUCCESS
+      → charged_value = 100
+      → authorized_value = 0  [因为 CHARGE_REQUEST 消耗了授权]
+    → process_order_with_transaction()
+      → updates_amounts_for_order()  [更新订单金额]
+        → Order.total_charged_amount = 100
+        → Order.charge_status = FULLY_CHARGED
+```
+
+**数据库变化**（新模型）：
+- `TransactionEvent` 新增 CHARGE_SUCCESS 事件
+- `TransactionItem.charged_value` 更新为 100
+- `TransactionItem.authorized_value` 更新为 0
+- `Order.total_charged_amount` 更新为 100
+
+### 8.3 端到端排查 SQL
+
+当需要追踪某笔交易时，使用以下 SQL 查询：
+
+```sql
+-- 1. 按 psp_reference 查询 TransactionItem
+SELECT * FROM payment_transactionitem 
+WHERE psp_reference = 'pi_3Nq...L4X';
+
+-- 2. 查询所有相关事件
+SELECT * FROM payment_transactionevent 
+WHERE transaction_id = (SELECT id FROM payment_transactionitem WHERE psp_reference = 'pi_3Nq...L4X')
+ORDER BY created_at;
+
+-- 3. 查询关联订单
+SELECT * FROM order_order 
+WHERE id = (SELECT order_id FROM payment_transactionitem WHERE psp_reference = 'pi_3Nq...L4X');
+
+-- 4. 新旧模型关联查询（迁移期间）
+SELECT * FROM payment_payment 
+WHERE psp_reference = 'pi_3Nq...L4X';
+
+SELECT * FROM payment_transaction 
+WHERE payment_id = (SELECT id FROM payment_payment WHERE psp_reference = 'pi_3Nq...L4X')
+ORDER BY created_at;
+```
+
+### 8.4 排障 Checklist
+
+| 检查项 | 查询/操作 | 预期结果 |
+|--------|-----------|----------|
+| TransactionItem 是否存在 | 按 token 或 psp_reference 查询 | 存在且关联正确的 order/checkout |
+| 事件序列是否完整 | 查询所有 events 按时间排序 | AUTHORIZATION_* → CHARGE_* 顺序正确 |
+| 金额计算是否正确 | 调用 recalculate_transaction_amounts() | 各金额字段与事件总和一致 |
+| 订单金额是否同步 | 对比 Order.total_charged_amount 与 TransactionItem.charged_value | 一致 |
+| webhook 是否重复处理 | 查询 events 中是否有重复 psp_reference | 同一 psp_reference + type 只有一个 |
+| 幂等键是否正确 | 检查 TransactionItem.idempotency_key | 与客户端传入一致 |
+
+---
+
+## 9. 关键代码索引（补充）
+
+| 功能 | 文件 | 行号 |
+|------|------|------|
+| 交易初始化 mutation | `saleor/graphql/payment/mutations/transaction/transaction_initialize.py` | 155 |
+| 交易处理 mutation | `saleor/graphql/payment/mutations/transaction/transaction_process.py` | 177 |
+| 初始化会话处理 | `saleor/payment/utils.py` | 1858 |
+| 处理会话处理 | `saleor/payment/utils.py` | 1952 |
+| 创建交易会话事件 | `saleor/payment/utils.py` | 1430 |
+| Stripe webhook 入口 | `saleor/payment/gateways/stripe/webhooks.py` | 50 |
+| Stripe 成功支付处理 | `saleor/payment/gateways/stripe/webhooks.py` | 431 |
+| Stripe 授权成功处理 | `saleor/payment/gateways/stripe/webhooks.py` | 301 |
+| Braintree 授权 | `saleor/payment/gateways/braintree/__init__.py` | 134 |
+| Braintree 扣款 | `saleor/payment/gateways/braintree/__init__.py` | 227 |

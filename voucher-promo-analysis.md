@@ -346,7 +346,341 @@ Step 3: calculate_prices(order, lines)
 
 ---
 
-## 五、关键代码文件索引
+## 五、优惠券失效/移除后的状态转换与订单促销回切
+
+### 5.1 Checkout 侧：自动回切流程
+
+当优惠券因资格校验失败（最低消费不满足、优惠券过期、商品不再适用等）而被移除时，系统会自动切换到订单促销。这是一个**无状态自动回切**机制。
+
+#### 状态转换链路
+
+```
+触发重算 (recalculate_checkout_discounts)
+  │
+  ├─ Step 1: create_checkout_line_discount_objects_for_catalogue_promotions
+  │     └── 目录促销行折扣独立处理，不受优惠券影响
+  │
+  └─ Step 2: recalculate_checkout_discount
+        │
+        ├─ 有 voucher? ──→ check_voucher_for_checkout
+        │                     │
+        │                     ├─ 校验通过 → 保留优惠券
+        │                     │
+        │                     └─ 校验失败 (NotApplicable)
+        │                           │
+        │                           └─ remove_voucher_from_checkout
+        │                                 ├─ checkout.voucher_code = None
+        │                                 ├─ checkout.discount_name = None
+        │                                 ├─ checkout.discount_amount = Decimal(0)
+        │                                 └─ checkout.save(update_fields=[...])
+        │
+        └─ 无 voucher → remove_voucher_from_checkout (幂等)
+              │
+              └─ Step 3: create_checkout_discount_objects_for_order_promotions
+                    │
+                    ├─ checkout.voucher_code == None → 不再跳过
+                    │
+                    ├─ _set_checkout_base_prices (设置基准价格，含目录促销)
+                    │
+                    ├─ create_discount_objects_for_order_promotions
+                    │     └── 计算并应用订单促销折扣
+                    │
+                    └── 保存折扣信息到 checkout
+```
+
+#### 关键代码路径
+
+**`check_voucher_for_checkout`**（`saleor/checkout/utils.py:603`）：
+```python
+def check_voucher_for_checkout(voucher, manager, checkout_info, lines):
+    checkout = checkout_info.checkout
+    address = checkout_info.shipping_address or checkout_info.billing_address
+    try:
+        discount = get_voucher_discount_for_checkout(
+            manager, voucher, checkout_info, lines, address,
+        )
+        return discount
+    except NotApplicable:
+        remove_voucher_from_checkout(checkout)   # ← 清空 voucher_code
+        checkout_info.voucher = None
+        return None
+```
+
+**`remove_voucher_from_checkout`**（`saleor/checkout/utils.py:839`）：
+```python
+def remove_voucher_from_checkout(checkout: Checkout):
+    checkout.voucher_code = None
+    checkout.discount_name = None
+    checkout.translated_discount_name = None
+    checkout.discount_amount = Decimal(0)
+    checkout.save(update_fields=[
+        "voucher_code", "discount_name", "translated_discount_name",
+        "discount_amount", "currency", "last_change",
+    ])
+```
+
+**`recalculate_checkout_discount`**（`saleor/checkout/utils.py:626`）：
+```python
+def recalculate_checkout_discount(manager, checkout_info, lines):
+    checkout = checkout_info.checkout
+    if voucher := checkout_info.voucher:
+        discount = check_voucher_for_checkout(voucher, manager, checkout_info, lines)
+        if discount:
+            # ... 设置 checkout.discount 并保存
+            checkout.save(...)
+    else:
+        remove_voucher_from_checkout(checkout)
+
+    # 无论优惠券是否成功，始终尝试计算订单促销
+    # 如果优惠券刚被移除，voucher_code 已为 None，订单促销会生效
+    create_checkout_discount_objects_for_order_promotions(
+        checkout_info, lines, save=True
+    )
+```
+
+#### 回切时机
+
+| 触发场景 | 触发函数 | 回切行为 |
+|---------|---------|---------|
+| 修改商品行（增删改） | `checkout/utils.py:76` `invalidate_checkout` | ✅ 自动重算并回切 |
+| 修改配送地址 | `checkout/utils.py:402` `change_shipping_address_in_checkout` | ✅ 自动重算并回切 |
+| 修改配送方式 | `checkout/utils.py` 配送相关函数 | ✅ 自动重算并回切 |
+| 添加/移除优惠券 | `checkout/utils.py:682` `add_promo_code_to_checkout` | ✅ 直接操作后回切 |
+| 优惠券过期 | `check_voucher_for_checkout` 中 `NotApplicable` | ✅ 校验失败自动回切 |
+
+### 5.2 Order 侧：需要显式操作才能回切
+
+与 Checkout 侧不同，Order 侧的 `voucher_code` **不会因优惠券校验失败而自动清空**。订单促销回切需要通过显式操作触发。
+
+#### Order 侧的 `voucher_code` 持久化
+
+`order.voucher_code` 在以下场景被设置：
+- **结账转订单**（`complete_checkout.py:741`）：通过 `_process_voucher_data_for_order` 获取 `voucher_code`，写入 `Order.voucher_code`
+- **草稿订单更新**（`draft_order_update.py`）：通过 `handle_order_voucher` 设置或清除
+
+#### 草稿订单中的优惠券校验
+
+在 `graphql/order/utils.py:349` `_validate_voucher` 中：
+```python
+def _validate_voucher(order, lines, channel, errors):
+    if channel.include_draft_order_in_voucher_usage:
+        try:
+            validate_voucher_in_order(order, lines, channel)
+        except NotApplicable as e:
+            errors["voucher"].append(...)
+```
+
+校验失败仅**记录错误**，不清除 `voucher_code`，不触发订单促销回切。
+
+#### 草稿订单的回切路径
+
+**路径 1：通过草稿订单更新显式移除优惠券**（`draft_order_update.py:323`）：
+```
+用户调用 draftOrderUpdate mutation → voucher 字段设为 None
+  → handle_order_voucher 处理：
+      ├─ voucher = None（表示移除）
+      ├─ old_voucher 存在 → release_voucher_code_usage
+      └─ instance.voucher = None（通过 construct_instance 设置）
+  → 订单的 voucher_code 仍保留，但 voucher_id 为 None
+  → Order.should_refresh_prices = True
+  → fetch_order_prices_if_expired 被调用：
+      ├─ prepare_order_lines_for_refresh
+      ├─ process_order_promotion → handle_order_promotion
+      │     └─ create_order_discount_objects_for_order_promotions
+      │           └─ 检查 order.voucher_code → 仍为非空 → 跳过订单促销！
+```
+
+**注意**：即使 `voucher_id` 为 None，只要 `voucher_code` 非空，订单促销仍然被跳过。需要同时清除 `voucher_code` 才能回切。
+
+**路径 2：通过草稿订单更新替换优惠券**（`draft_order_update.py:347`）：
+```
+用户调用 draftOrderUpdate mutation → 设置新 voucher
+  → handle_order_voucher 处理：
+      ├─ voucher 非空 → 验证新优惠券
+      └─ 如果新优惠券校验失败 → 记录错误，但保留旧 voucher
+```
+
+**路径 3：直接删除订单折扣对象**：
+```
+删除 OrderDiscount(type=VOUCHER) 
+  → order.voucher_code 仍非空 → 订单促销仍被跳过
+  → 需要显式设置 order.voucher_code = None 才能回切
+```
+
+#### Order 侧回切的条件总结
+
+| 条件 | 是否回切 | 说明 |
+|------|---------|------|
+| `order.voucher_code` 为 None | ✅ 回切 | 订单促销正常计算 |
+| `order.voucher_code` 非空 + `order.voucher_id` 为 None | ❌ 不回切 | `voucher_code` 仍阻断订单促销 |
+| `order.voucher_code` 非空 + 优惠券已过期 | ❌ 不回切 | 校验失败不清除 `voucher_code` |
+| 草稿订单更新移除优惠券 | ❌ 不回切 | 仅清除 `voucher_id`，不清除 `voucher_code` |
+| 显式设置 `voucher_code = None` + 触发重算 | ✅ 回切 | 需要同时操作两个字段 |
+
+### 5.3 状态转换的设计差异
+
+| 维度 | Checkout 侧 | Order 侧 |
+|------|------------|---------|
+| 优惠券失效 | 自动移除并回切订单促销 | 仅记录错误，不自动回切 |
+| `voucher_code` 语义 | 即时状态标记（有/无优惠券） | 历史记录（创建时的快照） |
+| 订单促销回切 | 自动、无状态 | 需要显式清除 `voucher_code` |
+| 设计目标 | 实时计算，对用户友好 | 保持订单历史完整性，防止意外变更 |
+
+---
+
+## 六、ENTIRE_ORDER 与 apply_once_per_order 的类型分类与计价层级
+
+### 6.1 类型分类：is_order_level_voucher vs is_line_level_voucher
+
+Saleor 使用三个分类函数来确定优惠券的计价层级（`saleor/discount/utils/voucher.py:51-66`）：
+
+```python
+def is_order_level_voucher(voucher):
+    return bool(
+        voucher
+        and voucher.type == VoucherType.ENTIRE_ORDER
+        and not voucher.apply_once_per_order    # ← 关键：必须 NOT apply_once_per_order
+    )
+
+def is_shipping_voucher(voucher):
+    return bool(voucher and voucher.type == VoucherType.SHIPPING)
+
+def is_line_level_voucher(voucher):
+    return voucher and (
+        voucher.type == VoucherType.SPECIFIC_PRODUCT
+        or voucher.apply_once_per_order          # ← 关键：apply_once_per_order 归入行级
+    )
+```
+
+#### 分类结果矩阵
+
+| `type` | `apply_once_per_order` | `is_order_level` | `is_shipping` | `is_line_level` | 实际计价层级 |
+|--------|----------------------|-----------------|--------------|----------------|------------|
+| `ENTIRE_ORDER` | `False` | ✅ | ❌ | ❌ | 订单级 |
+| `ENTIRE_ORDER` | `True` | ❌ | ❌ | ✅ | 行级 |
+| `SHIPPING` | 任意 | ❌ | ✅ | ❌ | 运费级 |
+| `SPECIFIC_PRODUCT` | 任意 | ❌ | ❌ | ✅ | 行级 |
+
+**核心结论**：`ENTIRE_ORDER + apply_once_per_order=True` 被分类为**行级**优惠券，与 `SPECIFIC_PRODUCT` 同属一类。
+
+### 6.2 计价层级差异
+
+#### 订单级 ENTIRE_ORDER（`apply_once_per_order=False`）
+
+- **折扣对象存储**：`OrderDiscount`（订单级）或 `CheckoutDiscount`（结账级）
+- **计算方式**：基于订单小计
+- **计算入口**：`get_voucher_discount_for_checkout`（`saleor/checkout/utils.py:490`）
+  ```python
+  if voucher.type == VoucherType.ENTIRE_ORDER and not voucher.apply_once_per_order:
+      subtotal = base_calculations.base_checkout_subtotal(lines, channel, currency)
+      return voucher.get_discount_amount_for(subtotal, channel)
+  ```
+- **分摊方式**：通过 `propagate_order_discount_on_order_prices` 按比例分摊到每行
+- **与订单促销的关系**：互斥（设置 `voucher_code`，订单促销跳过）
+
+#### 行级 ENTIRE_ORDER（`apply_once_per_order=True`）
+
+- **折扣对象存储**：`OrderLineDiscount`（行级）或 `CheckoutLineDiscount`（结账行级）
+- **计算方式**：基于最便宜商品的**单价**（不是小计）
+- **计算入口**：`get_voucher_discount_for_checkout`（`saleor/checkout/utils.py:498`）
+  ```python
+  if voucher.type == VoucherType.ENTIRE_ORDER and voucher.apply_once_per_order:
+      prices = get_base_lines_prices(lines)
+      return voucher.get_discount_amount_for(min(prices), channel)
+  ```
+- **行级应用**：通过 `attach_voucher_to_line_info`（`saleor/discount/utils/voucher.py:194`）
+  ```python
+  if voucher.apply_once_per_order:
+      if cheapest_line := get_the_cheapest_line(lines_included_in_discount):
+          discounted_lines_by_voucher = [cheapest_line]   # ← 只选最便宜的一行
+  ```
+- **行级折扣计算**：`calculate_line_discount_amount_from_voucher`（`saleor/discount/utils/voucher.py:622`）
+  ```python
+  if line_info.voucher.apply_once_per_order:
+      unit_price = total_price / quantity
+      voucher_unit_discount_amount = voucher.get_discount_amount_for(unit_price, channel)
+      discount_amount = min(voucher_unit_discount_amount, unit_price)   # ← 只扣单价，不乘数量
+  ```
+- **与订单促销的关系**：仍互斥（设置 `voucher_code`，订单促销跳过）
+
+#### SPECIFIC_PRODUCT 行级优惠券
+
+- **折扣对象存储**：`OrderLineDiscount` / `CheckoutLineDiscount`
+- **计算方式**：
+  - 非 `apply_once_per_order` + percentage：基于行的 `total_price`（已扣目录促销）计算百分比
+  - 非 `apply_once_per_order` + fixed：基于行的 `unit_price` × `quantity`
+  - `apply_once_per_order`：与 ENTIRE_ORDER + apply_once_per_order 相同，只扣单价
+- **商品范围**：通过 `voucher.products`、`voucher.collections`、`voucher.categories`、`voucher.variants` M2M 限制
+
+### 6.3 apply_once_per_order 对两种类型的影响对比
+
+| 维度 | ENTIRE_ORDER + apply_once_per_order | SPECIFIC_PRODUCT + apply_once_per_order |
+|------|------------------------------------|----------------------------------------|
+| **适用商品范围** | 所有商品（选最便宜的一行） | 指定商品/分类/集合/变体范围内选最便宜 |
+| **折扣对象类型** | `OrderLineDiscount` / `CheckoutLineDiscount` | `OrderLineDiscount` / `CheckoutLineDiscount` |
+| **计价基础** | 最便宜商品的**单价** | 指定范围内最便宜商品的**单价** |
+| **是否乘数量** | ❌ 不乘（只扣单价一次） | ❌ 不乘（只扣单价一次） |
+| **对订单促销** | 互斥（`voucher_code` 阻断） | 互斥（`voucher_code` 阻断） |
+| **与目录促销** | 叠加（行级，基于已扣目录促销的价格） | 叠加（行级，基于已扣目录促销的价格） |
+
+### 6.4 行级优惠券在 Order 重算中的特殊处理
+
+在 `refresh_order_base_prices_and_discounts`（`saleor/order/calculations.py:707`）中：
+
+```python
+is_apply_once_per_order_voucher = (
+    order.voucher and order.voucher.apply_once_per_order
+)
+if is_apply_once_per_order_voucher:
+    # apply_once_per_order 优惠券可能影响其他行（因为只选最便宜的）
+    # 如果最便宜行发生变化，需要重新分配
+    reattach_apply_once_per_order_voucher_info(
+        lines_info, initial_cheapest_line, order
+    )
+    create_or_update_line_discount_objects_from_voucher(lines_info)
+else:
+    # SPECIFIC_PRODUCT 非 apply_once_per_order 只影响指定行
+    create_or_update_line_discount_objects_from_voucher(lines_info_to_update)
+```
+
+**`reattach_apply_once_per_order_voucher_info`**（`saleor/order/fetch.py:202`）的核心逻辑：
+```python
+def reattach_apply_once_per_order_voucher_info(lines_info, initial_cheapest_line_info, order):
+    if get_the_cheapest_line(lines_info) == initial_cheapest_line_info:
+        return  # 最便宜行没变，无需重新分配
+    
+    # 最便宜行变了 → 清除所有行的优惠券信息，重新分配
+    for line_info in lines_info:
+        line_info.voucher = None
+        line_info.voucher_code = None
+        line_info.voucher_denormalized_info = None
+    
+    attach_voucher_info(lines_info, order)  # 重新选最便宜的行
+```
+
+### 6.5 完整的优惠券类型-计价层级决策树
+
+```
+Voucher
+  │
+  ├── type == SHIPPING ──────────→ 运费级 ──→ 基于运费计算
+  │
+  ├── type == ENTIRE_ORDER
+  │     │
+  │     ├── apply_once_per_order == False ──→ 订单级 ──→ 基于订单小计
+  │     │
+  │     └── apply_once_per_order == True ──→ 行级 ──→ 选最便宜行，扣单价(不乘数量)
+  │
+  └── type == SPECIFIC_PRODUCT
+        │
+        ├── apply_once_per_order == False ──→ 行级 ──→ 对指定范围内每行扣(乘数量)
+        │
+        └── apply_once_per_order == True ──→ 行级 ──→ 指定范围选最便宜行，扣单价(不乘数量)
+```
+
+---
+
+## 七、关键代码文件索引
 
 | 功能 | 文件路径 |
 |------|---------|
@@ -366,30 +700,31 @@ Step 3: calculate_prices(order, lines)
 
 ---
 
-## 六、特殊场景分析
+## 八、特殊场景分析
 
-### 6.1 订单完成时的优惠券冻结
+### 8.1 订单完成时的优惠券冻结
 
 当 Checkout 转换为 Order 时（`complete_checkout.py:_process_voucher_data_for_order`）：
 - 优惠券数据被验证并增加使用计数
 - 订单中的优惠券折扣信息被**反规范化**（denormalized），即使用当时的快照数据
 - 后续即使优惠券条件变化（如折扣值修改），已完成订单中的折扣不会自动变化
+- **但 `voucher_code` 仍保留在订单上**，持续阻断订单促销回切
 
-### 6.2 草稿订单的价格刷新
+### 8.2 草稿订单的价格刷新
 
 草稿订单的 `should_refresh_prices` 标志触发价格重算：
 - `refresh_order_base_prices_and_discounts` 会重新获取最新的渠道列表价格
 - 目录促销折扣基于最新价格重新计算
 - 优惠券折扣使用反规范化数据（`use_denormalized_data=True`）保持订单创建时的条件
-- 订单促销重新基于最新条件评估
+- 订单促销重新基于最新条件评估（但 `voucher_code` 非空时跳过）
 
-### 6.3 赠品促销与优惠券的交互
+### 8.3 赠品促销与优惠券的交互
 
 - 赠品行（`is_gift=True`）**不参与**行级优惠券折扣（`get_discounted_lines` 中跳过 `is_gift` 行）
 - 添加优惠券时会删除现有赠品行（`delete_gift_line`）
 - 优惠券优先于赠品促销
 
-### 6.4 目录促销折扣的预计算
+### 8.4 目录促销折扣的预计算
 
 目录促销折扣通过 `VariantChannelListingPromotionRule` 预计算并存储在渠道列表上（`discounted_price_amount`），这意味着：
 - 目录促销折扣不依赖于订单/结账上下文
@@ -398,7 +733,7 @@ Step 3: calculate_prices(order, lines)
 
 ---
 
-## 七、价格计算流程图示
+## 九、价格计算流程图示
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐

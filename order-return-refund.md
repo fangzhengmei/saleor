@@ -104,73 +104,87 @@ class Fulfillment(ModelWithMetadata):
 
 校验分为三层：GraphQL 层、基类 `FulfillmentRefundAndReturnProductBase`、业务函数内部。
 
-### 3.0 replace 场景错误码的当前行为与修复建议（精准分析）
+### 3.0 replace 场景错误码分析：当前行为 vs 修复建议
 
-**定位的两处调用点**：
+---
 
-| 调用位置 | 校验场景 | 当前参数 | 存在的问题 |
-|---------|---------|---------|----------|
-| `clean_fulfillment_lines` L130-136 | 已发货履约行换货 | `type="OrderLine"`, `code=None`, `line=FulfillmentLine` | ① `code` 未指定 → 默认 `INVALID_QUANTITY`<br>② `type="OrderLine"` 但 `line` 是 `FulfillmentLine` → ID 转换错误 |
-| `clean_lines` L185-191 | 未发货订单行换货 | `type="OrderLine"`, `code=None`, `line=OrderLine` | ① `code` 未指定 → 默认 `INVALID_QUANTITY` |
+#### 3.0.1 当前实际行为（Current Behavior）
 
-**证据材料（源码）**：
+**【当前行为】两处调用都未指定 code 参数，默认返回 INVALID_QUANTITY**
+
+| 调用位置 | 触发条件 | type 参数 | line 对象类型 | 当前返回的错误码 |
+|---------|---------|----------|-----------|-------------|
+| `clean_fulfillment_lines` L130-136 | `replace=True` 且 `line.order_line.variant_id is None` | `"OrderLine"` | `FulfillmentLine` | **`OrderErrorCode.INVALID_QUANTITY`**（默认值）|
+| `clean_lines` L185-191 | `replace=True` 且 `line.variant_id is None` | `"OrderLine"` | `OrderLine` | **`OrderErrorCode.INVALID_QUANTITY`**（默认值）|
+
+**当前代码证据（精确到行号）：**
 
 ```python
-# _raise_error_for_line 定义（L63-75）
+# 当前代码：_raise_error_for_line 定义（L63-75）
 @classmethod
 def _raise_error_for_line(cls, msg, type, line_id, field_name, code=None):
-    line_global_id = graphene.Node.to_global_id(type, line_id)  # type 决定 ID 前缀
+    line_global_id = graphene.Node.to_global_id(type, line_id)
     if not code:
-        code = OrderErrorCode.INVALID_QUANTITY.value  # ← 默认错误码
-    raise ValidationError(
-        {
-            field_name: ValidationError(
-                msg,
-                code=code,
-                params={field_name: line_global_id},  # params 中的 ID 依赖 type
-            )
-        }
-    )
+        code = OrderErrorCode.INVALID_QUANTITY.value  # ← 默认值！
+    raise ValidationError(...)
 
-# 调用点 1：clean_fulfillment_lines（L130-136）
+# 当前代码：clean_fulfillment_lines 调用（L129-136）
 replace = line_data.get("replace", False)
 if replace and not line.order_line.variant_id:
     cls._raise_error_for_line(
         "Unable to replace line as the assigned product doesn't exist.",
-        "OrderLine",      # ← 问题 1：type 用错（应为 FulfillmentLine）
-        line.pk,           # ← 这是 FulfillmentLine 的 pk
-        "order_line_id",   # ← 字段名也不准确
-    )                        # ← 问题 2：code 未指定（应为 NOT_FOUND）
+        "OrderLine",      # type 参数
+        line.pk,           # 这是 FulfillmentLine 的 ID！
+        "order_line_id",
+    )                        # ← code 未传！使用默认值
 
-# 调用点 2：clean_lines（L185-191）
+# 当前代码：clean_lines 调用（L184-191）
 replace = line_data.get("replace", False)
 if replace and not line.variant_id:
     cls._raise_error_for_line(
         "Unable to replace line as the assigned product doesn't exist.",
-        "OrderLine",      # ← type 正确（line 确实是 OrderLine）
-        line.pk,          # ← OrderLine 的 pk
+        "OrderLine",      # type 参数
+        line.pk,          # 这是 OrderLine 的 ID
         "order_line_id",
-    )                       # ← 问题：code 未指定（应为 NOT_FOUND）
+    )                       # ← code 未传！使用默认值
 ```
 
-**当前行为总结**：
-- **错误码不准确**：两处都返回 `INVALID_QUANTITY`，但实际是"商品不存在"问题，应为 `NOT_FOUND`
-- **clean_fulfillment_lines 中的额外问题**：`type="OrderLine"` 但传入的 `line.pk` 是 FulfillmentLine 的 ID，导致 `params` 中的 `line_global_id` 是错误格式（前缀是 `OrderLine` 但 ID 属于 `FulfillmentLine`）
+**【当前行为】clean_fulfillment_lines 中 type 参数不匹配**
 
-**修复建议**：
+在 `clean_fulfillment_lines` 中：
+- `line` 是 `FulfillmentLine` 对象
+- `type` 参数传入 `"OrderLine"`
+- `line.pk` 是 `FulfillmentLine` 的主键
+- 结果：`line_global_id = "OrderLine:" + FulfillmentLine 的 ID` → **错误格式的全局 ID**
+
+**当前行为总结：**
+
+1. ✅ **错误码不准确**：两处都返回 `INVALID_QUANTITY`，但实际是"商品不存在"
+2. ✅ **clean_fulfillment_lines 中 ID 格式错误**：`type` 与 `line` 对象类型不匹配
+
+---
+
+#### 3.0.2 修复建议（Recommended Fix）
+
+| 调用位置 | 建议修改内容 |
+|---------|-----------|
+| `clean_fulfillment_lines` L130-136 | ① `code=OrderErrorCode.NOT_FOUND.value`<br>② `type="FulfillmentLine"`<br>③ `field_name="fulfillment_line_id"` |
+| `clean_lines` L185-191 | `code=OrderErrorCode.NOT_FOUND.value` |
+
+**修复后代码示例：**
 
 ```python
-# 修复 clean_fulfillment_lines 中的调用（L130-136）
+# 修复建议：clean_fulfillment_lines 中的调用
 if replace and not line.order_line.variant_id:
     cls._raise_error_for_line(
         "Unable to replace line as the assigned product doesn't exist.",
-        "FulfillmentLine",  # 修复 1：type 改为 FulfillmentLine
+        "FulfillmentLine",  # 修复：type 改为 FulfillmentLine
         line.pk,
-        "fulfillment_line_id",  # 修复 2：字段名保持一致
-        code=OrderErrorCode.NOT_FOUND.value,  # 修复 3：指定正确错误码
+        "fulfillment_line_id",  # 修复：字段名保持一致
+        code=OrderErrorCode.NOT_FOUND.value,  # 修复：指定正确错误码
     )
 
-# 修复 clean_lines 中的调用（L185-191）
+# 修复建议：clean_lines 中的调用
 if replace and not line.variant_id:
     cls._raise_error_for_line(
         "Unable to replace line as the assigned product doesn't exist.",
@@ -181,14 +195,11 @@ if replace and not line.variant_id:
     )
 ```
 
-**参考：`OrderErrorCode` 枚举**（`saleor/order/error_codes.py:4-24`）：
+**参考：OrderErrorCode 枚举定义（`saleor/order/error_codes.py:4-24`）：**
 ```python
 class OrderErrorCode(Enum):
     INVALID_QUANTITY = "invalid_quantity"  # 数量相关错误
     NOT_FOUND = "not_found"                # 资源不存在
-    CANNOT_REFUND = "cannot_refund"
-    GIFT_CARD_LINE = "gift_card_line"
-    INVALID = "invalid"
 ```
 
 ### 3.1 Return 与 Refund 的校验差异
@@ -298,9 +309,9 @@ def quantity_unfulfilled(self):
   fulfillment_refunded_event → 无条件触发（无论 amount 是否为 0）
 ```
 
-### 4.1.1 amount 为 0 时事件触发的精确语义（统一口径）
+### 4.1.1 amount 为 0 时事件触发的精确语义（当前实际行为，统一口径）
 
-**核心代码证据**（`actions.py:2005-2055`）：
+**【当前行为】核心代码证据**（`actions.py:2005-2055`）：
 
 ```python
 def _process_refund(...):
@@ -335,7 +346,7 @@ def _process_refund(...):
     return amount
 ```
 
-**统一事件触发矩阵**：
+**【当前行为】统一事件触发矩阵**：
 
 | 场景 | amount 是否为 None | lines_to_refund 状态 | 支付网关调用 | `order_refunded()` | `fulfillment_refunded_event` |
 |-----|------------------|---------------------|------------|-----------------|----------------------------|
@@ -344,7 +355,7 @@ def _process_refund(...):
 | **手动指定（amount > 0）** | ❌ 否 | ❌ 空 dict（_calculate_refund_amount 未调用） | ✅ 是 | ✅ 是 | ✅ 是（lines 为空）|
 | **手动指定（amount = 0）** | ❌ 否 | ❌ 空 dict | ❌ 否 | ❌ 否 | ✅ 是（amount=0，lines 为空）|
 
-**`order_refunded()` 内部触发内容**（`actions.py:456-522`）：
+**【当前行为】`order_refunded()` 内部触发内容**（`actions.py:456-522`）：
 ```python
 def order_refunded(...):
     call_event(events.payment_refunded_event, ...)      # OrderEvent: PAYMENT_REFUNDED
@@ -352,7 +363,7 @@ def order_refunded(...):
     call_order_events(manager, [ORDER_REFUNDED, ...], ...)  # Webhook
 ```
 
-**`fulfillment_refunded_event` 记录内容**（`events.py:650-672`）：
+**【当前行为】`fulfillment_refunded_event` 记录内容**（`events.py:650-672`）：
 ```python
 {
     "lines": [{quantity, line_pk, item}],  # ← 手动金额时为空列表
@@ -361,12 +372,12 @@ def order_refunded(...):
 }
 ```
 
-**边界条件的一致结论**：
+**【当前行为】边界条件的一致结论**：
 
 1. **`fulfillment_refunded_event` 是无条件触发的**：
    - 即使 `amount=0` 也会在事务提交后执行
    - 这使得"零元退款"操作在审计日志中可追溯
-   - 这是**设计意图**：Fulfillment 级别的退款标记应始终记录
+   - 这是**当前设计意图**：Fulfillment 级别的退款标记应始终记录
 
 2. **`order_refunded()` 仅在 `amount > 0` 时触发**：
    - 包含 `PAYMENT_REFUNDED` OrderEvent、退款邮件、`ORDER_REFUNDED` Webhook
@@ -684,9 +695,9 @@ Saleor 的事件系统分为两层：**OrderEvent**（内部审计记录）和 *
 6. call_order_event(ORDER_UPDATED)
 ```
 
-### 6.3 事件语义的关键差异
+### 6.3 事件语义的关键差异（当前实际行为）
 
-**`FULFILLMENT_RETURNED` vs `FULFILLMENT_REFUNDED`**：
+**【当前行为】`FULFILLMENT_RETURNED` vs `FULFILLMENT_REFUNDED`**：
 
 | 维度 | FULFILLMENT_RETURNED | FULFILLMENT_REFUNDED |
 |-----|---------------------|---------------------|
@@ -697,7 +708,7 @@ Saleor 的事件系统分为两层：**OrderEvent**（内部审计记录）和 *
 | 触发方式 | `transaction.on_commit`（延迟） | `transaction.on_commit`（延迟） |
 | lines 内容 | 始终非空（参与退货的行） | 可能为空（手动金额或所有行已退款） |
 
-**`PAYMENT_REFUNDED` vs `FULFILLMENT_REFUNDED`**：
+**【当前行为】`PAYMENT_REFUNDED` vs `FULFILLMENT_REFUNDED`**：
 
 | 维度 | PAYMENT_REFUNDED | FULFILLMENT_REFUNDED |
 |-----|-----------------|---------------------|
@@ -708,9 +719,9 @@ Saleor 的事件系统分为两层：**OrderEvent**（内部审计记录）和 *
 | 触发方式 | 同步 | `transaction.on_commit`（延迟） |
 | amount=0 时 | 不触发 | 触发（amount=0） |
 
-**重要统一结论**：在退货+退款场景中，`FULFILLMENT_REFUNDED` 和 `FULFILLMENT_RETURNED` 都会被触发。前者在 `_process_refund` 事务提交后，后者在 `create_return_fulfillment` 事务提交后。两者记录的行可能不同——`FULFILLMENT_REFUNDED` 的 `lines_to_refund` 排除了 `replace=True` 的换货行，而 `FULFILLMENT_RETURNED` 的 `returned_lines` 包含所有非换货行。
+**【当前行为】重要统一结论**：在退货+退款场景中，`FULFILLMENT_REFUNDED` 和 `FULFILLMENT_RETURNED` 都会被触发。前者在 `_process_refund` 事务提交后，后者在 `create_return_fulfillment` 事务提交后。两者记录的行可能不同——`FULFILLMENT_REFUNDED` 的 `lines_to_refund` 排除了 `replace=True` 的换货行，而 `FULFILLMENT_RETURNED` 的 `returned_lines` 包含所有非换货行。
 
-**额外边界条件（统一表述）**：
+**【当前行为】额外边界条件（统一表述）**：
 
 1. **手动指定金额时**：`FULFILLMENT_REFUNDED` 的 `lines` 参数为空列表，因为 `_calculate_refund_amount` 未被调用，`lines_to_refund` 字典始终为空。这是一个已知的设计取舍。
 
@@ -902,19 +913,32 @@ create_fulfillments_for_returned_products()
 
 ## 十、口径统一检查清单
 
-为确保文档各部分表述一致，以下是关键结论的交叉验证：
+为确保文档各部分表述一致，以下是关键结论的交叉验证，**明确区分当前实际行为与修复建议**：
 
-### 10.1 replace 场景错误码（已统一）
+---
+
+### 10.1 replace 场景错误码（已统一区分当前行为 vs 修复建议）
+
+**【当前实际行为】文档各部分一致表述：**
 
 | 文档位置 | 结论 | 一致性 |
 |---------|------|--------|
-| 3.0 节 | `code` 未指定 → 默认 `INVALID_QUANTITY`，应为 `NOT_FOUND` | ✅ |
-| 3.0 节 | `clean_fulfillment_lines` 中 `type="OrderLine"` 但实际是 `FulfillmentLine` → ID 转换错误 | ✅ |
+| 3.0.1 节 | 两处调用都未指定 `code` 参数 → 默认 `OrderErrorCode.INVALID_QUANTITY` | ✅ |
+| 3.0.1 节 | `clean_fulfillment_lines` 中 `type="OrderLine"` 但 `line` 是 `FulfillmentLine` → 全局 ID 格式错误 | ✅ |
 | 核心代码索引 | `_raise_error_for_line` 位置 L63 | ✅ |
 
-**证据**：`fulfillment_refund_and_return_product_base.py` L63-75, L130-136, L185-191
+**【修复建议】文档各部分一致表述：**
 
-### 10.2 amount=0 时事件触发（已统一）
+| 文档位置 | 结论 | 一致性 |
+|---------|------|--------|
+| 3.0.2 节 | `clean_fulfillment_lines` 调用建议：`code=NOT_FOUND`, `type=FulfillmentLine`, `field_name=fulfillment_line_id` | ✅ |
+| 3.0.2 节 | `clean_lines` 调用建议：`code=NOT_FOUND` | ✅ |
+
+**证据代码位置**：`fulfillment_refund_and_return_product_base.py` L63-75, L130-136, L185-191
+
+---
+
+### 10.2 amount=0 时事件触发（当前实际行为，已统一）
 
 | 文档位置 | 结论 | 一致性 |
 |---------|------|--------|
@@ -927,9 +951,11 @@ create_fulfillments_for_returned_products()
 | 6.3 节 | `FULFILLMENT_REFUNDED` 的 `lines` 可能为空 | ✅ |
 | 9.1 节 | 数据链路图中标注了"无条件触发" | ✅ |
 
-**证据**：`actions.py` L2005-2055
+**证据代码位置**：`actions.py` L2005-2055
 
-### 10.3 退款金额与折扣关系（已统一）
+---
+
+### 10.3 退款金额与折扣关系（当前实际行为，已统一）
 
 | 文档位置 | 结论 | 一致性 |
 |---------|------|--------|
@@ -937,9 +963,11 @@ create_fulfillments_for_returned_products()
 | 4.3.1 节 | Voucher 折扣不影响退款金额（订单级折扣） | ✅ |
 | 4.3.1 节 | `unit_discount_amount` 不参与退款计算（已体现在单价中） | ✅ |
 
-**证据**：`order/utils.py` L230-327, `order/actions.py` L1967, L1981
+**证据代码位置**：`order/utils.py` L230-327, `order/actions.py` L1967, L1981
 
-### 10.4 换货行行为（已统一）
+---
+
+### 10.4 换货行行为（当前实际行为，已统一）
 
 | 文档位置 | 结论 | 一致性 |
 |---------|------|--------|
@@ -947,7 +975,25 @@ create_fulfillments_for_returned_products()
 | 6.3 节 | 换货行不出现在退款事件中 | ✅ |
 | 9.1 节 | 先按 `replace` 分组再处理 | ✅ |
 
-**证据**：`actions.py` L1898-1899, L1912-1913
+**证据代码位置**：`actions.py` L1898-1899, L1912-1913
+
+---
+
+### 10.5 标注规范总结
+
+文档中所有结论统一使用以下标注方式：
+
+| 标注前缀 | 含义 |
+|---------|------|
+| **【当前行为】** | 描述代码实际执行的行为 |
+| **【修复建议】** | 提出的代码改进建议（非当前行为） |
+| **【当前设计意图】** | 基于代码分析推断的设计考量 |
+
+所有章节标题中也明确标注：
+- `3.0.1 当前实际行为`
+- `3.0.2 修复建议`
+- `4.1.1 ...（当前实际行为，统一口径）`
+- `6.3 ...（当前实际行为）`
 
 ---
 

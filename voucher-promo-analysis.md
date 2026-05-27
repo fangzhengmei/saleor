@@ -87,13 +87,27 @@ BaseDiscount (抽象)
 
 ### 2.3 优惠券与促销的前置互斥判定
 
-这是最关键的冲突检测点。**核心原则：订单级促销与优惠券不共存。**
+这是最关键的冲突检测点。**核心原则：所有类型的优惠券与订单促销（ORDER_PROMOTION）均不共存。**
+
+#### 判定依据：`voucher_code` 字段
+
+`Checkout.voucher_code` 和 `Order.voucher_code` 都是 `CharField(max_length=255, null=True)` 类型的简单字符串字段。**无论优惠券是什么类型**（整单、运费、行级、apply_once_per_order），只要优惠券被应用，该字段就会被设置。订单促销的跳过逻辑直接检查此字段：
+
+```python
+if checkout.voucher_code:          # checkout.py:227
+if order.voucher_code or ...:      # order.py:189
+```
+
+这是一个类型无关的检查——仅凭 `voucher_code` 非空就跳过订单促销，不区分优惠券的具体类型。
 
 #### Checkout 场景
 
 在 `saleor/checkout/utils.py:747` `add_voucher_to_checkout`：
 ```python
 # 当添加优惠券时，显式删除订单促销折扣和赠品
+# 此操作对所有优惠券类型都执行
+checkout.voucher_code = voucher_code.code          # ← 所有类型都设置此字段
+...
 CheckoutDiscount.objects.filter(
     checkout=checkout_info.checkout,
     type=DiscountType.ORDER_PROMOTION,
@@ -101,23 +115,57 @@ CheckoutDiscount.objects.filter(
 delete_gift_line(checkout_info.checkout, lines)
 ```
 
-在 `saleor/discount/utils/checkout.py:227` `create_checkout_discount_objects_for_order_promotions`：
+在 `saleor/discount/utils/checkout.py:214` `create_checkout_discount_objects_for_order_promotions`：
 ```python
 # 订单促销只在未设置优惠券时才生效
+# 检查的是 checkout.voucher_code，不区分优惠券类型
 if checkout.voucher_code:
     _clear_checkout_discount(checkout_info, lines_info, save)
     return None
 ```
 
+在 `saleor/checkout/utils.py:626` `recalculate_checkout_discount`：
+```python
+# 先处理优惠券（所有类型），再尝试订单促销——但订单促销会因 voucher_code 已设置而跳过
+if voucher := checkout_info.voucher:
+    ...
+    checkout.save(...)
+# 此调用会因 checkout.voucher_code 已被设置而直接返回 None
+create_checkout_discount_objects_for_order_promotions(checkout_info, lines, save=True)
+```
+
 #### Order 场景
 
-在 `saleor/discount/utils/order.py:189` `create_order_discount_objects_for_order_promotions`：
+在 `saleor/discount/utils/order.py:181` `create_order_discount_objects_for_order_promotions`：
 ```python
-# 如果设置了优惠券或人工折扣，则跳过订单促销
+# 如果设置了优惠券（任何类型）或人工折扣，则跳过订单促销
+# voucher_code 字段在所有优惠券类型下均非空
 if order.voucher_code or order.discounts.filter(type=DiscountType.MANUAL):
     _clear_order_discount(order, lines_info)
     return
 ```
+
+在 `saleor/checkout/complete_checkout.py:741` 结账转订单时：
+```python
+# _process_voucher_data_for_order 对所有优惠券类型都返回 voucher_code
+# 该值随后通过 **order_data 写入 Order.voucher_code
+order_data.update(_process_voucher_data_for_order(checkout_info))
+# _process_voucher_data_for_order 返回 {"voucher": voucher, "voucher_code": voucher_code.code}
+# 不区分优惠券类型
+```
+
+#### 各类型优惠券对订单促销的影响总结
+
+| 优惠券类型 | `voucher_code` 是否设置 | 是否阻断订单促销 | 代码依据 |
+|-----------|----------------------|----------------|---------|
+| `ENTIRE_ORDER`（非 apply_once_per_order） | ✅ 是 | ✅ 阻断 | `checkout/utils.py:767` 设置 `voucher_code` |
+| `ENTIRE_ORDER` + `apply_once_per_order=True` | ✅ 是 | ✅ 阻断 | 同上，`voucher_code` 照常设置 |
+| `SHIPPING` | ✅ 是 | ✅ 阻断 | 同上 |
+| `SPECIFIC_PRODUCT` | ✅ 是 | ✅ 阻断 | 同上 |
+
+**结论：不存在任何类型的优惠券可以与订单促销并存。**
+
+但注意：优惠券与**目录促销（Catalogue Promotion）**可以叠加，因为目录促销作用于行级单价，而订单促销作用于订单小计，两者不共享互斥检查逻辑。
 
 ---
 
@@ -220,12 +268,20 @@ Step 3: calculate_prices(order, lines)
 | 折扣A ↓ \ 折扣B → | 目录促销 | 行级优惠券 | 整单优惠券 | 运费优惠券 | 订单促销 | 人工行折扣 | 人工整单折扣 |
 |---------------------|---------|-----------|-----------|-----------|---------|-----------|-------------|
 | **目录促销** | - | ✅ 叠加 | ✅ 叠加 | ✅ 叠加 | ✅ 叠加 | ❌ 互斥 | ✅ 叠加 |
-| **行级优惠券** | ✅ 叠加 | - | ✅ 叠加 | ✅ 叠加 | ✅ 叠加 | ❌ 互斥 | ✅ 叠加 |
+| **行级优惠券** | ✅ 叠加 | - | ✅ 叠加 | ✅ 叠加 | ❌ 互斥 | ❌ 互斥 | ✅ 叠加 |
 | **整单优惠券** | ✅ 叠加 | ✅ 叠加 | - | ✅ 叠加 | ❌ 互斥 | ✅ 叠加 | ❌ 互斥 |
-| **运费优惠券** | ✅ 叠加 | ✅ 叠加 | ✅ 叠加 | - | ✅ 叠加 | ✅ 叠加 | ✅ 叠加 |
-| **订单促销** | ✅ 叠加 | ✅ 叠加 | ❌ 互斥 | ✅ 叠加 | - | ✅ 叠加 | ❌ 互斥 |
+| **运费优惠券** | ✅ 叠加 | ✅ 叠加 | ✅ 叠加 | - | ❌ 互斥 | ✅ 叠加 | ✅ 叠加 |
+| **订单促销** | ✅ 叠加 | ❌ 互斥 | ❌ 互斥 | ❌ 互斥 | - | ✅ 叠加 | ❌ 互斥 |
 | **人工行折扣** | ❌ 互斥 | ❌ 互斥 | ✅ 叠加 | ✅ 叠加 | ✅ 叠加 | - | ✅ 叠加 |
 | **人工整单折扣** | ✅ 叠加 | ✅ 叠加 | ❌ 互斥 | ✅ 叠加 | ❌ 互斥 | ✅ 叠加 | - |
+
+**互斥依据说明：**
+
+- **行级优惠券 ❌ 订单促销**：`checkout.voucher_code` / `order.voucher_code` 在所有优惠券类型下均被设置，订单促销计算前统一检查此字段并跳过（`checkout.py:227`、`order.py:189`）
+- **运费优惠券 ❌ 订单促销**：同上，`voucher_code` 对运费优惠券同样被设置
+- **整单优惠券 ❌ 订单促销**：同上
+- **目录促销 ✅ 所有优惠券**：目录促销作用于行级单价（通过 `VariantChannelListingPromotionRule.discounted_price_amount` 预计算），与订单促销的订单小计级检查不冲突；行级优惠券在 `calculate_base_line_total_price` 中基于已扣目录促销的价格继续扣减
+- **人工行折扣 ❌ 所有行级折扣**：`unique_type` 唯一约束 + 显式删除逻辑
 
 ### 4.2 冲突仲裁的实现机制
 
@@ -259,19 +315,34 @@ Step 3: calculate_prices(order, lines)
 原始单价
   │
   ├── ① 目录促销（行级，固定或百分比，先扣）
+  │     可与所有类型优惠券叠加
   │
   ├── ② 行级优惠券（行级，基于已扣目录促销的价格再扣）
+  │     可与目录促销叠加，但阻断订单促销
   │
   ├── ③ 人工行折扣（如存在，会清除①和②，独立计算）
   │
-  ├── ④ 整单优惠券（基于前三步后的小计）
-  │     或
-  │     订单促销（基于前三步后的小计，与④互斥）
+  ├── ④ 整单级折扣（三选一，互斥，有优先级）
+  │     ├─ 整单优惠券 (ENTIRE_ORDER)      ──┐
+  │     ├─ 订单促销 (ORDER_PROMOTION)      ├── 三者互斥
+  │     └─ 人工整单折扣 (MANUAL)          ──┘
+  │     优先级：整单优惠券 > 订单促销（voucher_code 检查使订单促销跳过）
+  │             人工整单折扣 > 整单优惠券（manual 检查使整单优惠券被删除）
   │
   └── ⑤ 运费优惠券（基于原始运费）
-        和
-        人工整单折扣（基于小计+运费，与④互斥）
+        可与目录促销、行级优惠券叠加，但阻断订单促销
 ```
+
+**优先级规则总结：**
+
+| 冲突场景 | 仲裁结果 | 代码位置 |
+|---------|---------|---------|
+| 任意优惠券 vs 订单促销 | **优惠券胜**，订单促销被跳过/删除 | `checkout.py:227`、`order.py:189`、`checkout/utils.py:791` |
+| 整单优惠券 vs 人工整单折扣 | **人工胜**，优惠券订单折扣被删除 | `voucher.py:398` |
+| 行级优惠券 vs 目录促销 | **叠加**，行级优惠券基于已扣目录促销的价格计算 | `base_calculations.py:38` |
+| 人工行折扣 vs 目录促销/行级优惠券 | **人工胜**，行级折扣被清除 | `checkout.py:143`、`order.py:147` |
+| 多条目录促销规则 | **只取最优**，折扣金额最大的那条 | `promotion.py:116` |
+| 多条订单促销规则 | **只取最优**，折扣金额最大的那条 | `promotion.py:718` |
 
 ---
 
@@ -340,12 +411,14 @@ Step 3: calculate_prices(order, lines)
 │  ┌─────────────────────┐                                        │
 │  │ ① 目录促销折扣       │  从 VariantChannelListingPromotionRule │
 │  │ (每条变体只取最优)    │  读取预计算的 discounted_price_amount │
+│  │ 可与所有优惠券叠加    │                                        │
 │  └─────────────────────┘                                        │
 │       │                                                         │
 │       ▼                                                         │
 │  ┌─────────────────────┐                                        │
 │  │ ② 行级优惠券折扣     │  SPECIFIC_PRODUCT / apply_once_per_order│
 │  │ (基于已扣①的价格)    │  通过 voucher.get_discount_amount_for   │
+│  │ 阻断订单促销          │                                        │
 │  └─────────────────────┘                                        │
 │       │                                                         │
 │       ▼                                                         │
@@ -353,15 +426,24 @@ Step 3: calculate_prices(order, lines)
 │       │                                                         │
 │       ▼                                                         │
 │  ┌──────────────────────────────────┐                          │
-│  │ ③ 整单级折扣（三选一，互斥）       │                          │
-│  │   ├─ 整单优惠券 (ENTIRE_ORDER)    │                          │
-│  │   ├─ 订单促销 (ORDER_PROMOTION)   │                          │
-│  │   └─ 人工整单折扣 (MANUAL)        │                          │
+│  │ ③ 整单级折扣（三选一，互斥，有优先级）│                          │
+│  │   ├─ 整单优惠券 (ENTIRE_ORDER)   │ 优先级最高                │
+│  │   ├─ 订单促销 (ORDER_PROMOTION)  │ 若有任何优惠券则跳过       │
+│  │   └─ 人工整单折扣 (MANUAL)       │ 若有则删除整单优惠券       │
 │  │ 基于小计按比例分摊到各行           │                          │
 │  └──────────────────────────────────┘                          │
 │       │                                                         │
 │       ▼                                                         │
+│  ┌─────────────────────┐                                        │
+│  │ ④ 运费优惠券折扣     │  基于原始运费计算                      │
+│  │ 阻断订单促销          │  与目录促销/行级优惠券可共存          │
+│  └─────────────────────┘                                        │
+│       │                                                         │
+│       ▼                                                         │
 │  运费 + 小计（已扣③） → 总计                                       │
 │                                                                 │
+│ ─────────────────────────────────────                          │
+│ 关键互斥：任意类型优惠券 → voucher_code 非空 → 订单促销完全跳过 │
+│ 关键叠加：目录促销 → 行级优惠券（基于已扣价格继续扣）             │
 └─────────────────────────────────────────────────────────────────┘
 ```

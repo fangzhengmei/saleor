@@ -2,113 +2,418 @@
 
 ## 1. 概述
 
-Saleor 的插件系统采用 **责任链模式** + **延迟加载** 的设计，核心类为 `PluginsManager`（位于 `saleor/plugins/manager.py`）。插件用于扩展 Saleor 的核心功能，包括：
+Saleor 的插件系统采用 **责任链模式** + **延迟加载** 的设计，核心类为 `PluginsManager`（位于 `saleor/plugins/manager.py`）。插件用于扩展 Saleor 的核心功能，包括税务计算、支付网关、邮件通知、Webhook 分发、第三方认证等。
 
-- 税务计算（如 Avalara 插件）
-- 支付网关（如 Stripe、Braintree）
-- 邮件通知
-- Webhook 分发
-- 第三方认证（如 OpenID Connect）
+本文档重点分析三个容易产生理解偏差的核心问题：
+1. 外部插件注入应用列表的完整注册流程
+2. 无 channel 情况下插件集合的组成及调用顺序
+3. Manager 实例的生命周期与读写库路径的差异
 
-## 2. 插件注册配置
+---
 
-### 2.1 配置文件定义 (`saleor/settings.py:892-922`)
+## 2. 外部插件注入应用列表的注册流程
 
-插件通过 settings 中的 `PLUGINS` 列表进行注册，分为两类：
+### 2.1 完整注册流程详解 (`saleor/settings.py:898-922`)
+
+外部插件通过 Python `entry_points` 机制实现自动发现和注入，完整流程如下：
 
 ```python
-# 内置插件列表
+# saleor/settings.py:898-922
+
+# 1. 内置插件列表（硬编码在代码中）
 BUILTIN_PLUGINS = [
-    "saleor.plugins.webhook.plugin.WebhookPlugin",
     "saleor.plugins.avatax.plugin.DeprecatedAvataxPlugin",
+    "saleor.plugins.webhook.plugin.WebhookPlugin",
     "saleor.payment.gateways.stripe.plugin.StripeGatewayPlugin",
     "saleor.plugins.user_email.plugin.UserEmailPlugin",
     "saleor.plugins.openid_connect.plugin.OpenIDConnectPlugin",
     # ... 更多内置插件
 ]
 
-# 通过 entry_points 动态发现的外部插件
+# 2. 通过 entry_points 动态发现外部插件
 EXTERNAL_PLUGINS = []
 installed_plugins = importlib.metadata.entry_points(group="saleor.plugins")
-for entry_point in installed_plugins:
-    plugin_path = f"{entry_point.module}.{entry_point.attr}"
-    EXTERNAL_PLUGINS.append(plugin_path)
 
-# 最终插件列表（决定调用优先级！）
+for entry_point in installed_plugins:
+    # 2.1 构建插件类的完整路径
+    plugin_path = f"{entry_point.module}.{entry_point.attr}"
+    
+    # 2.2 去重检查：避免重复注册
+    if plugin_path not in BUILTIN_PLUGINS and plugin_path not in EXTERNAL_PLUGINS:
+        
+        # 2.3 将插件所属的 Django App 注入 INSTALLED_APPS
+        # entry_point.name 对应插件包的 Django App 名称
+        if entry_point.name not in INSTALLED_APPS:
+            INSTALLED_APPS.append(entry_point.name)
+        
+        # 2.4 将插件类路径添加到外部插件列表
+        EXTERNAL_PLUGINS.append(plugin_path)
+
+# 3. 最终插件列表（顺序决定调用优先级！）
 PLUGINS: list[str] = BUILTIN_PLUGINS + EXTERNAL_PLUGINS
 ```
 
-**关键点**：`PLUGINS` 列表的顺序直接决定了插件执行的优先级，排在前面的插件先被调用。
+### 2.2 Entry Points 配置示例
 
-### 2.2 插件基类定义 (`saleor/plugins/base_plugin.py:100-150`)
+外部插件包需要在 `pyproject.toml` 或 `setup.py` 中声明 entry points：
 
-所有插件必须继承 `BasePlugin` 抽象类：
-
-```python
-class BasePlugin:
-    # 插件唯一标识（用于数据库存储和配置查找）
-    PLUGIN_ID = ""
-    PLUGIN_NAME = ""
-    PLUGIN_DESCRIPTION = ""
-    
-    # 是否支持按通道配置（True = 每个 Channel 可独立配置）
-    CONFIGURATION_PER_CHANNEL = True
-    
-    # 默认配置结构
-    DEFAULT_CONFIGURATION = []
-    DEFAULT_ACTIVE = False
-    
-    # 配置字段类型定义
-    CONFIG_STRUCTURE = None
-    
-    # 是否隐藏（不在管理界面显示）
-    HIDDEN = False
+```toml
+# pyproject.toml 示例
+[project.entry-points."saleor.plugins"]
+my_custom_plugin = "my_custom_plugin.plugin:MyCustomPlugin"
 ```
 
-### 2.3 插件配置模型 (`saleor/plugins/models.py:9-25`)
+其中：
+- `entry_point.name` = `"my_custom_plugin"` → 注入到 `INSTALLED_APPS`
+- `entry_point.module` = `"my_custom_plugin.plugin"`
+- `entry_point.attr` = `"MyCustomPlugin"`
+- 最终 `plugin_path` = `"my_custom_plugin.plugin:MyCustomPlugin"`
 
-插件配置存储在 `PluginConfiguration` 表中：
+### 2.3 注入到 INSTALLED_APPS 的意义
 
-```python
-class PluginConfiguration(models.Model):
-    identifier = models.CharField(max_length=128)  # 对应 PLUGIN_ID
-    name = models.CharField(max_length=128)
-    channel = models.ForeignKey(Channel, null=True, on_delete=models.CASCADE)
-    description = models.TextField(blank=True)
-    active = models.BooleanField(default=False)
-    configuration = JSONField(default=dict)  # 实际配置数据
-    
-    class Meta:
-        unique_together = ("identifier", "channel")  # 联合唯一约束
+将 `entry_point.name` 添加到 Django 的 `INSTALLED_APPS` 有以下作用：
+
+1. **Django App 初始化**：触发插件包的 `apps.py` 中的 `AppConfig.ready()` 方法
+2. **模型发现**：Django 能够发现插件包中定义的模型
+3. **管理命令发现**：插件包中定义的 `management/commands` 可被发现
+4. **迁移发现**：插件包的 `migrations` 目录可被 Django 迁移系统识别
+
+### 2.4 注册流程时序图
+
+```
+应用启动
+    ↓
+加载 settings.py
+    ↓
+INSTALLED_APPS 初始化（内置 Django App）
+    ↓
+执行 PLUGINS 注册逻辑
+    ↓
+遍历 entry_points(group="saleor.plugins")
+    ├─> 构建 plugin_path = module.attr
+    ├─> 去重检查
+    ├─> 注入 entry_point.name 到 INSTALLED_APPS
+    └─> 添加 plugin_path 到 EXTERNAL_PLUGINS
+    ↓
+PLUGINS = BUILTIN_PLUGINS + EXTERNAL_PLUGINS
+    ↓
+Django 完成 App 初始化（调用各 App 的 ready()）
 ```
 
-## 3. 插件管理器初始化与加载
+---
 
-### 3.1 管理器构造 (`saleor/plugins/manager.py:131-142`)
+## 3. 无 channel 情况下插件集合的组成及调用顺序
+
+这是最容易产生理解偏差的部分。**有 channel 和无 channel 场景下插件集合的组成逻辑完全不同。**
+
+### 3.1 有 channel 场景（明确指定 channel_slug）
 
 ```python
-class PluginsManager(PaymentInterface):
-    # 类级缓存
-    plugins_per_channel: dict[str, list["BasePlugin"]] = {}
-    global_plugins: list["BasePlugin"] = []
-    all_plugins: list["BasePlugin"] = []
+# saleor/plugins/manager.py:2488-2508
+def get_plugins(self, channel_slug: str | None = None, ...):
+    if channel_slug is not None:
+        # 触发该 channel 的插件加载
+        self._ensure_channel_plugins_loaded(channel_slug)
+        plugins = self.plugins_per_channel[channel_slug]
+    ...
+```
 
-    def __init__(self, plugins: list[str], requestor_getter=None, allow_replica=True):
-        self.plugins = plugins  # PLUGINS 配置列表
-        self._allow_replica = allow_replica
-        self.all_plugins = []
-        self.global_plugins = []
-        self.plugins_per_channel = defaultdict(list)
+`plugins_per_channel[channel_slug]` 的组成顺序（`saleor/plugins/manager.py:171-199`）：
+
+```
+1. 遍历 PLUGINS 配置
+   └─> 对 CONFIGURATION_PER_CHANNEL=True 的插件
+       └─> 创建该 channel 专属实例 → 按 PLUGINS 顺序加入列表
+
+2. 追加全局插件（CONFIGURATION_PER_CHANNEL=False 的插件）
+   └─> 按 PLUGINS 顺序追加在列表末尾
+
+最终顺序：[通道插件A, 通道插件B, ..., 全局插件X, 全局插件Y, ...]
+```
+
+### 3.2 无 channel 场景（channel_slug=None）
+
+这是理解的关键！无 channel 时返回的是 `all_plugins` 列表：
+
+```python
+# saleor/plugins/manager.py:2488-2508
+def get_plugins(self, channel_slug: str | None = None, ...):
+    if channel_slug is not None:
+        ...
+    else:
+        # 只加载全局插件，不加载任何通道插件！
+        self._ensure_channel_plugins_loaded(None)
+        plugins = self.all_plugins
+```
+
+**关键点**：`_ensure_channel_plugins_loaded(None)` **只加载全局插件**，不加载任何通道插件。
+
+让我们看 `_ensure_channel_plugins_loaded(None)` 的实现（`saleor/plugins/manager.py:154-169`）：
+
+```python
+def _ensure_channel_plugins_loaded(self, channel_slug: str | None, ...):
+    # 当 channel_slug is None 时，只执行这段代码：
+    if channel_slug is None and not self.loaded_global:
+        global_db_config = self._get_db_plugin_configs(None)
         
-        # 延迟加载标记
-        self.loaded_all_channels = False
-        self.loaded_channels: set[str] = set()
-        self.loaded_global = False
-        
-        self.requestor_getter = requestor_getter  # 获取当前请求用户
+        for plugin_path in self.plugins:  # 按 PLUGINS 顺序遍历
+            PluginClass = import_string(plugin_path)
+            # 只加载 CONFIGURATION_PER_CHANNEL=False 的插件（全局插件）
+            if not getattr(PluginClass, "CONFIGURATION_PER_CHANNEL", False):
+                plugin = self._load_plugin(PluginClass, global_db_config, ...)
+                self.global_plugins.append(plugin)
+                self.all_plugins.append(plugin)  # 按 PLUGINS 顺序添加
+        self.loaded_global = True
+    
+    # 注意：channel_slug is None 时，下面这段代码不会执行！
+    if channel_slug is not None and channel_slug not in self.loaded_channels:
+        ...  # 加载通道插件的逻辑
 ```
 
-### 3.2 延迟加载机制 (`saleor/plugins/manager.py:151-199`)
+### 3.3 all_plugins 的填充顺序（关键！）
+
+`all_plugins` 是一个扁平列表，其填充顺序**完全取决于加载触发顺序**：
+
+#### 场景 A：先触发无 channel 的调用
+
+```
+调用 get_plugins(channel_slug=None)
+    ↓
+_ensure_channel_plugins_loaded(None)
+    ↓
+加载全局插件（按 PLUGINS 顺序）
+    ↓
+all_plugins = [全局插件1, 全局插件2, ...]
+    ↓
+后续调用 get_plugins(channel_slug="channel-usd")
+    ↓
+加载通道插件（按 PLUGINS 顺序）
+    ↓
+all_plugins = [全局插件1, 全局插件2, ..., 通道插件A, 通道插件B, ...]
+```
+
+**无 channel 调用顺序**：全局插件按 PLUGINS 顺序调用，通道插件不会被调用。
+
+#### 场景 B：先触发某 channel 的调用
+
+```
+调用 get_plugins(channel_slug="channel-usd")
+    ↓
+_ensure_channel_plugins_loaded("channel-usd")
+    ├─> 先调用 _ensure_channel_plugins_loaded(None) 加载全局插件
+    │   └─> all_plugins = [全局插件1, 全局插件2, ...]
+    └─> 加载 "channel-usd" 的通道插件
+        └─> all_plugins = [全局插件1, 全局插件2, ..., 通道插件A, 通道插件B, ...]
+    ↓
+后续调用 get_plugins(channel_slug=None)
+    ↓
+all_plugins 已包含：[全局插件1, 全局插件2, ..., 通道插件A, 通道插件B, ...]
+```
+
+**无 channel 调用顺序**：全局插件按 PLUGINS 顺序在前，已加载的通道插件按 PLUGINS 顺序在后。
+
+#### 场景 C：通过 get_all_plugins() 触发
+
+```python
+# saleor/plugins/manager.py:2480-2486
+def get_all_plugins(self, active_only=False):
+    if not self.loaded_all_channels:
+        # 遍历数据库中所有 Channel
+        channels = Channel.objects.using(self.database).all()
+        for channel in channels.iterator(chunk_size=1000):
+            # 按 Channel 在数据库中的顺序加载
+            self._ensure_channel_plugins_loaded(channel.slug, channel=channel)
+        self.loaded_all_channels = True
+    return self.get_plugins(active_only=active_only)
+```
+
+**all_plugins 顺序**：
+1. 全局插件（按 PLUGINS 顺序）
+2. 第一个 Channel 的通道插件（按 PLUGINS 顺序）
+3. 第二个 Channel 的通道插件（按 PLUGINS 顺序）
+4. ... 依此类推，按数据库中 Channel 的顺序
+
+### 3.4 无 channel 场景的调用总结
+
+| 触发顺序 | all_plugins 组成 | 无 channel 调用顺序 |
+|---------|----------------|-------------------|
+| 先调用无 channel | [全局插件按 PLUGINS 顺序] | 只有全局插件，按 PLUGINS 顺序 |
+| 先调用 channel-A | [全局插件按 PLUGINS 顺序, channel-A 通道插件按 PLUGINS 顺序] | 全局插件在前，channel-A 通道插件在后，各自按 PLUGINS 顺序 |
+| 调用 get_all_plugins() | [全局插件, channel-A 插件, channel-B 插件, ...] | 全局插件在前，各通道插件按数据库顺序追加，每类内部按 PLUGINS 顺序 |
+
+### 3.5 无 channel 场景的使用场景
+
+无 channel 的插件调用主要用于：
+
+1. **全局事件**：如 `customer_created`、`product_created` 等不依赖特定 channel 的事件
+2. **跨通道操作**：如 `order_bulk_created` 批量订单创建
+3. **全局认证**：如 `authenticate_user`、`external_obtain_access_tokens`
+4. **管理后台查询**：查询所有插件的配置列表
+
+---
+
+## 4. Manager 实例的生命周期与读写库路径的差异
+
+### 4.1 Manager 实例的创建入口 (`saleor/plugins/manager.py:2818-2826`)
+
+```python
+def get_plugins_manager(
+    allow_replica: bool,
+    requestor_getter: Callable[[], "Requestor"] | None = None,
+) -> PluginsManager:
+    with tracer.start_as_current_span("get_plugins_manager"):
+        if allow_replica:
+            return PluginsManager(settings.PLUGINS, requestor_getter, allow_replica)
+        with allow_writer():
+            return PluginsManager(settings.PLUGINS, requestor_getter, allow_replica)
+```
+
+### 4.2 读写库路径的选择
+
+`PluginsManager` 通过 `_allow_replica` 参数决定使用哪个数据库连接：
+
+```python
+# saleor/plugins/manager.py:96-102
+@property
+def database(self):
+    return (
+        settings.DATABASE_CONNECTION_REPLICA_NAME  # "replica"
+        if self._allow_replica
+        else settings.DATABASE_CONNECTION_DEFAULT_NAME  # "default"
+    )
+```
+
+数据库配置（`saleor/settings.py:123-149`）：
+
+```python
+DATABASE_CONNECTION_DEFAULT_NAME = "default"
+DATABASE_CONNECTION_REPLICA_NAME = "replica"
+
+DATABASES = {
+    DATABASE_CONNECTION_DEFAULT_NAME: dj_database_url.config(
+        env="DATABASE_URL",  # 主库连接
+        default="postgres://saleor:saleor@localhost:5432/saleor",
+    ),
+    DATABASE_CONNECTION_REPLICA_NAME: dj_database_url.config(
+        env="DATABASE_URL_REPLICA",  # 从库连接，默认与主库相同
+        default="postgres://saleor:saleor@localhost:5432/saleor",
+        test_options={"MIRROR": DATABASE_CONNECTION_DEFAULT_NAME},
+    ),
+}
+```
+
+### 4.3 allow_writer() 的作用
+
+当 `allow_replica=False` 时，必须使用 `allow_writer()` 上下文管理器：
+
+```python
+# saleor/plugins/manager.py:2825
+with allow_writer():
+    return PluginsManager(settings.PLUGINS, requestor_getter, allow_replica)
+```
+
+`allow_writer()` 是 Saleor 的数据库路由保护机制，确保：
+- 写操作只能在主库（"default"）上执行
+- 防止在从库（"replica"）上执行写操作导致数据不一致
+
+### 4.4 Manager 实例的生命周期
+
+#### 4.4.1 GraphQL 请求上下文（最常见）
+
+通过 DataLoader 实现同一请求内的 Manager 实例复用（`saleor/graphql/plugins/dataloaders.py:31-60`）：
+
+```python
+class PluginManagerByRequestorDataloader(DataLoader[Requestor, PluginsManager]):
+    context_key = "plugin_manager_by_requestor"
+
+    def batch_load(self, keys):
+        allow_replica = getattr(self.context, "allow_replica", True)
+        return [get_plugins_manager(allow_replica, lambda: user) for user in keys]
+
+class AnonymousPluginManagerLoader(DataLoader[None, PluginsManager]):
+    context_key = "anonymous_plugin_manager"
+
+    def batch_load(self, keys):
+        allow_replica = getattr(self.context, "allow_replica", True)
+        return [get_plugins_manager(allow_replica, None) for key in keys]
+
+# 获取 manager 的函数
+def get_plugin_manager_promise(context: SaleorContext) -> Promise[PluginsManager]:
+    app = get_app_promise(context).get()
+    return plugin_manager_promise(context, app)
+```
+
+**生命周期**：
+- 每个 GraphQL 请求上下文（`SaleorContext`）独立
+- 同一请求中，同一 requestor（user 或 app）共享同一个 Manager 实例
+- 请求结束后，随上下文一起被垃圾回收
+
+#### 4.4.2 读写库路径在 GraphQL 中的使用
+
+```python
+# GraphQL Query（只读）：allow_replica=True（默认）
+# saleor/graphql/plugins/dataloaders.py:35
+allow_replica = getattr(self.context, "allow_replica", True)
+
+# GraphQL Mutation（写操作）：allow_replica=False
+# 示例：saleor/graphql/plugins/mutations.py 中的插件配置更新
+manager = get_plugins_manager(allow_replica=False)
+```
+
+#### 4.4.3 后台任务（Celery Task）
+
+```python
+# 示例：saleor/plugins/user_email/tasks.py:38
+with allow_writer():
+    manager = get_plugins_manager(allow_replica=False)
+    manager.notify(...)
+```
+
+**生命周期**：
+- 每个任务独立创建 Manager 实例
+- 任务执行完毕后销毁
+- 必须使用 `allow_replica=False` 和 `allow_writer()` 上下文
+
+#### 4.4.4 测试环境
+
+```python
+# 示例：saleor/graphql/tests/fixtures.py:173
+"plugins": get_plugins_manager(allow_replica=False),
+```
+
+### 4.5 读写库路径对比表
+
+| 维度 | allow_replica=True（读库） | allow_replica=False（写库） |
+|------|--------------------------|---------------------------|
+| 数据库连接 | "replica"（从库） | "default"（主库） |
+| 适用场景 | GraphQL Query 查询、只读操作 | GraphQL Mutation、写操作、Celery 任务 |
+| 性能 | 可分散读压力，提升性能 | 必须保证数据一致性，只能用主库 |
+| allow_writer() | 不需要 | 必须使用 |
+| 典型调用 | `get_plugin_manager_promise(context)` | `get_plugins_manager(allow_replica=False)` |
+
+### 4.6 数据库查询中的应用
+
+所有数据库查询都通过 `self.database` 属性指定连接：
+
+```python
+# saleor/plugins/manager.py:173-177
+channel = (
+    Channel.objects.using(self.database)
+    .filter(slug=channel_slug)
+    .first()
+)
+
+# saleor/plugins/manager.py:203-205
+plugin_manager_configs = PluginConfiguration.objects.using(
+    self.database
+).filter(channel=channel)
+```
+
+---
+
+## 5. 补充：插件加载与调用核心机制
+
+### 5.1 延迟加载机制 (`saleor/plugins/manager.py:151-199`)
 
 插件采用 **按需加载（Lazy Loading）** 策略，首次访问时才实例化：
 
@@ -143,11 +448,7 @@ def _ensure_channel_plugins_loaded(self, channel_slug: str | None, channel: Chan
         self.loaded_channels.add(channel_slug)
 ```
 
-**加载顺序说明**：
-1. 通道专属插件（按 PLUGINS 顺序）
-2. 全局插件（按 PLUGINS 顺序，追加在后面）
-
-### 3.3 单个插件实例化 (`saleor/plugins/manager.py:104-129`)
+### 5.2 单个插件实例化 (`saleor/plugins/manager.py:104-129`)
 
 ```python
 def _load_plugin(self, PluginClass: type["BasePlugin"], db_configs_map: dict, 
@@ -172,21 +473,7 @@ def _load_plugin(self, PluginClass: type["BasePlugin"], db_configs_map: dict,
     )
 ```
 
-### 3.4 数据库配置读取 (`saleor/plugins/manager.py:201-209`)
-
-```python
-def _get_db_plugin_configs(self, channel: Channel | None):
-    plugin_manager_configs = PluginConfiguration.objects.using(self.database)\
-        .filter(channel=channel)
-    configs = {}
-    for db_plugin_config in plugin_manager_configs.iterator(chunk_size=1000):
-        configs[db_plugin_config.identifier] = db_plugin_config
-    return configs
-```
-
-## 4. 运行时钩子分发机制
-
-### 4.1 核心调用流程 (`saleor/plugins/manager.py:211-255`)
+### 5.3 运行时钩子分发 (`saleor/plugins/manager.py:211-255`)
 
 插件调用的核心是 **责任链模式**，前一个插件的输出作为后一个插件的输入：
 
@@ -209,7 +496,7 @@ def __run_method_on_plugins(self, method_name: str, default_value: Any, *args,
     return value
 ```
 
-### 4.2 单个插件调用 (`saleor/plugins/manager.py:233-255`)
+### 5.4 单个插件调用 (`saleor/plugins/manager.py:233-255`)
 
 ```python
 def __run_method_on_single_plugin(self, plugin: Optional["BasePlugin"], 
@@ -236,240 +523,47 @@ def __run_method_on_single_plugin(self, plugin: Optional["BasePlugin"],
     return returned_value
 ```
 
-### 4.3 获取插件列表 (`saleor/plugins/manager.py:2488-2508`)
+---
 
-```python
-def get_plugins(self, channel_slug: str | None = None, active_only=False,
-                plugin_ids: list[str] | None = None) -> list["BasePlugin"]:
-    # 触发延迟加载
-    if channel_slug is not None:
-        self._ensure_channel_plugins_loaded(channel_slug)
-        plugins = self.plugins_per_channel[channel_slug]
-    else:
-        self._ensure_channel_plugins_loaded(None)
-        plugins = self.all_plugins
+## 6. 常见理解偏差修正
 
-    # 过滤激活状态
-    if active_only:
-        plugins = [plugin for plugin in plugins if plugin.active]
+### 偏差 1：认为 PLUGINS 列表顺序只影响有 channel 场景
 
-    # 按 plugin_ids 过滤
-    if plugin_ids:
-        plugins = [plugin for plugin in plugins if plugin.PLUGIN_ID in plugin_ids]
+**修正**：PLUGINS 列表顺序影响所有场景。无论是全局插件还是各通道插件，内部都是按 PLUGINS 顺序遍历的。
 
-    return plugins
-```
+### 偏差 2：认为无 channel 时 all_plugins 包含所有通道的插件
 
-## 5. 特殊调用模式
+**修正**：无 channel 时 `_ensure_channel_plugins_loaded(None)` 只加载全局插件，不加载任何通道插件。只有先触发了某 channel 的调用，all_plugins 才会包含该 channel 的插件。
 
-### 5.1 "直到第一个成功"模式 (`saleor/plugins/manager.py:2582-2599`)
+### 偏差 3：认为 Manager 是全局单例
 
-适用于只需一个插件处理的场景（如获取税率类型列表）：
+**修正**：Manager 不是全局单例。每个 GraphQL 请求为每个 requestor 创建独立实例，通过 DataLoader 在请求内复用。Celery 任务每次创建新实例。
 
-```python
-def __run_plugin_method_until_first_success(self, method_name: str, *args,
-                                            channel_slug: str | None, 
-                                            plugins: list["BasePlugin"] | None = None,
-                                            **kwargs):
-    if plugins is None:
-        plugins = self.get_plugins(channel_slug=channel_slug, active_only=True)
-    
-    for plugin in plugins:
-        result = self.__run_method_on_single_plugin(
-            plugin, method_name, None, *args, **kwargs
-        )
-        if result is not None:  # 第一个返回非 None 结果的插件获胜
-            return result
-    return None
-```
+### 偏差 4：认为 allow_replica 只是性能优化
 
-### 5.2 税务方法特殊模式 (`saleor/plugins/manager.py:632-657`)
+**修正**：allow_replica 不仅是性能优化，还涉及数据一致性。写操作必须使用 `allow_replica=False`，并配合 `allow_writer()` 确保操作在主库执行。
 
-税务插件的错误处理逻辑更复杂：
+### 偏差 5：认为 entry_points 只注册插件类
 
-```python
-def __run_tax_method_until_first_success(self, method_name: str, *args,
-                                         channel_slug: str | None, **kwargs
-                                         ) -> TaxData | None:
-    plugins = self.get_plugins(channel_slug=channel_slug, active_only=True)
-    error = None
-    
-    for plugin in plugins:
-        try:
-            tax_data = self.__run_method_on_single_plugin(
-                plugin, method_name, default_value, *args, **kwargs
-            )
-        except TaxDataError as e:
-            error = e  # 记录错误，继续尝试下一个
-            continue
-        
-        if tax_data is not None:
-            return tax_data  # 成功则返回
-    
-    if error:
-        raise error  # 全部失败且有错误则抛出最后一个
-    return default_value
-```
+**修正**：entry_points 注册流程还会将插件所属的 Django App 注入 `INSTALLED_APPS`，这对插件的模型、迁移、管理命令等功能至关重要。
 
-### 5.3 支付网关模式 (`saleor/plugins/manager.py:2556-2580`)
+---
 
-支付方法指定具体网关插件调用：
+## 7. 总结
 
-```python
-def __run_payment_method(self, gateway: str, method_name: str,
-                         payment_information: "PaymentData", 
-                         channel_slug: str, **kwargs) -> "GatewayResponse":
-    # 查找指定的支付插件
-    plugin = self.get_plugin(gateway, channel_slug)
-    if plugin is not None:
-        resp = self.__run_method_on_single_plugin(
-            plugin, method_name, previous_value=None,
-            payment_information=payment_information, **kwargs
-        )
-        if resp is not None:
-            return resp
-    
-    raise Exception(f"Payment plugin {gateway} for {method_name} is inaccessible!")
-```
+### 7.1 核心设计模式
 
-## 6. 插件方法实现示例
+| 模式 | 用途 | 关键代码 |
+|------|------|---------|
+| **责任链模式** | 插件按顺序处理，前一个的输出作为后一个的输入 | `__run_method_on_plugins` |
+| **延迟加载** | 首次访问通道时才加载插件，节省启动时间 | `_ensure_channel_plugins_loaded` |
+| **模板方法** | Manager 定义调用流程，插件实现具体逻辑 | `__run_method_on_single_plugin` |
+| **策略模式** | 通过 `plugin_ids` 参数可选择特定插件子集执行 | `get_plugins(plugin_ids=...)` |
 
-以 Avalara 税务插件的 `calculate_checkout_total` 为例：
+### 7.2 关键理解点
 
-```python
-# saleor/plugins/avatax/plugin.py:211-254
-class DeprecatedAvataxPlugin(BasePlugin):
-    PLUGIN_ID = "mirumee.taxes.avalara"
-    
-    def calculate_checkout_total(self, checkout_info: "CheckoutInfo",
-                                 lines: list["CheckoutLineInfo"],
-                                 address: Optional["Address"],
-                                 previous_value: TaxedMoney) -> TaxedMoney:
-        # 1. 检查是否应该跳过此插件
-        if self._skip_plugin(previous_value):
-            return previous_value  # 返回前一个插件的结果
-        
-        # 2. 调用 Avalara API 获取税务数据
-        response = self._get_checkout_tax_data(checkout_info, lines, previous_value)
-        if response is None:
-            return previous_value
-        
-        # 3. 应用税务计算
-        currency = checkout_info.checkout.currency
-        taxed_total = zero_taxed_money(currency)
-        for line in lines:
-            taxed_line_total_data = self._calculate_checkout_line_total_price(...)
-            taxed_total += taxed_line_total_data
-        
-        # 4. 返回计算结果（传给下一个插件作为 previous_value）
-        return max(taxed_total, zero_taxed_money(taxed_total.currency))
-```
-
-## 7. 调用优先级与数据流
-
-### 7.1 优先级排序规则
-
-插件调用顺序由以下因素决定（按优先级从高到低）：
-
-1. **`PLUGINS` 配置列表顺序** - 最关键，排在前面的插件先被调用
-2. **通道专属插件优先** - `CONFIGURATION_PER_CHANNEL=True` 的插件排在全局插件前面
-3. **全局插件追加在后** - `CONFIGURATION_PER_CHANNEL=False` 的插件统一追加在列表末尾
-
-### 7.2 数据流示意
-
-```
-调用 manager.calculate_checkout_total(...)
-          ↓
-default_value = base_calculations.checkout_total(...)  # 基础计算值
-          ↓
-插件1.calculate_checkout_total(..., previous_value=default_value) → value1
-          ↓
-插件2.calculate_checkout_total(..., previous_value=value1) → value2
-          ↓
-插件3.calculate_checkout_total(..., previous_value=value2) → value3
-          ↓
-...（所有插件依次处理）
-          ↓
-返回最终结果
-```
-
-## 8. 关键设计要点
-
-### 8.1 previous_value 约定
-
-- 每个插件方法接收 `previous_value` 参数（前一个插件的输出）
-- 插件可选择：
-  - 基于 `previous_value` 进行修改后返回
-  - 完全忽略 `previous_value` 重新计算
-  - 返回 `NotImplemented` 表示跳过（透传 `previous_value`）
-  - 检查 `previous_value` 是否已被处理（如 `net != gross` 表示已含税）
-
-### 8.2 线程安全与缓存
-
-- `PluginsManager` 每个请求实例化一次（通过 `get_plugins_manager` context）
-- 插件实例存储在实例变量中，非全局共享
-- 数据库配置使用 `iterator(chunk_size=1000)` 分批加载
-
-### 8.3 配置持久化
-
-插件配置保存方法 (`saleor/plugins/manager.py:2636-2667`)：
-
-```python
-def save_plugin_configuration(self, plugin_id, channel_slug: str | None, 
-                              cleaned_data: dict) -> None | PluginConfiguration:
-    # 1. 创建或获取 PluginConfiguration 记录
-    plugin_configuration, _ = PluginConfiguration.objects.get_or_create(
-        identifier=plugin_id,
-        channel=channel,
-        defaults={"configuration": plugin.configuration},
-    )
-    # 2. 调用插件的配置验证和保存逻辑
-    configuration = plugin.save_plugin_configuration(
-        plugin_configuration, cleaned_data
-    )
-    # 3. 更新内存中插件实例的状态
-    plugin.active = configuration.active
-    plugin.configuration = configuration.configuration
-    return configuration
-```
-
-## 9. 常见钩子方法分类
-
-### 9.1 计算类钩子（链式调用）
-- `calculate_checkout_total` / `calculate_order_total`
-- `calculate_checkout_shipping` / `calculate_order_shipping`
-- `calculate_checkout_line_total` / `calculate_order_line_total`
-- `get_checkout_line_tax_rate` / `get_order_line_tax_rate`
-
-### 9.2 事件通知类钩子（广播调用）
-- `order_created` / `order_updated` / `order_cancelled`
-- `product_created` / `product_updated` / `product_deleted`
-- `customer_created` / `customer_updated`
-- `checkout_created` / `checkout_updated`
-
-### 9.3 支付类钩子（指定调用）
-- `authorize_payment` / `capture_payment` / `refund_payment`
-- `process_payment` / `initialize_payment`
-- `list_payment_sources`
-
-### 9.4 认证类钩子
-- `authenticate_user`
-- `external_obtain_access_tokens`
-- `external_verify`
-
-## 10. 总结
-
-Saleor Plugin Manager 的核心设计模式：
-
-| 模式 | 用途 |
-|------|------|
-| **责任链模式** | 插件按顺序处理，前一个的输出作为后一个的输入 |
-| **延迟加载** | 首次访问通道时才加载插件，节省启动时间 |
-| **模板方法** | `__run_method_on_plugins` 定义调用流程，插件实现具体逻辑 |
-| **策略模式** | 通过 `plugin_ids` 参数可选择特定插件子集执行 |
-
-关键理解点：
-1. `PLUGINS` 配置顺序 = 调用优先级
-2. `previous_value` 是插件间数据传递的核心
-3. 通道插件在前，全局插件在后
-4. 返回 `NotImplemented` = 跳过当前插件，透传值
+1. **外部插件注册**：entry_points 不仅注册插件类，还注入 Django App 到 `INSTALLED_APPS`
+2. **无 channel 调用**：只返回已加载的插件，顺序取决于加载触发时机
+3. **Manager 生命周期**：请求级隔离，DataLoader 实现同一请求内复用
+4. **读写库路径**：读操作走 replica，写操作走 default，由 `allow_replica` 参数控制
+5. **PLUGINS 顺序**：决定所有场景下的插件调用优先级

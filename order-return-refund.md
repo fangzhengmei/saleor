@@ -104,56 +104,88 @@ class Fulfillment(ModelWithMetadata):
 
 校验分为三层：GraphQL 层、基类 `FulfillmentRefundAndReturnProductBase`、业务函数内部。
 
-### 3.0 replace 场景的错误码归属问题（Bug 分析）
+### 3.0 replace 场景错误码的当前行为与修复建议（精准分析）
 
-**问题定位**：`fulfillment_refund_and_return_product_base.py:129-136` 与 `fulfillment_refund_and_return_product_base.py:184-191`
+**定位的两处调用点**：
 
-当 `replace=True` 且 `line.variant_id is None`（关联商品已被删除）时，代码调用 `_raise_error_for_line` 但**未传入 `code` 参数**，导致默认使用了错误的错误码。
+| 调用位置 | 校验场景 | 当前参数 | 存在的问题 |
+|---------|---------|---------|----------|
+| `clean_fulfillment_lines` L130-136 | 已发货履约行换货 | `type="OrderLine"`, `code=None`, `line=FulfillmentLine` | ① `code` 未指定 → 默认 `INVALID_QUANTITY`<br>② `type="OrderLine"` 但 `line` 是 `FulfillmentLine` → ID 转换错误 |
+| `clean_lines` L185-191 | 未发货订单行换货 | `type="OrderLine"`, `code=None`, `line=OrderLine` | ① `code` 未指定 → 默认 `INVALID_QUANTITY` |
 
-**证据材料**：
+**证据材料（源码）**：
 
 ```python
-# clean_fulfillment_lines 中（第 129-136 行）
+# _raise_error_for_line 定义（L63-75）
+@classmethod
+def _raise_error_for_line(cls, msg, type, line_id, field_name, code=None):
+    line_global_id = graphene.Node.to_global_id(type, line_id)  # type 决定 ID 前缀
+    if not code:
+        code = OrderErrorCode.INVALID_QUANTITY.value  # ← 默认错误码
+    raise ValidationError(
+        {
+            field_name: ValidationError(
+                msg,
+                code=code,
+                params={field_name: line_global_id},  # params 中的 ID 依赖 type
+            )
+        }
+    )
+
+# 调用点 1：clean_fulfillment_lines（L130-136）
 replace = line_data.get("replace", False)
 if replace and not line.order_line.variant_id:
     cls._raise_error_for_line(
         "Unable to replace line as the assigned product doesn't exist.",
-        "OrderLine",
-        line.pk,
+        "OrderLine",      # ← 问题 1：type 用错（应为 FulfillmentLine）
+        line.pk,           # ← 这是 FulfillmentLine 的 pk
+        "order_line_id",   # ← 字段名也不准确
+    )                        # ← 问题 2：code 未指定（应为 NOT_FOUND）
+
+# 调用点 2：clean_lines（L185-191）
+replace = line_data.get("replace", False)
+if replace and not line.variant_id:
+    cls._raise_error_for_line(
+        "Unable to replace line as the assigned product doesn't exist.",
+        "OrderLine",      # ← type 正确（line 确实是 OrderLine）
+        line.pk,          # ← OrderLine 的 pk
         "order_line_id",
+    )                       # ← 问题：code 未指定（应为 NOT_FOUND）
+```
+
+**当前行为总结**：
+- **错误码不准确**：两处都返回 `INVALID_QUANTITY`，但实际是"商品不存在"问题，应为 `NOT_FOUND`
+- **clean_fulfillment_lines 中的额外问题**：`type="OrderLine"` 但传入的 `line.pk` 是 FulfillmentLine 的 ID，导致 `params` 中的 `line_global_id` 是错误格式（前缀是 `OrderLine` 但 ID 属于 `FulfillmentLine`）
+
+**修复建议**：
+
+```python
+# 修复 clean_fulfillment_lines 中的调用（L130-136）
+if replace and not line.order_line.variant_id:
+    cls._raise_error_for_line(
+        "Unable to replace line as the assigned product doesn't exist.",
+        "FulfillmentLine",  # 修复 1：type 改为 FulfillmentLine
+        line.pk,
+        "fulfillment_line_id",  # 修复 2：字段名保持一致
+        code=OrderErrorCode.NOT_FOUND.value,  # 修复 3：指定正确错误码
     )
 
-# clean_lines 中（第 184-191 行）
-replace = line_data.get("replace", False)
+# 修复 clean_lines 中的调用（L185-191）
 if replace and not line.variant_id:
     cls._raise_error_for_line(
         "Unable to replace line as the assigned product doesn't exist.",
         "OrderLine",
         line.pk,
         "order_line_id",
+        code=OrderErrorCode.NOT_FOUND.value,  # 修复：指定正确错误码
     )
-
-# _raise_error_for_line 定义（第 63-75 行）
-@classmethod
-def _raise_error_for_line(cls, msg, type, line_id, field_name, code=None):
-    line_global_id = graphene.Node.to_global_id(type, line_id)
-    if not code:
-        code = OrderErrorCode.INVALID_QUANTITY.value  # ← 默认错误码！
-    raise ValidationError(...)
 ```
 
-**Bug 分析**：
-- 实际错误：商品已删除 → 应为 `OrderErrorCode.NOT_FOUND`
-- 当前错误：使用了 `OrderErrorCode.INVALID_QUANTITY`
-- 影响：客户端无法正确识别错误原因，UI 可能提示"数量不正确"而非"商品已删除"
-
-**修复建议**：在两处调用 `_raise_error_for_line` 时显式传入 `code=OrderErrorCode.NOT_FOUND.value`。
-
-**`OrderErrorCode` 枚举定义**（`saleor/order/error_codes.py:4-24`）供参考：
+**参考：`OrderErrorCode` 枚举**（`saleor/order/error_codes.py:4-24`）：
 ```python
 class OrderErrorCode(Enum):
-    INVALID_QUANTITY = "invalid_quantity"  # 数量错误
-    NOT_FOUND = "not_found"                # 未找到
+    INVALID_QUANTITY = "invalid_quantity"  # 数量相关错误
+    NOT_FOUND = "not_found"                # 资源不存在
     CANNOT_REFUND = "cannot_refund"
     GIFT_CARD_LINE = "gift_card_line"
     INVALID = "invalid"
@@ -260,48 +292,57 @@ def quantity_unfulfilled(self):
     payment 在校验阶段已保证非 None
     ↓
 第三层：_process_refund 内部
-  if amount is None → 自动计算
+  if amount is None → 自动计算（调用 _calculate_refund_amount 填充 lines_to_refund）
+  if amount is not None → 手动指定（lines_to_refund 始终为空 dict）
   if amount and payment → 实际执行退款（支付网关 + order_refunded）
-  amount=0 时：不调用支付网关、不触发 order_refunded，但仍然触发 fulfillment_refunded_event
+  fulfillment_refunded_event → 无条件触发（无论 amount 是否为 0）
 ```
 
-### 4.1.1 amount 为 0 时事件触发的精确语义
+### 4.1.1 amount 为 0 时事件触发的精确语义（统一口径）
 
-**关键发现**：`_process_refund` 函数（`actions.py:1993-2056`）中事件触发逻辑存在分支。
-
-**证据材料**：
+**核心代码证据**（`actions.py:2005-2055`）：
 
 ```python
-# actions.py:2020-2055
-if amount and payment:
-    # 仅当 amount > 0 时进入此分支
-    amount = min(payment.captured_amount, amount)
-    from ..payment.gateway import refund
-    refund(...)  # 调用支付网关
-    payment.refresh_from_db()
-    order_refunded(...)  # ← 触发 PAYMENT_REFUNDED、邮件、ORDER_REFUNDED Webhook
-
-# 注意：下面的 on_commit 在 if 块外！无条件执行！
-transaction.on_commit(
-    lambda: fulfillment_refunded_event(
-        order=order,
-        user=user,
-        app=app,
-        refunded_lines=list(lines_to_refund.values()),
-        amount=amount,  # amount 可能是 0
-        shipping_costs_included=refund_shipping_costs,
+def _process_refund(...):
+    # lines_to_refund 初始化为空 dict
+    lines_to_refund: dict[OrderLineIDType, tuple[QuantityType, OrderLine]] = {}
+    
+    # 只有自动计算金额时才填充 lines_to_refund
+    if amount is None:
+        amount = _calculate_refund_amount(
+            order_lines_to_refund, fulfillment_lines_to_refund, lines_to_refund
+        )
+        # _calculate_refund_amount 内部向 lines_to_refund 写入数据
+    
+    # 仅当 amount > 0 时执行支付退款
+    if amount and payment:
+        amount = min(payment.captured_amount, amount)
+        refund(...)              # 支付网关调用
+        payment.refresh_from_db()
+        order_refunded(...)      # PAYMENT_REFUNDED 事件 + 邮件 + ORDER_REFUNDED Webhook
+    
+    # 注意：on_commit 在 if 块外！无条件执行！
+    transaction.on_commit(
+        lambda: fulfillment_refunded_event(
+            order=order,
+            user=user,
+            app=app,
+            refunded_lines=list(lines_to_refund.values()),  # 内容取决于 amount 是否为 None
+            amount=amount,
+            shipping_costs_included=refund_shipping_costs,
+        )
     )
-)
+    return amount
 ```
 
-**事件触发矩阵**：
+**统一事件触发矩阵**：
 
-| 场景 | 支付网关调用 | `order_refunded()` | `fulfillment_refunded_event` | `lines_to_refund` 内容 |
-|-----|------------|-----------------|----------------------------|---------------------|
-| `amount > 0`（自动计算）| ✅ 是 | ✅ 是 | ✅ 是（延迟）| 非空（`_calculate_refund_amount` 已填充）|
-| `amount > 0`（手动指定）| ✅ 是 | ✅ 是 | ✅ 是（延迟）| **空列表**（`_calculate_refund_amount` 未调用）|
-| `amount = 0`（自动计算）| ❌ 否 | ❌ 否 | ✅ 是（延迟，amount=0）| 空列表（所有行已退款被跳过）|
-| `amount = 0`（手动指定）| ❌ 否 | ❌ 否 | ✅ 是（延迟，amount=0）| **空列表** |
+| 场景 | amount 是否为 None | lines_to_refund 状态 | 支付网关调用 | `order_refunded()` | `fulfillment_refunded_event` |
+|-----|------------------|---------------------|------------|-----------------|----------------------------|
+| **自动计算（amount > 0）** | ✅ 是 | ✅ 非空（_calculate_refund_amount 填充）| ✅ 是 | ✅ 是 | ✅ 是 |
+| **自动计算（amount = 0）** | ✅ 是 | 可能为空（所有行已退款被跳过） | ❌ 否 | ❌ 否 | ✅ 是（amount=0）|
+| **手动指定（amount > 0）** | ❌ 否 | ❌ 空 dict（_calculate_refund_amount 未调用） | ✅ 是 | ✅ 是 | ✅ 是（lines 为空）|
+| **手动指定（amount = 0）** | ❌ 否 | ❌ 空 dict | ❌ 否 | ❌ 否 | ✅ 是（amount=0，lines 为空）|
 
 **`order_refunded()` 内部触发内容**（`actions.py:456-522`）：
 ```python
@@ -314,16 +355,31 @@ def order_refunded(...):
 **`fulfillment_refunded_event` 记录内容**（`events.py:650-672`）：
 ```python
 {
-    "lines": [{quantity, line_pk, item}],  # ← 手动指定金额时为空
-    "amount": amount,
+    "lines": [{quantity, line_pk, item}],  # ← 手动金额时为空列表
+    "amount": amount,                       # ← 可能为 0
     "shipping_costs_included": bool
 }
 ```
 
-**边界条件含义**：
-- **手动指定金额场景**：`fulfillment_refunded_event` 的 `refunded_lines` 为空列表，审计记录缺少行级关联。这是设计上的取舍——手动金额不由行计算，因此无法自动关联。
-- **`amount=0` 场景**：虽然退款金额为 0，但仍然创建 `FULFILMENT_REFUNDED` OrderEvent。这使得"零元退款"操作在审计日志中可追溯。
-- **`order_refunded()` vs `fulfillment_refunded_event`**：前者是"支付层面的退款成功"，后者是"业务层面的退款标记"。两者可能不一致（如手动指定金额时）。
+**边界条件的一致结论**：
+
+1. **`fulfillment_refunded_event` 是无条件触发的**：
+   - 即使 `amount=0` 也会在事务提交后执行
+   - 这使得"零元退款"操作在审计日志中可追溯
+   - 这是**设计意图**：Fulfillment 级别的退款标记应始终记录
+
+2. **`order_refunded()` 仅在 `amount > 0` 时触发**：
+   - 包含 `PAYMENT_REFUNDED` OrderEvent、退款邮件、`ORDER_REFUNDED` Webhook
+   - `amount=0` 时跳过，因为没有实际的资金流动
+
+3. **`lines_to_refund` 的状态取决于金额来源**：
+   - 自动计算：调用 `_calculate_refund_amount` 填充（除非所有行都已退款被跳过）
+   - 手动指定：`_calculate_refund_amount` 未被调用，始终为空 dict
+
+4. **换货行（`replace=True`）的一致行为**：
+   - `create_fulfillments_for_returned_products` 中先按 `replace` 分组
+   - 只有 `replace=False` 的行（`return_order_lines`、`return_fulfillment_lines`）被传递给 `_process_refund`
+   - 换货行**从不参与退款计算**，也不会出现在 `fulfillment_refunded_event` 中
 
 ### 4.2 金额计算的两个分支
 
@@ -581,20 +637,21 @@ Saleor 的事件系统分为两层：**OrderEvent**（内部审计记录）和 *
 | `FULFILLMENT_CANCELED` | `fulfillment_canceled_event` | `cancel_fulfillment` 中（同步） | `{composed_id}` | 写入**原订单** |
 | `FULFILLMENT_RESTOCKED_ITEMS` | `fulfillment_restocked_items_event` | `cancel_fulfillment` 中（同步） | `{quantity, warehouse}` | 写入**原订单** |
 
-### 6.2 事件触发顺序对比
+### 6.2 事件触发顺序对比（统一口径）
 
 **退货+退款场景** (`create_fulfillments_for_returned_products`, `refund=True`)：
 
 ```
 [事务内]
 1. _process_refund():
-   1.1 gateway.refund() → 支付网关执行退款
-   1.2 order_refunded():
-       1.2.1 payment_refunded_event    ← 同步，OrderEvent
-       1.2.2 send_order_refunded_confirmation  ← 同步，发邮件
-       1.2.3 call_order_events(ORDER_REFUNDED / ORDER_FULLY_REFUNDED)  ← 同步，Webhook
-   → transaction.on_commit:
-       1.3 fulfillment_refunded_event  ← 延迟，OrderEvent
+   1.1 [仅 amount is None] _calculate_refund_amount() → 填充 lines_to_refund
+   1.2 [amount > 0 时] gateway.refund() → 支付网关执行退款
+   1.3 [amount > 0 时] order_refunded():
+       1.3.1 payment_refunded_event    ← 同步，OrderEvent
+       1.3.2 send_order_refunded_confirmation  ← 同步，发邮件
+       1.3.3 call_order_events(ORDER_REFUNDED / ORDER_FULLY_REFUNDED)  ← 同步，Webhook
+   → transaction.on_commit: 无条件执行！
+       1.4 fulfillment_refunded_event  ← 延迟，OrderEvent（即使 amount=0）
 
 2. process_replace()（如果有换货行）:
    2.1 fulfillment_replaced_event      ← 同步
@@ -610,11 +667,16 @@ Saleor 的事件系统分为两层：**OrderEvent**（内部审计记录）和 *
 4. call_order_event(ORDER_UPDATED)      ← 同步，Webhook
 ```
 
+**关键点**：`fulfillment_refunded_event` 在 `transaction.on_commit` 中**无条件触发**，不受 `amount` 或 `payment` 状态影响。但 `lines` 参数的内容取决于：
+- 自动计算（`amount is None`）：填充了参与退款的行
+- 手动指定（`amount is not None`）：始终为空列表
+- 所有行已退款被跳过：可能为空列表
+
 **仅退款场景** (`create_refund_fulfillment`)：
 
 ```
 [事务内]
-1. _process_refund():  ← 同上
+1. _process_refund():  ← 同上（无条件触发 fulfillment_refunded_event）
 2. 创建 status=REFUNDED 的 Fulfillment
 3. _move_order_lines_to_target_fulfillment()
 4. _move_fulfillment_lines_to_target_fulfillment()
@@ -628,27 +690,35 @@ Saleor 的事件系统分为两层：**OrderEvent**（内部审计记录）和 *
 
 | 维度 | FULFILLMENT_RETURNED | FULFILLMENT_REFUNDED |
 |-----|---------------------|---------------------|
-| 语义 | 商品被标记为退货 | 退款被实际执行 |
-| 触发条件 | `create_return_fulfillment` 完成后 | `_process_refund` 完成后 |
+| 语义 | 商品被标记为退货 | 执行了退款操作（可能是 0 元） |
+| 触发条件 | `create_return_fulfillment` 完成后 | `_process_refund` 被调用后（无条件） |
 | 参数 | 仅 `{lines}` | `{lines, amount, shipping_costs_included}` |
-| 金额信息 | 无 | 有 |
+| 金额信息 | 无 | 有（可能为 0） |
 | 触发方式 | `transaction.on_commit`（延迟） | `transaction.on_commit`（延迟） |
+| lines 内容 | 始终非空（参与退货的行） | 可能为空（手动金额或所有行已退款） |
 
 **`PAYMENT_REFUNDED` vs `FULFILLMENT_REFUNDED`**：
 
 | 维度 | PAYMENT_REFUNDED | FULFILLMENT_REFUNDED |
 |-----|-----------------|---------------------|
-| 语义 | 支付通道确认退款 | 业务层面的行级退款记录 |
+| 语义 | 实际支付通道退款成功 | 业务层面标记了退款操作 |
+| 触发条件 | `order_refunded()` 中，**仅 `amount > 0`** | `_process_refund` 后，**无条件** |
 | 参数 | `{amount, payment_id, payment_gateway}` | `{lines, amount, shipping_costs_included}` |
-| 关联对象 | Payment 对象 | OrderLine 列表 |
+| 关联对象 | Payment 对象 | OrderLine 列表（可能为空） |
 | 触发方式 | 同步 | `transaction.on_commit`（延迟） |
+| amount=0 时 | 不触发 | 触发（amount=0） |
 
-**重要**：在退货+退款场景中，`FULFILLMENT_REFUNDED` 和 `FULFILLMENT_RETURNED` 都会被触发。前者在退款事务提交后，后者在退货 Fulfillment 创建事务提交后。两者记录的行可能不同——`FULFILLMENT_REFUNDED` 的 `lines_to_refund` 排除了 `replace=True` 的换货行，而 `FULFILLMENT_RETURNED` 的 `returned_lines` 包含所有非换货行。
+**重要统一结论**：在退货+退款场景中，`FULFILLMENT_REFUNDED` 和 `FULFILLMENT_RETURNED` 都会被触发。前者在 `_process_refund` 事务提交后，后者在 `create_return_fulfillment` 事务提交后。两者记录的行可能不同——`FULFILLMENT_REFUNDED` 的 `lines_to_refund` 排除了 `replace=True` 的换货行，而 `FULFILLMENT_RETURNED` 的 `returned_lines` 包含所有非换货行。
 
-**额外边界**：
-- **手动指定金额时**：`FULFILLMENT_REFUNDED` 的 `lines` 参数为空列表，因为 `_calculate_refund_amount` 未被调用，`lines_to_refund` 字典始终为空。这是一个已知的设计取舍。
-- **换货行（`replace=True`）**：换货行**不参与退款计算**，也不会出现在 `fulfillment_refunded_event` 或 `payment_refunded_event` 中。换货行只触发 `fulfillment_replaced_event`。
-- **`amount=0` 时**：仍然触发 `fulfillment_refunded_event`，但 `amount=0`，且 `order_refunded()` 不会被调用（因此不触发 `PAYMENT_REFUNDED`、不发送邮件、不触发 `ORDER_REFUNDED` Webhook）。
+**额外边界条件（统一表述）**：
+
+1. **手动指定金额时**：`FULFILLMENT_REFUNDED` 的 `lines` 参数为空列表，因为 `_calculate_refund_amount` 未被调用，`lines_to_refund` 字典始终为空。这是一个已知的设计取舍。
+
+2. **换货行（`replace=True`）**：换货行**不参与退款计算**，也不会出现在 `fulfillment_refunded_event` 或 `payment_refunded_event` 中。换货行只触发 `fulfillment_replaced_event`。
+
+3. **`amount=0` 时**：仍然触发 `fulfillment_refunded_event`，但 `amount=0`，且 `order_refunded()` 不会被调用（因此不触发 `PAYMENT_REFUNDED`、不发送邮件、不触发 `ORDER_REFUNDED` Webhook）。
+
+4. **自动计算但所有行被跳过**：当 `amount is None` 但所有 FulfillmentLine 都处于 `REFUNDED` 状态时，`_calculate_refund_amount` 返回 0 且 `lines_to_refund` 为空。此时行为等同于 `amount=0` 手动指定。
 
 ### 6.4 Webhook 事件层
 
@@ -830,7 +900,58 @@ create_fulfillments_for_returned_products()
 
 ---
 
-## 十、核心代码索引
+## 十、口径统一检查清单
+
+为确保文档各部分表述一致，以下是关键结论的交叉验证：
+
+### 10.1 replace 场景错误码（已统一）
+
+| 文档位置 | 结论 | 一致性 |
+|---------|------|--------|
+| 3.0 节 | `code` 未指定 → 默认 `INVALID_QUANTITY`，应为 `NOT_FOUND` | ✅ |
+| 3.0 节 | `clean_fulfillment_lines` 中 `type="OrderLine"` 但实际是 `FulfillmentLine` → ID 转换错误 | ✅ |
+| 核心代码索引 | `_raise_error_for_line` 位置 L63 | ✅ |
+
+**证据**：`fulfillment_refund_and_return_product_base.py` L63-75, L130-136, L185-191
+
+### 10.2 amount=0 时事件触发（已统一）
+
+| 文档位置 | 结论 | 一致性 |
+|---------|------|--------|
+| 4.1 节 | `fulfillment_refunded_event` 无条件触发（无论 amount 是否为 0） | ✅ |
+| 4.1.1 节 | `order_refunded()` 仅在 `amount > 0` 时触发 | ✅ |
+| 4.1.1 节 | 手动指定金额时 `lines_to_refund` 始终为空 dict | ✅ |
+| 6.1 节 | `FULFILLMENT_REFUNDED` 触发条件：`_process_refund` 后无条件 | ✅ |
+| 6.1 节 | `PAYMENT_REFUNDED` 触发条件：仅 `amount > 0` | ✅ |
+| 6.2 节 | 事件流程图中标注了"无条件执行" | ✅ |
+| 6.3 节 | `FULFILLMENT_REFUNDED` 的 `lines` 可能为空 | ✅ |
+| 9.1 节 | 数据链路图中标注了"无条件触发" | ✅ |
+
+**证据**：`actions.py` L2005-2055
+
+### 10.3 退款金额与折扣关系（已统一）
+
+| 文档位置 | 结论 | 一致性 |
+|---------|------|--------|
+| 4.3.1 节 | `unit_price_gross_amount` 是折后含税价（含 promotion） | ✅ |
+| 4.3.1 节 | Voucher 折扣不影响退款金额（订单级折扣） | ✅ |
+| 4.3.1 节 | `unit_discount_amount` 不参与退款计算（已体现在单价中） | ✅ |
+
+**证据**：`order/utils.py` L230-327, `order/actions.py` L1967, L1981
+
+### 10.4 换货行行为（已统一）
+
+| 文档位置 | 结论 | 一致性 |
+|---------|------|--------|
+| 4.1.1 节 | 换货行不参与退款计算 | ✅ |
+| 6.3 节 | 换货行不出现在退款事件中 | ✅ |
+| 9.1 节 | 先按 `replace` 分组再处理 | ✅ |
+
+**证据**：`actions.py` L1898-1899, L1912-1913
+
+---
+
+## 十一、核心代码索引
 
 | 功能 | 文件位置 | 函数/类 |
 |-----|---------|---------|

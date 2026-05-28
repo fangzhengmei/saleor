@@ -199,78 +199,160 @@ def _ensure_channel_plugins_loaded(self, channel_slug: str | None, ...):
         ...  # 加载通道插件的逻辑
 ```
 
-### 3.3 all_plugins 的填充顺序（关键！）
+### 3.3 all_plugins 的填充顺序（关键！时序敏感）
 
-`all_plugins` 是一个扁平列表，其填充顺序**完全取决于加载触发顺序**：
+`all_plugins` 是一个扁平列表，其填充顺序**完全取决于加载触发的历史时序**。这是最容易产生理解偏差的部分。
 
-#### 场景 A：先触发无 channel 的调用
-
-```
-调用 get_plugins(channel_slug=None)
-    ↓
-_ensure_channel_plugins_loaded(None)
-    ↓
-加载全局插件（按 PLUGINS 顺序）
-    ↓
-all_plugins = [全局插件1, 全局插件2, ...]
-    ↓
-后续调用 get_plugins(channel_slug="channel-usd")
-    ↓
-加载通道插件（按 PLUGINS 顺序）
-    ↓
-all_plugins = [全局插件1, 全局插件2, ..., 通道插件A, 通道插件B, ...]
-```
-
-**无 channel 调用顺序**：全局插件按 PLUGINS 顺序调用，通道插件不会被调用。
-
-#### 场景 B：先触发某 channel 的调用
-
-```
-调用 get_plugins(channel_slug="channel-usd")
-    ↓
-_ensure_channel_plugins_loaded("channel-usd")
-    ├─> 先调用 _ensure_channel_plugins_loaded(None) 加载全局插件
-    │   └─> all_plugins = [全局插件1, 全局插件2, ...]
-    └─> 加载 "channel-usd" 的通道插件
-        └─> all_plugins = [全局插件1, 全局插件2, ..., 通道插件A, 通道插件B, ...]
-    ↓
-后续调用 get_plugins(channel_slug=None)
-    ↓
-all_plugins 已包含：[全局插件1, 全局插件2, ..., 通道插件A, 通道插件B, ...]
-```
-
-**无 channel 调用顺序**：全局插件按 PLUGINS 顺序在前，已加载的通道插件按 PLUGINS 顺序在后。
-
-#### 场景 C：通过 get_all_plugins() 触发
+**先明确代码执行时序**（`saleor/plugins/manager.py:171-199`）：
 
 ```python
-# saleor/plugins/manager.py:2480-2486
-def get_all_plugins(self, active_only=False):
-    if not self.loaded_all_channels:
-        # 遍历数据库中所有 Channel
-        channels = Channel.objects.using(self.database).all()
-        for channel in channels.iterator(chunk_size=1000):
-            # 按 Channel 在数据库中的顺序加载
-            self._ensure_channel_plugins_loaded(channel.slug, channel=channel)
-        self.loaded_all_channels = True
-    return self.get_plugins(active_only=active_only)
+if channel_slug is not None and channel_slug not in self.loaded_channels:
+    # ⚠️ 第一步：先加载通道插件，先写入 all_plugins
+    for plugin_path in self.plugins:
+        if getattr(PluginClass, "CONFIGURATION_PER_CHANNEL", False):
+            plugin = self._load_plugin(...)
+            self.plugins_per_channel[channel_slug].append(plugin)
+            self.all_plugins.append(plugin)  # 先写通道插件！
+    
+    # ⚠️ 第二步：才加载全局插件，后写入 all_plugins
+    self._ensure_channel_plugins_loaded(None)
+    self.plugins_per_channel[channel_slug].extend(self.global_plugins)
 ```
 
-**all_plugins 顺序**：
-1. 全局插件（按 PLUGINS 顺序）
-2. 第一个 Channel 的通道插件（按 PLUGINS 顺序）
-3. 第二个 Channel 的通道插件（按 PLUGINS 顺序）
-4. ... 依此类推，按数据库中 Channel 的顺序
+**重要对比**：
+- `plugins_per_channel[channel_slug]` 的顺序是**确定的**：[通道插件按 PLUGINS 顺序] + [全局插件按 PLUGINS 顺序]
+- `all_plugins` 的顺序是**不确定的**：取决于哪个 channel 先被加载
 
-### 3.4 无 channel 场景的调用总结
+---
 
-| 触发顺序 | all_plugins 组成 | 无 channel 调用顺序 |
-|---------|----------------|-------------------|
-| 先调用无 channel | [全局插件按 PLUGINS 顺序] | 只有全局插件，按 PLUGINS 顺序 |
-| 先调用 channel-A | [全局插件按 PLUGINS 顺序, channel-A 通道插件按 PLUGINS 顺序] | 全局插件在前，channel-A 通道插件在后，各自按 PLUGINS 顺序 |
-| 调用 get_all_plugins() | [全局插件, channel-A 插件, channel-B 插件, ...] | 全局插件在前，各通道插件按数据库顺序追加，每类内部按 PLUGINS 顺序 |
+#### 基础假设
 
-### 3.5 无 channel 场景的使用场景
+为了清晰对比，假设 `PLUGINS` 配置如下（按顺序）：
+
+| 序号 | 插件类 | CONFIGURATION_PER_CHANNEL | 类型 |
+|------|--------|--------------------------|------|
+| 1 | AvataxPlugin | True | 通道插件 |
+| 2 | WebhookPlugin | True | 通道插件 |
+| 3 | StripePlugin | True | 通道插件 |
+| 4 | UserEmailPlugin | False | 全局插件 |
+| 5 | AdminEmailPlugin | False | 全局插件 |
+| 6 | OpenIDPlugin | False | 全局插件 |
+
+---
+
+#### 场景 A：先触发无 channel 的调用，再触发有 channel 的调用
+
+```
+1. 调用 get_plugins(channel_slug=None)
+    ↓
+_ensure_channel_plugins_loaded(None) 只加载全局插件
+    ↓
+遍历 PLUGINS，只处理 CONFIGURATION_PER_CHANNEL=False 的
+    ↓
+all_plugins = [UserEmail, AdminEmail, OpenID]  ✅ 按 PLUGINS 顺序
+    ↓
+2. 后续调用 get_plugins(channel_slug="usd")
+    ↓
+_ensure_channel_plugins_loaded("usd")
+    ├─> 第一步：加载通道插件（Avatax, Webhook, Stripe）
+    │   └─> all_plugins 追加 → [UserEmail, AdminEmail, OpenID, Avatax(usd), Webhook(usd), Stripe(usd)]
+    └─> 第二步：调用 _ensure_channel_plugins_loaded(None)，但 loaded_global=True，跳过
+```
+
+**all_plugins 最终顺序**：`[全局×3, usd通道×3]`
+
+**无 channel 调用顺序**：全局插件在前，usd 通道插件在后，各自按 PLUGINS 顺序。
+
+---
+
+#### 场景 B：先触发有 channel 的调用，再触发无 channel 的调用
+
+**⚠️ 这是与场景 A 顺序完全相反的情况！**
+
+```
+1. 调用 get_plugins(channel_slug="usd")
+    ↓
+_ensure_channel_plugins_loaded("usd")
+    ├─> 第一步：先加载通道插件（Avatax, Webhook, Stripe）
+    │   └─> all_plugins = [Avatax(usd), Webhook(usd), Stripe(usd)]  ⚠️ 通道插件在前！
+    └─> 第二步：才调用 _ensure_channel_plugins_loaded(None) 加载全局插件
+        └─> all_plugins 追加 → [Avatax(usd), Webhook(usd), Stripe(usd), UserEmail, AdminEmail, OpenID]
+    ↓
+2. 调用 get_plugins(channel_slug=None)
+    ↓
+返回 all_plugins = [Avatax(usd), Webhook(usd), Stripe(usd), UserEmail, AdminEmail, OpenID]
+```
+
+**all_plugins 最终顺序**：`[usd通道×3, 全局×3]`
+
+**无 channel 调用顺序**：usd 通道插件在前，全局插件在后，各自按 PLUGINS 顺序。
+
+---
+
+#### 场景 C：通过 get_all_plugins() 触发（按数据库 Channel 顺序加载）
+
+假设数据库中有两个 Channel，按创建顺序：`eur` → `usd`
+
+```
+调用 get_all_plugins()
+    ↓
+遍历 channels：先 eur，后 usd
+    ↓
+加载 eur:
+    ├─> 第一步：all_plugins = [Avatax(eur), Webhook(eur), Stripe(eur)]
+    └─> 第二步：all_plugins = [Avatax(eur), Webhook(eur), Stripe(eur), UserEmail, AdminEmail, OpenID]
+    ↓
+加载 usd:
+    ├─> 第一步：all_plugins 追加 → [..., Avatax(usd), Webhook(usd), Stripe(usd)]
+    └─> 第二步：loaded_global=True，跳过
+```
+
+**all_plugins 最终顺序**：`[eur通道×3, 全局×3, usd通道×3]`
+
+**无 channel 调用顺序**：eur 通道插件 → 全局插件 → usd 通道插件，每类内部按 PLUGINS 顺序。
+
+---
+
+#### 场景 D：先调用 eur，再调用 usd，最后调用 None
+
+```
+1. 调用 get_plugins(channel_slug="eur")
+   → all_plugins = [Avatax(eur), Webhook(eur), Stripe(eur), UserEmail, AdminEmail, OpenID]
+
+2. 调用 get_plugins(channel_slug="usd")
+   → all_plugins = [Avatax(eur), Webhook(eur), Stripe(eur), UserEmail, AdminEmail, OpenID, Avatax(usd), Webhook(usd), Stripe(usd)]
+
+3. 调用 get_plugins(channel_slug=None)
+   → 返回上述 all_plugins
+```
+
+**all_plugins 最终顺序**：`[eur通道×3, 全局×3, usd通道×3]`
+
+---
+
+### 3.4 无 channel 场景的调用总结对比表
+
+| 触发时序 | all_plugins 顺序 | get_plugins(None) 返回顺序 |
+|---------|----------------|--------------------------|
+| 先 None 后 usd | `[全局×3, usd通道×3]` | `[全局×3, usd通道×3]` |
+| 先 usd 后 None | `[usd通道×3, 全局×3]` | `[usd通道×3, 全局×3]` |
+| get_all_plugins() | `[eur通道×3, 全局×3, usd通道×3]` | `[eur通道×3, 全局×3, usd通道×3]` |
+| 先 eur 再 usd 再 None | `[eur通道×3, 全局×3, usd通道×3]` | `[eur通道×3, 全局×3, usd通道×3]` |
+
+### 3.5 关键结论
+
+1. **`plugins_per_channel[channel_slug]` 顺序确定**：无论加载历史如何，始终是 `[通道插件按 PLUGINS 顺序] + [全局插件按 PLUGINS 顺序]`
+
+2. **`all_plugins` 顺序不确定**：完全取决于加载触发的历史时序，可能出现：
+   - 全局插件在前（先调用无 channel）
+   - 通道插件在前（先调用有 channel）
+   - 多个通道插件交替出现（按 Channel 加载顺序）
+
+3. **`get_plugins(channel_slug=None)` 返回 `all_plugins`**：因此其调用顺序也是不确定的，取决于加载历史
+
+4. **设计意图**：`all_plugins` 主要用于管理后台查询所有插件配置，而非用于需要确定顺序的业务逻辑。业务逻辑应始终明确指定 `channel_slug`。
+
+### 3.6 无 channel 场景的使用场景
 
 无 channel 的插件调用主要用于：
 
@@ -564,15 +646,19 @@ def __run_method_on_single_plugin(self, plugin: Optional["BasePlugin"],
 
 **修正**：无 channel 时 `_ensure_channel_plugins_loaded(None)` 只加载全局插件，不加载任何通道插件。只有先触发了某 channel 的调用，all_plugins 才会包含该 channel 的插件。
 
-### 偏差 3：认为 Manager 是全局单例
+### 偏差 3：认为 all_plugins 的顺序是确定的（全局插件始终在前）
+
+**修正**：`all_plugins` 的顺序完全取决于加载触发的历史时序。当先调用有 channel 的接口时，通道插件会先写入 `all_plugins`，全局插件后写入，导致顺序变为 `[通道插件, 全局插件]`。只有 `plugins_per_channel[channel_slug]` 的顺序是确定的。
+
+### 偏差 4：认为 Manager 是全局单例
 
 **修正**：Manager 不是全局单例。每个 GraphQL 请求为每个 requestor 创建独立实例，通过 DataLoader 在请求内复用。Celery 任务每次创建新实例。
 
-### 偏差 4：认为 allow_replica 只是性能优化
+### 偏差 5：认为 allow_replica 只是性能优化
 
 **修正**：allow_replica 不仅是性能优化，还涉及数据一致性。写操作必须使用 `allow_replica=False`，并配合 `allow_writer()` 确保操作在主库执行。
 
-### 偏差 5：认为 entry_points 只注册插件类
+### 偏差 6：认为 entry_points 只注册插件类
 
 **修正**：entry_points 注册流程还会将插件所属的 Django App 注入 `INSTALLED_APPS`，这对插件的模型、迁移、管理命令等功能至关重要。
 
@@ -592,7 +678,9 @@ def __run_method_on_single_plugin(self, plugin: Optional["BasePlugin"],
 ### 7.2 关键理解点
 
 1. **外部插件注册**：entry_points 不仅注册插件类，还注入 Django App 到 `INSTALLED_APPS`
-2. **无 channel 调用**：只返回已加载的插件，顺序取决于加载触发时机
-3. **Manager 生命周期**：请求级隔离，DataLoader 实现同一请求内复用
-4. **读写库路径**：读操作走 replica，写操作走 default，由 `allow_replica` 参数控制
-5. **PLUGINS 顺序**：决定所有场景下的插件调用优先级
+2. **无 channel 调用**：只返回已加载的插件，顺序取决于加载触发时机，**时序敏感**
+3. **all_plugins 顺序不确定**：取决于加载历史，先调用有 channel 则通道插件在前，先调用无 channel 则全局插件在前
+4. **plugins_per_channel 顺序确定**：始终是 `[通道插件按 PLUGINS 顺序] + [全局插件按 PLUGINS 顺序]`
+5. **Manager 生命周期**：请求级隔离，DataLoader 实现同一请求内复用
+6. **读写库路径**：读操作走 replica，写操作走 default，由 `allow_replica` 参数控制
+7. **PLUGINS 顺序**：决定所有场景下的插件调用优先级

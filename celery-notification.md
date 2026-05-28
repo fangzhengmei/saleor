@@ -1140,12 +1140,14 @@ send_webhook_request_async.apply_async(
 
 ### 13.5 Deferred Payload 补排队
 
-| 触发条件 | 处理动作 | 结果 |
-|---------|---------|------|
-| 全部 delivery 在从库不可见 | `raise self.retry(countdown=1*2^retries)` | 指数退避重试，等待主从同步 |
-| 部分 delivery 在从库不可见 | 缺失的重新入队 `generate_deferred_payloads.apply_async(**request_kwargs)`，可用的立即调用 `_generate_deferred_payloads` | 分批分流，不阻塞 |
-| 重试超过 max_retries=12 次 | `MaxRetriesExceededError`，记录错误日志 | delivery 放弃处理 |
-| delivery 最终在从库可见 | 生成 payload 并入队 `send_webhook_request_async` | Webhook 正常发送 |
+| 触发条件 | 处理动作 | delivery 状态结果 |
+|---------|---------|------------------|
+| 全部 delivery 在从库不可见 | `raise self.retry(countdown=1*2^retries)` | PENDING（未被触碰） |
+| 部分 delivery 在从库不可见 | 缺失的重新入队 `generate_deferred_payloads.apply_async(**request_kwargs)`，可用的立即调用 `_generate_deferred_payloads` | 缺失的 PENDING，可用的进入 payload 生成 |
+| 重试超过 max_retries=12 次 | `MaxRetriesExceededError`，记录 error 日志，`return` | **PENDING（僵尸记录）** |
+| delivery 最终在从库可见 + subscribable_object 重建成功 | 生成 payload 并入队 `send_webhook_request_async` | PENDING（待发送） |
+| delivery 最终在从库可见 + subscribable_object 重建失败 | `EventDelivery.objects.filter(pk__in=ids).update(status=FAILED)` | **FAILED** |
+| delivery 最终在从库可见 + subscription query 返回空 | delivery 不加入 `event_deliveries_for_bulk_update` | **PENDING（无 payload，无后续发送）** |
 
 ### 13.6 send_webhook_queue 继承链路
 
@@ -1157,3 +1159,150 @@ send_webhook_request_async.apply_async(
 | 最终 send_webhook_request_async | 最终发送队列（继承 send_webhook_queue） | ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME |
 
 > **设计要点**: `generate_deferred_payloads` 任务始终在延迟队列执行，`send_webhook_queue` 只影响最终发送任务的队列。补排队时通过 `**request_kwargs` 完整继承 `send_webhook_queue`。
+
+---
+
+## 14. Deferred Payload 重试打满后 Delivery 记录的状态落点
+
+**文件位置**: `saleor/webhook/transport/asynchronous/transport.py:535-608`
+
+### 14.1 背景
+
+`generate_deferred_payloads` 的重试场景有两类，重试打满后 delivery 的状态落点不同：
+
+1. **全部不可见 → `self.retry()` 重试打满**：delivery 在从库始终查不到
+2. **部分不可见 → 补排队新任务**：缺失的 delivery 被单独入队为新的 `generate_deferred_payloads` 任务
+
+### 14.2 全部不可见场景：`self.retry()` 重试打满
+
+| 触发条件 | 处理动作 | delivery 状态结果 |
+|---------|---------|------------------|
+| `confirm_event_delivery_availability` 返回 `available_delivery_pks` 为空 | `raise self.retry(countdown=1*2^retries)` | PENDING（未被触碰） |
+| 重试期间 delivery 在从库可见 | 正常调用 `_generate_deferred_payloads` | payload 生成 → 入队发送 |
+| `self.retry()` 超过 max_retries=12 | 捕获 `MaxRetriesExceededError`，记录 error 日志，`return` | **PENDING（僵尸记录）** |
+
+**关键代码路径**:
+```python
+if not available_delivery_pks:
+    try:
+        retry_backoff = 1
+        countdown = retry_backoff * (2**self.request.retries)
+        raise self.retry(countdown=countdown, ...)
+    except MaxRetriesExceededError:
+        logger.error(
+            "Max retries exceeded for deferred payload generation. "
+            "Event deliveries not found on replica: %s.",
+            missing_delivery_pks,
+            extra={"event_delivery_ids": event_delivery_ids},
+        )
+    return  # <-- 静默退出，delivery 状态仍为 PENDING
+```
+
+> **与 `send_webhook_request_async` 的 `not_found` 分支完全对称**：delivery 在从库不可见时无法获取对象，因此也没有代码路径能更新其状态。
+
+### 14.3 部分不可见场景：补排队任务重试打满
+
+| 触发条件 | 处理动作 | delivery 状态结果 |
+|---------|---------|------------------|
+| `missing_delivery_pks` 非空 | `generate_deferred_payloads.apply_async(kwargs={**request_kwargs, "event_delivery_ids": missing})` | 新任务独立重试 |
+| 补排队新任务中 delivery 在从库可见 | 正常调用 `_generate_deferred_payloads` | payload 生成 → 入队发送 |
+| 补排队新任务重试打满（max_retries=12） | 同 14.2，`MaxRetriesExceededError` → `return` | **PENDING（僵尸记录）** |
+
+> 补排队的新任务是独立的 Celery 任务，拥有自己的重试计数器（`self.request.retries` 从 0 开始），因此享有完整的 12 次重试预算。
+
+### 14.4 可用 delivery 进入 `_generate_deferred_payloads` 后的状态落点
+
+| 触发条件 | 处理动作 | delivery 状态结果 |
+|---------|---------|------------------|
+| `subscribable_object` 重建成功 | 执行 subscription query，生成 payload，入队 `send_webhook_request_async` | PENDING（等待发送任务执行） |
+| `subscribable_object` 重建失败（`subscribable_object is None`） | `EventDelivery.objects.filter(pk__in=event_delivery_ids).update(status=FAILED)` | **FAILED** |
+| subscription query 返回空数据（`data is None`） | delivery 不加入 `event_deliveries_for_bulk_update`，不入队发送 | **PENDING（无 payload，无后续发送）** |
+| subscription query 返回有效数据 | 创建 EventPayload，关联 delivery，入队发送 | PENDING → 后续由 `send_webhook_request_async` 决定终态 |
+
+### 14.5 Deferred Payload 各终态汇总
+
+| 终态 | 产生条件 | 是否有 EventDeliveryAttempt |
+|------|---------|---------------------------|
+| **PENDING（僵尸）** | 从库始终不可见 + 重试打满（12 次） | 无 |
+| **PENDING（无 payload）** | subscription query 返回空 | 无 |
+| **FAILED** | subscribable_object 重建失败 | 无 |
+| **PENDING（待发送）** | payload 生成成功，已入队 `send_webhook_request_async` | 无（发送阶段才创建） |
+
+---
+
+## 15. not_found 快速重试与发送失败重试共享计数预算
+
+**文件位置**: `saleor/webhook/transport/asynchronous/transport.py:761-843`
+
+### 15.1 问题本质
+
+`send_webhook_request_async` 的任务定义：
+```python
+@app.task(
+    queue=settings.WEBHOOK_CELERY_QUEUE_NAME,
+    bind=True,
+    retry_backoff=10,
+    retry_kwargs={"max_retries": 5},
+)
+```
+
+Celery 的 `self.request.retries` 是**同一任务实例内**的累计计数器。`not_found` 快速重试和发送失败重试都调用 `self.retry()`，共享同一个 `max_retries=5` 的预算。
+
+### 15.2 两种重试的调用方式并列
+
+| 维度 | not_found 快速重试 | 发送失败重试 |
+|------|-------------------|-------------|
+| **触发条件** | `get_delivery_for_webhook` 返回 `(None, True)` | `send_webhook_using_scheme_method` 返回 FAILED 且 `retry_on_failure=True` |
+| **调用方式** | `self.retry(countdown=1)` | `celery_task.retry(countdown=retry_backoff*2^retries, **retry_kwargs)` |
+| **退避间隔** | 固定 1 秒 | 指数退避 10s, 20s, 40s, 80s, 160s |
+| **是否消耗重试计数** | **是**，`self.request.retries += 1` | **是**，`self.request.retries += 1` |
+| **3xx/4xx 跳过** | 不涉及 | `handle_webhook_retry` 中 300-499 不重试，直接返回 |
+
+### 15.3 共享预算的影响分析
+
+**场景推演**：
+
+```
+假设 max_retries=5，初始 retries=0
+
+场景 A：先 not_found 重试 3 次后 delivery 可见，再发送失败
+  retry 1: not_found → countdown=1, retries=1
+  retry 2: not_found → countdown=1, retries=2
+  retry 3: not_found → countdown=1, retries=3
+  retry 4: delivery 可见，发送请求 → 失败 → handle_webhook_retry
+           countdown=10*2^4=160s, retries=4
+  retry 5: 发送请求 → 失败 → handle_webhook_retry
+           countdown=10*2^5=320s, retries=5 → MaxRetriesExceededError
+  结果：发送失败只有 2 次重试机会，而非预期的 5 次
+
+场景 B：not_found 重试 5 次后 delivery 仍不可见
+  retry 1-5: not_found → countdown=1, retries=1..5
+  retry 6: not_found → MaxRetriesExceededError → 任务终止
+  结果：delivery 永远为 PENDING，发送请求一次都未执行
+
+场景 C：delivery 立即可见，发送失败 5 次
+  retry 1-5: 发送失败 → countdown=10,20,40,80,160, retries=1..5
+  retry 6: 发送失败 → MaxRetriesExceededError → delivery 标记 FAILED
+  结果：发送失败有完整的 5 次重试机会
+```
+
+### 15.4 触发条件、处理动作、状态结果并列说明
+
+| 触发条件 | 处理动作 | delivery 状态结果 | 剩余重试预算 |
+|---------|---------|------------------|-------------|
+| delivery 不可见（not_found=True） | `self.retry(countdown=1)` | 保持 PENDING | retries + 1 |
+| delivery 不可见，retries 已达 max_retries | `MaxRetriesExceededError`，任务终止 | **PENDING（僵尸）** | 0 |
+| delivery 可见 + 发送失败 + 非 3xx/4xx | `handle_webhook_retry` → `celery_task.retry(countdown=10*2^retries)` | `delivery_update(delivery, FAILED)` 每次失败都写入 FAILED | retries + 1 |
+| delivery 可见 + 发送失败 + 3xx/4xx 状态码 | `handle_webhook_retry` 返回 False，不重试 | FAILED | 不消耗 |
+| delivery 可见 + 发送失败 + retries 已达 max_retries | `MaxRetriesExceededError`（在 `handle_webhook_retry` 中捕获） | 已被 `delivery_update` 设为 FAILED | 0 |
+| delivery 可见 + 发送成功 | `delivery.status = SUCCESS` + `clear_successful_delivery` | SUCCESS（已清理） | 不适用 |
+
+### 15.5 关键发现
+
+1. **not_found 快速重试会蚕食发送失败的重试预算**。如果主从延迟消耗了 N 次重试，发送失败只剩 `5 - N` 次机会。
+
+2. **not_found 重试固定 1 秒间隔，不计入 `retry_backoff` 退避曲线**。因为 `send_webhook_request_async` 的 `retry_backoff=10`，但 not_found 分支直接传 `countdown=1`，不使用 `retry_backoff`。然而 `self.request.retries` 仍然递增，所以后续发送失败重试的退避基数 `10 * 2^retries` 会因 not_found 消耗的次数而跳级。
+
+3. **发送失败每次都会 `delivery_update(delivery, FAILED)`**，即使后续还会重试。这意味着 delivery 在每次失败重试之间短暂处于 FAILED 状态，直到重试成功才变为 SUCCESS。如果重试打满，delivery 最终保持 FAILED。
+
+4. **not_found 重试打满后 delivery 为 PENDING**，而发送失败重试打满后 delivery 为 FAILED——因为后者在重试前已经调用了 `delivery_update(delivery, EventDeliveryStatus.FAILED)`。

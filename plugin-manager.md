@@ -225,18 +225,29 @@ if channel_slug is not None and channel_slug not in self.loaded_channels:
 
 ---
 
-#### 基础假设
+#### 基础假设（基于代码核实结果）
 
-为了清晰对比，假设 `PLUGINS` 配置如下（按顺序）：
+根据代码核实，`BUILTIN_PLUGINS` 配置及各插件的 `CONFIGURATION_PER_CHANNEL` 属性如下（按 PLUGINS 顺序）：
 
-| 序号 | 插件类 | CONFIGURATION_PER_CHANNEL | 类型 |
-|------|--------|--------------------------|------|
-| 1 | AvataxPlugin | True | 通道插件 |
-| 2 | WebhookPlugin | True | 通道插件 |
-| 3 | StripePlugin | True | 通道插件 |
-| 4 | UserEmailPlugin | False | 全局插件 |
-| 5 | AdminEmailPlugin | False | 全局插件 |
-| 6 | OpenIDPlugin | False | 全局插件 |
+| 序号 | 插件类 | PLUGIN_ID | CONFIGURATION_PER_CHANNEL | 类型 | 定义位置 |
+|------|--------|-----------|--------------------------|------|---------|
+| 1 | DeprecatedAvataxPlugin | mirumee.taxes.avalara | 未定义，继承基类默认 `True` | 通道插件 | saleor/plugins/avatax/plugin.py |
+| 2 | WebhookPlugin | mirumee.webhooks | 显式 `False` | 全局插件 | saleor/plugins/webhook/plugin.py:162 |
+| 3 | DeprecatedDummyGatewayPlugin | mirumee.payments.dummy | 未定义，继承基类默认 `True` | 通道插件 | saleor/payment/gateways/dummy/plugin.py |
+| 4 | DeprecatedDummyCreditCardGatewayPlugin | mirumee.payments.dummy_credit_card | 未定义，继承基类默认 `True` | 通道插件 | saleor/payment/gateways/dummy_credit_card/plugin.py |
+| 5 | StripeGatewayPlugin | saleor.payments.stripe | 未定义，继承基类默认 `True` | 通道插件 | saleor/payment/gateways/stripe/plugin.py |
+| 6 | DeprecatedBraintreeGatewayPlugin | mirumee.payments.braintree | 显式 `True` | 通道插件 | saleor/payment/gateways/braintree/plugin.py:32 |
+| 7 | DeprecatedRazorpayPlugin | mirumee.payments.razorpay | 未定义，继承基类默认 `True` | 通道插件 | saleor/payment/gateways/razorpay/plugin.py |
+| 8 | UserEmailPlugin | mirumee.notifications.user_email | 显式 `True` | 通道插件 | saleor/plugins/user_email/plugin.py:75 |
+| 9 | AdminEmailPlugin | mirumee.notifications.admin_email | 显式 `False` | 全局插件 | saleor/plugins/admin_email/plugin.py:51 |
+| 10 | DeprecatedSendgridEmailPlugin | mirumee.notifications.sendgrid_email | 显式 `True` | 通道插件 | saleor/plugins/sendgrid/plugin.py:109 |
+| 11 | OpenIDConnectPlugin | mirumee.authentication.openid_connect | 显式 `False` | 全局插件 | saleor/plugins/openid_connect/plugin.py:69 |
+
+**基类默认值**：`BasePlugin.CONFIGURATION_PER_CHANNEL = True`（`saleor/plugins/base_plugin.py:113`）
+
+**分类汇总**：
+- 全局插件（3个）：WebhookPlugin, AdminEmailPlugin, OpenIDConnectPlugin
+- 通道插件（8个）：Avatax, DummyGateway, DummyCreditCard, Stripe, Braintree, Razorpay, UserEmail, Sendgrid
 
 ---
 
@@ -247,19 +258,19 @@ if channel_slug is not None and channel_slug not in self.loaded_channels:
     ↓
 _ensure_channel_plugins_loaded(None) 只加载全局插件
     ↓
-遍历 PLUGINS，只处理 CONFIGURATION_PER_CHANNEL=False 的
+遍历 PLUGINS（11个），只处理 CONFIGURATION_PER_CHANNEL=False 的（第2、9、11个）
     ↓
-all_plugins = [UserEmail, AdminEmail, OpenID]  ✅ 按 PLUGINS 顺序
+all_plugins = [Webhook, AdminEmail, OpenID]  ✅ 按 PLUGINS 顺序
     ↓
 2. 后续调用 get_plugins(channel_slug="usd")
     ↓
 _ensure_channel_plugins_loaded("usd")
-    ├─> 第一步：加载通道插件（Avatax, Webhook, Stripe）
-    │   └─> all_plugins 追加 → [UserEmail, AdminEmail, OpenID, Avatax(usd), Webhook(usd), Stripe(usd)]
+    ├─> 第一步：加载通道插件（第1、3、4、5、6、7、8、10个，共8个）
+    │   └─> all_plugins 追加 → [Webhook, AdminEmail, OpenID, Avatax(usd), DummyGateway(usd), DummyCreditCard(usd), Stripe(usd), Braintree(usd), Razorpay(usd), UserEmail(usd), Sendgrid(usd)]
     └─> 第二步：调用 _ensure_channel_plugins_loaded(None)，但 loaded_global=True，跳过
 ```
 
-**all_plugins 最终顺序**：`[全局×3, usd通道×3]`
+**all_plugins 最终顺序**：`[全局×3, usd通道×8]`
 
 **无 channel 调用顺序**：全局插件在前，usd 通道插件在后，各自按 PLUGINS 顺序。
 
@@ -267,23 +278,23 @@ _ensure_channel_plugins_loaded("usd")
 
 #### 场景 B：先触发有 channel 的调用，再触发无 channel 的调用
 
-**⚠️ 这是与场景 A 顺序完全相反的情况！**
+**⚠️ 这是与场景 A 顺序完全不同的情况！**
 
 ```
 1. 调用 get_plugins(channel_slug="usd")
     ↓
 _ensure_channel_plugins_loaded("usd")
-    ├─> 第一步：先加载通道插件（Avatax, Webhook, Stripe）
-    │   └─> all_plugins = [Avatax(usd), Webhook(usd), Stripe(usd)]  ⚠️ 通道插件在前！
+    ├─> 第一步：先加载通道插件（共8个）
+    │   └─> all_plugins = [Avatax(usd), DummyGateway(usd), DummyCreditCard(usd), Stripe(usd), Braintree(usd), Razorpay(usd), UserEmail(usd), Sendgrid(usd)]  ⚠️ 8个通道插件在前！
     └─> 第二步：才调用 _ensure_channel_plugins_loaded(None) 加载全局插件
-        └─> all_plugins 追加 → [Avatax(usd), Webhook(usd), Stripe(usd), UserEmail, AdminEmail, OpenID]
+        └─> 遍历 PLUGINS，处理第2、9、11个 → all_plugins 追加 → [..., Webhook, AdminEmail, OpenID]
     ↓
 2. 调用 get_plugins(channel_slug=None)
     ↓
-返回 all_plugins = [Avatax(usd), Webhook(usd), Stripe(usd), UserEmail, AdminEmail, OpenID]
+返回 all_plugins = [Avatax(usd), DummyGateway(usd), ..., Sendgrid(usd), Webhook, AdminEmail, OpenID]
 ```
 
-**all_plugins 最终顺序**：`[usd通道×3, 全局×3]`
+**all_plugins 最终顺序**：`[usd通道×8, 全局×3]`
 
 **无 channel 调用顺序**：usd 通道插件在前，全局插件在后，各自按 PLUGINS 顺序。
 
@@ -299,15 +310,15 @@ _ensure_channel_plugins_loaded("usd")
 遍历 channels：先 eur，后 usd
     ↓
 加载 eur:
-    ├─> 第一步：all_plugins = [Avatax(eur), Webhook(eur), Stripe(eur)]
-    └─> 第二步：all_plugins = [Avatax(eur), Webhook(eur), Stripe(eur), UserEmail, AdminEmail, OpenID]
+    ├─> 第一步：all_plugins = [Avatax(eur), DummyGateway(eur), DummyCreditCard(eur), Stripe(eur), Braintree(eur), Razorpay(eur), UserEmail(eur), Sendgrid(eur)]
+    └─> 第二步：all_plugins 追加全局 → [..., Webhook, AdminEmail, OpenID]
     ↓
 加载 usd:
-    ├─> 第一步：all_plugins 追加 → [..., Avatax(usd), Webhook(usd), Stripe(usd)]
+    ├─> 第一步：all_plugins 追加通道 → [..., Avatax(usd), DummyGateway(usd), ..., Sendgrid(usd)]
     └─> 第二步：loaded_global=True，跳过
 ```
 
-**all_plugins 最终顺序**：`[eur通道×3, 全局×3, usd通道×3]`
+**all_plugins 最终顺序**：`[eur通道×8, 全局×3, usd通道×8]`
 
 **无 channel 调用顺序**：eur 通道插件 → 全局插件 → usd 通道插件，每类内部按 PLUGINS 顺序。
 
@@ -317,16 +328,16 @@ _ensure_channel_plugins_loaded("usd")
 
 ```
 1. 调用 get_plugins(channel_slug="eur")
-   → all_plugins = [Avatax(eur), Webhook(eur), Stripe(eur), UserEmail, AdminEmail, OpenID]
+   → all_plugins = [eur通道×8, 全局×3]
 
 2. 调用 get_plugins(channel_slug="usd")
-   → all_plugins = [Avatax(eur), Webhook(eur), Stripe(eur), UserEmail, AdminEmail, OpenID, Avatax(usd), Webhook(usd), Stripe(usd)]
+   → all_plugins = [eur通道×8, 全局×3, usd通道×8]
 
 3. 调用 get_plugins(channel_slug=None)
    → 返回上述 all_plugins
 ```
 
-**all_plugins 最终顺序**：`[eur通道×3, 全局×3, usd通道×3]`
+**all_plugins 最终顺序**：`[eur通道×8, 全局×3, usd通道×8]`
 
 ---
 
@@ -334,25 +345,38 @@ _ensure_channel_plugins_loaded("usd")
 
 | 触发时序 | all_plugins 顺序 | get_plugins(None) 返回顺序 |
 |---------|----------------|--------------------------|
-| 先 None 后 usd | `[全局×3, usd通道×3]` | `[全局×3, usd通道×3]` |
-| 先 usd 后 None | `[usd通道×3, 全局×3]` | `[usd通道×3, 全局×3]` |
-| get_all_plugins() | `[eur通道×3, 全局×3, usd通道×3]` | `[eur通道×3, 全局×3, usd通道×3]` |
-| 先 eur 再 usd 再 None | `[eur通道×3, 全局×3, usd通道×3]` | `[eur通道×3, 全局×3, usd通道×3]` |
+| 先 None 后 usd | `[全局×3, usd通道×8]` | `[全局×3, usd通道×8]` |
+| 先 usd 后 None | `[usd通道×8, 全局×3]` | `[usd通道×8, 全局×3]` |
+| get_all_plugins() | `[eur通道×8, 全局×3, usd通道×8]` | `[eur通道×8, 全局×3, usd通道×8]` |
+| 先 eur 再 usd 再 None | `[eur通道×8, 全局×3, usd通道×8]` | `[eur通道×8, 全局×3, usd通道×8]` |
 
 ### 3.5 关键结论
 
-1. **`plugins_per_channel[channel_slug]` 顺序确定**：无论加载历史如何，始终是 `[通道插件按 PLUGINS 顺序] + [全局插件按 PLUGINS 顺序]`
+1. **`plugins_per_channel[channel_slug]` 顺序确定**：无论加载历史如何，始终是 `[8个通道插件按 PLUGINS 顺序] + [3个全局插件按 PLUGINS 顺序]`
 
 2. **`all_plugins` 顺序不确定**：完全取决于加载触发的历史时序，可能出现：
-   - 全局插件在前（先调用无 channel）
-   - 通道插件在前（先调用有 channel）
-   - 多个通道插件交替出现（按 Channel 加载顺序）
+   - `[全局×3, 通道×8]`（先调用无 channel）
+   - `[通道×8, 全局×3]`（先调用有 channel）
+   - `[eur通道×8, 全局×3, usd通道×8]`（按 Channel 加载顺序）
 
 3. **`get_plugins(channel_slug=None)` 返回 `all_plugins`**：因此其调用顺序也是不确定的，取决于加载历史
 
-4. **设计意图**：`all_plugins` 主要用于管理后台查询所有插件配置，而非用于需要确定顺序的业务逻辑。业务逻辑应始终明确指定 `channel_slug`。
+4. **数量差异显著**：实际内置插件中，通道插件（8个）远多于全局插件（3个），这意味着先调用有 channel 时，`all_plugins` 中 73% 是通道插件，只有 27% 是全局插件
 
-### 3.6 无 channel 场景的使用场景
+5. **设计意图**：`all_plugins` 主要用于管理后台查询所有插件配置，而非用于需要确定顺序的业务逻辑。业务逻辑应始终明确指定 `channel_slug`。
+
+### 3.6 插件分类总结
+
+根据代码核实，内置插件分类如下：
+
+| 分类 | 数量 | 插件列表 | PLUGINS 中的位置 |
+|------|------|---------|----------------|
+| 全局插件 | 3个 | WebhookPlugin, AdminEmailPlugin, OpenIDConnectPlugin | 第2、9、11位 |
+| 通道插件 | 8个 | Avatax, DummyGateway, DummyCreditCard, Stripe, Braintree, Razorpay, UserEmail, Sendgrid | 第1、3、4、5、6、7、8、10位 |
+
+**注意**：遍历 PLUGINS 列表时，全局插件和通道插件是**交替出现**的，而非连续排列。加载时会跳过不符合条件的插件，只将符合条件的按顺序加入列表。
+
+### 3.7 无 channel 场景的使用场景
 
 无 channel 的插件调用主要用于：
 
@@ -662,6 +686,14 @@ def __run_method_on_single_plugin(self, plugin: Optional["BasePlugin"],
 
 **修正**：entry_points 注册流程还会将插件所属的 Django App 注入 `INSTALLED_APPS`，这对插件的模型、迁移、管理命令等功能至关重要。
 
+### 偏差 7：认为插件默认是全局插件（CONFIGURATION_PER_CHANNEL=False）
+
+**修正**：基类 `BasePlugin` 的默认值是 `CONFIGURATION_PER_CHANNEL = True`，未显式定义的插件默认都是**通道插件**。实际内置插件中，只有 3 个显式设置为 `False`，其余 8 个（包括未显式定义的）都是通道插件。
+
+### 偏差 8：认为遍历 PLUGINS 时全局插件和通道插件是连续排列的
+
+**修正**：实际 PLUGINS 列表中，全局插件（第2、9、11位）和通道插件（第1、3、4、5、6、7、8、10位）是**交替出现**的。加载时会跳过不符合条件的插件，只将符合条件的按顺序加入列表。
+
 ---
 
 ## 7. 总结
@@ -679,8 +711,9 @@ def __run_method_on_single_plugin(self, plugin: Optional["BasePlugin"],
 
 1. **外部插件注册**：entry_points 不仅注册插件类，还注入 Django App 到 `INSTALLED_APPS`
 2. **无 channel 调用**：只返回已加载的插件，顺序取决于加载触发时机，**时序敏感**
-3. **all_plugins 顺序不确定**：取决于加载历史，先调用有 channel 则通道插件在前，先调用无 channel 则全局插件在前
-4. **plugins_per_channel 顺序确定**：始终是 `[通道插件按 PLUGINS 顺序] + [全局插件按 PLUGINS 顺序]`
-5. **Manager 生命周期**：请求级隔离，DataLoader 实现同一请求内复用
-6. **读写库路径**：读操作走 replica，写操作走 default，由 `allow_replica` 参数控制
-7. **PLUGINS 顺序**：决定所有场景下的插件调用优先级
+3. **all_plugins 顺序不确定**：取决于加载历史，先调用有 channel 则8个通道插件在前，先调用无 channel 则3个全局插件在前
+4. **plugins_per_channel 顺序确定**：始终是 `[8个通道插件按 PLUGINS 顺序] + [3个全局插件按 PLUGINS 顺序]`
+5. **基类默认值重要**：`BasePlugin.CONFIGURATION_PER_CHANNEL = True`，未显式定义的插件默认都是通道插件
+6. **Manager 生命周期**：请求级隔离，DataLoader 实现同一请求内复用
+7. **读写库路径**：读操作走 replica，写操作走 default，由 `allow_replica` 参数控制
+8. **PLUGINS 顺序**：决定所有场景下的插件调用优先级

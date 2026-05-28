@@ -838,9 +838,94 @@ def send_webhook_request_async(self, event_delivery_id, ...):
 
 ### 11.3 结果
 
-- **成功**: 1秒后 delivery 在从库可见，任务正常执行
-- **失败**: 如果多次重试后仍不可见，最终会因 `MaxRetriesExceededError` 标记为失败
-- **设计意图**: 针对主从复制延迟的常见场景，用最小代价（1秒等待）解决大部分临时性不可见问题
+| 场景 | 状态变化 | 说明 |
+|------|---------|------|
+| **重试期间 delivery 可见** | EventDelivery 保持 PENDING → 正常发送 → SUCCESS/FAILED | 任务继续执行发送逻辑 |
+| **重试超限（max_retries=5）** | EventDelivery **仍保持 PENDING** | Celery 抛出 `MaxRetriesExceededError`，任务终止，但由于 delivery 对象始终不可见，代码中没有任何地方能更新其状态 |
+
+> **重要修正**：当 delivery 因主从延迟持续不可见时，重试超限后 EventDelivery 状态不会自动变为 FAILED。因为 `not_found=True` 时 `delivery is None`，无法调用 `delivery_update()`。这意味着会存在"僵尸" PENDING 状态的 delivery 记录。
+
+### 11.4 Inactive Delivery 处理分支
+
+**文件位置**: `saleor/webhook/transport/utils.py:522-542`
+
+#### 触发条件
+| 触发条件 | 说明 |
+|---------|------|
+| Webhook 被禁用 (`webhook.is_active = False`) | 管理员手动停用了 Webhook |
+| App 被禁用且不是生命周期事件 (`app.is_active = False`) | App 被停用，且非 APP_DELETED/APP_STATUS_CHANGED |
+| App 被软删除 (`app.removed_at IS NOT NULL`) | App 被标记删除 |
+
+#### 处理动作
+
+```python
+def get_multiple_deliveries_for_webhooks(event_delivery_ids, ...):
+    deliveries = EventDelivery.objects.using(...).filter(id__in=event_delivery_ids)
+
+    for delivery in deliveries:
+        bypass_inactive_check = delivery.event_type in (
+            WebhookEventAsyncType.APP_DELETED,
+            WebhookEventAsyncType.APP_STATUS_CHANGED,
+        )
+        should_deliver = delivery.webhook.is_active and (
+            delivery.webhook.app.is_active or bypass_inactive_check
+        )
+
+        if should_deliver:
+            active_deliveries[delivery.pk] = delivery
+        else:
+            logger.info("Event delivery id: %r app/webhook is disabled.", delivery.pk)
+            inactive_delivery_ids.add(delivery.pk)
+
+    # 批量标记 inactive delivery 为 FAILED
+    if inactive_delivery_ids:
+        EventDelivery.objects.filter(id__in=inactive_delivery_ids).update(
+            status=EventDeliveryStatus.FAILED
+        )
+
+    return active_deliveries, inactive_delivery_ids
+```
+
+**处理流程**:
+```
+EventDelivery
+  ├─ webhook.is_active = False → inactive → 标记 FAILED
+  ├─ webhook.app.is_active = False
+  │    ├─ event_type == APP_DELETED/APP_STATUS_CHANGED → bypass → 继续发送
+  │    └─ 其他事件类型 → inactive → 标记 FAILED
+  └─ app.removed_at IS NOT NULL
+       ├─ event_type == APP_DELETED/APP_STATUS_CHANGED → bypass → 继续发送
+       └─ 其他事件类型 → inactive → 标记 FAILED
+```
+
+#### 结果
+- **继续发送**: 通过 `active_deliveries` 返回，后续正常执行发送逻辑
+- **标记 FAILED**: 立即批量更新数据库状态为 `EventDeliveryStatus.FAILED`，不创建 attempt 记录
+- **设计意图**: APP_DELETED/APP_STATUS_CHANGED 是特殊生命周期事件，即使 App 被停用/删除也需要通知外部系统
+
+---
+
+## 11.5 Delivery 不可见与 Inactive 的完整分支逻辑
+
+```
+get_delivery_for_webhook(event_delivery_id)
+  ↓
+get_multiple_deliveries_for_webhooks([id])
+  ├─ 查询数据库获取 delivery
+  │    ├─ delivery 不存在 → not_found_delivery_ids（记录 warning）
+  │    └─ delivery 存在
+  │         ├─ 检查 webhook/app 是否 active
+  │         │    ├─ 应该发送 → active_deliveries[id] = delivery
+  │         │    └─ 不应发送 → inactive_delivery_ids.add(id) + 标记 FAILED
+  │         └─ 批量更新 inactive 状态
+  └─ return (active_deliveries, inactive_delivery_ids)
+  ↓
+delivery = active_deliveries.get(id)
+  ├─ delivery 存在 → 继续执行发送
+  └─ delivery 不存在
+       ├─ id in inactive_delivery_ids → not_found = False → 静默 return
+       └─ id not in inactive_delivery_ids → not_found = True → raise retry(countdown=1)
+```
 
 ---
 
@@ -920,6 +1005,96 @@ def generate_deferred_payloads(self, event_delivery_ids, ...):
               (最终处理或失败)
 ```
 
+### 12.2.1 send_webhook_queue 完整继承路径
+
+**关键代码位置**: `saleor/webhook/transport/asynchronous/transport.py:591-600` 与 `714-724`
+
+#### 触发条件
+| 触发条件 | 说明 |
+|---------|------|
+| 部分 delivery 缺失需要补排队 | `missing_delivery_pks` 非空 |
+| 原始任务传入了 `send_webhook_queue` | WebhookPlugin 调用时指定了事件专用队列（如 ORDER_*、CHECKOUT_*） |
+
+#### 处理动作
+
+**第一阶段：原始任务入队（WebhookPlugin → generate_deferred_payloads）**
+```python
+# 在 trigger_webhooks_async_for_multiple_objects 中
+generate_deferred_payloads.apply_async(
+    kwargs={
+        "event_delivery_ids": event_delivery_ids,
+        "deferred_payload_data": asdict(deferred_payload_data),
+        "send_webhook_queue": queue,  # <-- 传入事件专用队列（ORDER/CHECKOUT）
+        "telemetry_context": get_task_context().to_dict(),
+    },
+    queue=settings.WEBHOOK_DEFERRED_PAYLOAD_QUEUE_NAME,  # <-- generate 任务本身用延迟队列
+)
+```
+
+**第二阶段：补排队（继承所有 kwargs）**
+```python
+if missing_delivery_pks:
+    request_kwargs = self.request.kwargs  # <-- 获取当前任务的所有 kwargs
+    generate_deferred_payloads.apply_async(
+        kwargs={
+            **request_kwargs,  # <-- 展开所有 kwargs，包含 send_webhook_queue
+            "event_delivery_ids": list(missing_delivery_pks),
+        },
+        MessageGroupId=message_group_id,
+    )
+```
+
+**第三阶段：最终发送队列决策（_generate_deferred_payloads）**
+```python
+def _generate_deferred_payloads(..., send_webhook_queue, ...):
+    # ... 生成 payload ...
+    for delivery in event_deliveries_for_bulk_update:
+        send_webhook_request_async.apply_async(
+            kwargs={"event_delivery_id": delivery.pk, ...},
+            queue=get_queue_name_for_webhook(
+                delivery.webhook,
+                # <-- send_webhook_queue 一路传递到此处
+                default_queue=send_webhook_queue or settings.WEBHOOK_CELERY_QUEUE_NAME,
+            ),
+        )
+```
+
+**完整传递链路**:
+```
+WebhookPlugin.order_created(queue=ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME)
+  ↓
+trigger_webhooks_async(queue=ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME)
+  ↓
+trigger_webhooks_async_for_multiple_objects(queue=ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME)
+  ↓
+generate_deferred_payloads.apply_async(
+    kwargs={"send_webhook_queue": ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME},
+    queue=WEBHOOK_DEFERRED_PAYLOAD_QUEUE_NAME  # generate 任务用延迟队列
+)
+  ↓ (部分 delivery 缺失，补排队)
+generate_deferred_payloads.apply_async(
+    kwargs={**request_kwargs, "event_delivery_ids": missing},
+    # request_kwargs 包含 send_webhook_queue=ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME
+)
+  ↓ (payload 生成完成)
+send_webhook_request_async.apply_async(
+    queue=get_queue_name_for_webhook(
+        webhook,
+        default_queue=ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME  # <-- 继承成功
+    )
+)
+```
+
+#### 结果
+| 场景 | 最终发送队列 | 说明 |
+|------|-------------|------|
+| **HTTP Webhook + Order 事件** | `ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME` | 事件专用队列继承成功 |
+| **SQS Webhook + Order 事件** | `WEBHOOK_SQS_CELERY_QUEUE_NAME` | 协议专用队列优先级更高，覆盖事件队列 |
+| **HTTP Webhook + Product 事件（无专用队列）** | `WEBHOOK_CELERY_QUEUE_NAME` | 回退到默认队列 |
+| **补排队任务** | 与原始任务相同 | 通过 `**request_kwargs` 完整继承 `send_webhook_queue` |
+
+> **设计要点**: `generate_deferred_payloads` 任务本身始终运行在 `WEBHOOK_DEFERRED_PAYLOAD_QUEUE_NAME` 队列上，但 `send_webhook_queue` 参数仅用于决定**最终发送任务**的队列。这实现了"payload 生成集中处理，发送按业务类型分流"的架构。
+
 ### 12.3 结果
 
 - **已可用 delivery**: 立即生成 payload 并入队 `send_webhook_request_async`，不被缺失的 delivery 阻塞
@@ -951,19 +1126,42 @@ def generate_deferred_payloads(self, event_delivery_ids, ...):
 | Webhook scheme 是 http/https 且传入 queue=None | 使用 WEBHOOK_CELERY_QUEUE_NAME | 默认队列 |
 | 以上队列未配置环境变量 | 回退到 WEBHOOK_CELERY_QUEUE_NAME | 默认队列兜底 |
 
-### 13.3 Delivery 不可见重试
+### 13.3 Delivery 完整分支处理
+
+| 触发条件 | 处理动作 | 结果 |
+|---------|---------|------|
+| **Inactive: webhook.is_active = False | 加入 inactive_delivery_ids + 批量更新 | EventDelivery 标记为 FAILED |
+| **Inactive: app.is_active = False 且非生命周期事件 | 加入 inactive_delivery_ids + 批量更新 | EventDelivery 标记为 FAILED |
+| **Bypass: APP_DELETED/APP_STATUS_CHANGED 且 app 停用/删除 | 加入 active_deliveries | 继续发送 |
+| **NotFound: delivery 不存在且不在 inactive 列表 | raise self.retry(countdown=1) | 1秒后快速重试 |
+
+### 13.4 Delivery 不可见重试
 
 | 触发条件 | 处理动作 | 结果 |
 |---------|---------|------|
 | get_delivery_for_webhook 返回 (None, True) | raise self.retry(countdown=1) | 1秒后快速重试 |
 | 重试后 delivery 可见 | 正常执行发送逻辑 | Webhook 发送成功或失败 |
-| 重试超过 max_retries=5 次 | MaxRetriesExceededError | EventDelivery 标记为 FAILED |
+| 重试超过 max_retries=5 次 | MaxRetriesExceededError | EventDelivery **仍为 PENDING（僵尸状态） |
 
-### 13.4 Deferred Payload 补排队
+> **重要修正**: 重试超限后 EventDelivery 不会被标记为 FAILED，因为 delivery 对象始终不可见
+
+### 13.5 Deferred Payload 补排队
 
 | 触发条件 | 处理动作 | 结果 |
 |---------|---------|------|
 | 全部 delivery 缺失 | 指数退避重试 (1s, 2s, 4s, ...) | 等待主从同步 |
-| 部分 delivery 缺失 | 缺失的重新入队，可用的立即处理 | 分批分流，不阻塞 |
+| 部分 delivery 缺失 | 缺失的重新入队（**request_kwargs 全继承），可用的立即处理 | 分批分流，不阻塞 |
 | 重试超过 max_retries=12 次 | MaxRetriesExceededError | 记录错误日志，放弃 |
 | delivery 最终可用 | 生成 payload 并入队发送 | Webhook 正常发送 |
+| 补排队任务中的 send_webhook_queue | 通过 **request_kwargs 完整继承 | 最终发送队列与原始任务一致 |
+
+### 13.6 send_webhook_queue 继承链路
+
+| 阶段 | 队列用途 | 队列名称 |
+|------|---------|---------|
+| WebhookPlugin 传入 | 事件专用队列 | ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME |
+| generate_deferred_payloads 任务自身 | 延迟 payload 生成队列 | WEBHOOK_DEFERRED_PAYLOAD_QUEUE_NAME |
+| 补排队任务自身 | 延迟 payload 生成队列 | WEBHOOK_DEFERRED_PAYLOAD_QUEUE_NAME |
+| 最终 send_webhook_request_async | 最终发送队列（继承 send_webhook_queue） | ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME |
+
+> **设计要点：generate_deferred_payloads 任务始终在延迟队列执行，send_webhook_queue 只影响最终发送任务的队列

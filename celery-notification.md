@@ -849,82 +849,73 @@ def send_webhook_request_async(self, event_delivery_id, ...):
 
 **文件位置**: `saleor/webhook/transport/utils.py:522-542`
 
-#### 触发条件
-| 触发条件 | 说明 |
-|---------|------|
-| Webhook 被禁用 (`webhook.is_active = False`) | 管理员手动停用了 Webhook |
-| App 被禁用且不是生命周期事件 (`app.is_active = False`) | App 被停用，且非 APP_DELETED/APP_STATUS_CHANGED |
-| App 被软删除 (`app.removed_at IS NOT NULL`) | App 被标记删除 |
-
-#### 处理动作
+代码中唯一的判定表达式为：
 
 ```python
-def get_multiple_deliveries_for_webhooks(event_delivery_ids, ...):
-    deliveries = EventDelivery.objects.using(...).filter(id__in=event_delivery_ids)
-
-    for delivery in deliveries:
-        bypass_inactive_check = delivery.event_type in (
-            WebhookEventAsyncType.APP_DELETED,
-            WebhookEventAsyncType.APP_STATUS_CHANGED,
-        )
-        should_deliver = delivery.webhook.is_active and (
-            delivery.webhook.app.is_active or bypass_inactive_check
-        )
-
-        if should_deliver:
-            active_deliveries[delivery.pk] = delivery
-        else:
-            logger.info("Event delivery id: %r app/webhook is disabled.", delivery.pk)
-            inactive_delivery_ids.add(delivery.pk)
-
-    # 批量标记 inactive delivery 为 FAILED
-    if inactive_delivery_ids:
-        EventDelivery.objects.filter(id__in=inactive_delivery_ids).update(
-            status=EventDeliveryStatus.FAILED
-        )
-
-    return active_deliveries, inactive_delivery_ids
+should_deliver = delivery.webhook.is_active and (
+    delivery.webhook.app.is_active or bypass_inactive_check
+)
 ```
 
-**处理流程**:
-```
-EventDelivery
-  ├─ webhook.is_active = False → inactive → 标记 FAILED
-  ├─ webhook.app.is_active = False
-  │    ├─ event_type == APP_DELETED/APP_STATUS_CHANGED → bypass → 继续发送
-  │    └─ 其他事件类型 → inactive → 标记 FAILED
-  └─ app.removed_at IS NOT NULL
-       ├─ event_type == APP_DELETED/APP_STATUS_CHANGED → bypass → 继续发送
-       └─ 其他事件类型 → inactive → 标记 FAILED
-```
+其中 `bypass_inactive_check` 仅在 `event_type in (APP_DELETED, APP_STATUS_CHANGED)` 时为 True。
+
+> **注意**: 代码中**没有**判断 `app.removed_at`。虽然被软删除的 App 通常 `is_active=False`，但 `removed_at` 字段本身并不参与 `should_deliver` 的条件计算。
+
+#### 触发条件（仅基于实际 if 判断）
+
+| 触发条件 | 处理动作 | 结果 |
+|---------|---------|------|
+| `webhook.is_active = False` | `inactive_delivery_ids.add(pk)` | 标记 FAILED |
+| `webhook.is_active = True` 且 `app.is_active = True` | `active_deliveries[pk] = delivery` | 继续发送 |
+| `webhook.is_active = True` 且 `app.is_active = False` 且 `event_type in (APP_DELETED, APP_STATUS_CHANGED)` | `active_deliveries[pk] = delivery` | 继续发送（bypass） |
+| `webhook.is_active = True` 且 `app.is_active = False` 且 `event_type` 不是生命周期事件 | `inactive_delivery_ids.add(pk)` | 标记 FAILED |
 
 #### 结果
 - **继续发送**: 通过 `active_deliveries` 返回，后续正常执行发送逻辑
 - **标记 FAILED**: 立即批量更新数据库状态为 `EventDeliveryStatus.FAILED`，不创建 attempt 记录
-- **设计意图**: APP_DELETED/APP_STATUS_CHANGED 是特殊生命周期事件，即使 App 被停用/删除也需要通知外部系统
+- **设计意图**: APP_DELETED/APP_STATUS_CHANGED 是特殊生命周期事件，即使 App 被停用也需要通知外部系统
 
 ---
 
-## 11.5 Delivery 不可见与 Inactive 的完整分支逻辑
+## 11.5 not_found 与 inactive 两条分支并列对照
 
+`send_webhook_request_async` 中对 `delivery` 不可获取的情况有两条互斥的分支路径：
+
+```python
+delivery, not_found = get_delivery_for_webhook(event_delivery_id)
+if not delivery:
+    if not_found:        # 分支 A：delivery 在数据库中不存在
+        raise self.retry(countdown=1)
+    return               # 分支 B：delivery 存在但属于 inactive
 ```
-get_delivery_for_webhook(event_delivery_id)
+
+| 维度 | not_found 分支（A） | inactive 分支（B） |
+|------|---------------------|-------------------|
+| **何时进入** | delivery 在 DB 中查不到，且不在 `inactive_delivery_ids` 中 | delivery 在 DB 中查得到，但 `should_deliver = False`，因此不在 `active_deliveries` 中 |
+| **根本原因** | 主从延迟：主库已写入 EventDelivery，从库尚未同步 | 业务停用：webhook 或 app 已被禁用 |
+| **处理动作** | `raise self.retry(countdown=1)` | `return`（静默退出） |
+| **是否重试** | 是，1 秒后快速重试 | 否，直接结束 |
+| **delivery 状态** | 保持 PENDING（未被代码触碰） | 已被批量更新为 FAILED |
+| **重试超限后** | 仍为 PENDING（僵尸记录） | 不适用（无重试） |
+
+**决策流程**:
+```
+send_webhook_request_async(event_delivery_id)
   ↓
-get_multiple_deliveries_for_webhooks([id])
-  ├─ 查询数据库获取 delivery
-  │    ├─ delivery 不存在 → not_found_delivery_ids（记录 warning）
-  │    └─ delivery 存在
-  │         ├─ 检查 webhook/app 是否 active
-  │         │    ├─ 应该发送 → active_deliveries[id] = delivery
-  │         │    └─ 不应发送 → inactive_delivery_ids.add(id) + 标记 FAILED
-  │         └─ 批量更新 inactive 状态
-  └─ return (active_deliveries, inactive_delivery_ids)
+get_delivery_for_webhook(id)
+  ↓ get_multiple_deliveries_for_webhooks([id])
+  ↓ 查询 DB
+  ├─ DB 中找到 delivery
+  │    ├─ should_deliver = True  → active_deliveries[id] = delivery
+  │    └─ should_deliver = False → inactive_delivery_ids.add(id) + 标记 FAILED
+  └─ DB 中未找到 delivery → not_found_delivery_ids（仅记录 warning）
+  ↓ return (active_deliveries, inactive_delivery_ids)
   ↓
 delivery = active_deliveries.get(id)
-  ├─ delivery 存在 → 继续执行发送
+  ├─ delivery 存在 → 正常发送
   └─ delivery 不存在
-       ├─ id in inactive_delivery_ids → not_found = False → 静默 return
-       └─ id not in inactive_delivery_ids → not_found = True → raise retry(countdown=1)
+       ├─ id in inactive_delivery_ids → not_found = False → 静默 return（分支 B）
+       └─ id not in inactive_delivery_ids → not_found = True → raise retry(countdown=1)（分支 A）
 ```
 
 ---
@@ -1126,34 +1117,35 @@ send_webhook_request_async.apply_async(
 | Webhook scheme 是 http/https 且传入 queue=None | 使用 WEBHOOK_CELERY_QUEUE_NAME | 默认队列 |
 | 以上队列未配置环境变量 | 回退到 WEBHOOK_CELERY_QUEUE_NAME | 默认队列兜底 |
 
-### 13.3 Delivery 完整分支处理
+### 13.3 Delivery 完整分支处理（基于 `should_deliver` 判定）
 
 | 触发条件 | 处理动作 | 结果 |
 |---------|---------|------|
-| **Inactive: webhook.is_active = False | 加入 inactive_delivery_ids + 批量更新 | EventDelivery 标记为 FAILED |
-| **Inactive: app.is_active = False 且非生命周期事件 | 加入 inactive_delivery_ids + 批量更新 | EventDelivery 标记为 FAILED |
-| **Bypass: APP_DELETED/APP_STATUS_CHANGED 且 app 停用/删除 | 加入 active_deliveries | 继续发送 |
-| **NotFound: delivery 不存在且不在 inactive 列表 | raise self.retry(countdown=1) | 1秒后快速重试 |
+| `webhook.is_active = False` | `inactive_delivery_ids.add(pk)` | EventDelivery.status → FAILED |
+| `webhook.is_active = True` 且 `app.is_active = True` | `active_deliveries[pk] = delivery` | 继续发送 |
+| `webhook.is_active = True` 且 `app.is_active = False` 且 `event_type in (APP_DELETED, APP_STATUS_CHANGED)` | `active_deliveries[pk] = delivery` | 继续发送（bypass） |
+| `webhook.is_active = True` 且 `app.is_active = False` 且非生命周期事件 | `inactive_delivery_ids.add(pk)` | EventDelivery.status → FAILED |
 
-### 13.4 Delivery 不可见重试
+> 代码中**没有**判断 `app.removed_at`，该字段不参与 `should_deliver` 计算。
 
-| 触发条件 | 处理动作 | 结果 |
-|---------|---------|------|
-| get_delivery_for_webhook 返回 (None, True) | raise self.retry(countdown=1) | 1秒后快速重试 |
-| 重试后 delivery 可见 | 正常执行发送逻辑 | Webhook 发送成功或失败 |
-| 重试超过 max_retries=5 次 | MaxRetriesExceededError | EventDelivery **仍为 PENDING（僵尸状态） |
+### 13.4 not_found 与 inactive 分支并列对照
 
-> **重要修正**: 重试超限后 EventDelivery 不会被标记为 FAILED，因为 delivery 对象始终不可见
+| 维度 | not_found 分支 | inactive 分支 |
+|------|---------------|---------------|
+| **触发条件** | delivery 在 DB 中查不到，且不在 `inactive_delivery_ids` | delivery 在 DB 中存在，但 `should_deliver = False` |
+| **处理动作** | `raise self.retry(countdown=1)` | `return`（静默退出） |
+| **是否重试** | 是，1 秒后快速重试，最多 5 次 | 否，直接结束 |
+| **delivery 状态** | 保持 PENDING | 已被更新为 FAILED |
+| **重试超限后** | 仍为 PENDING（僵尸记录） | 不适用 |
 
 ### 13.5 Deferred Payload 补排队
 
 | 触发条件 | 处理动作 | 结果 |
 |---------|---------|------|
-| 全部 delivery 缺失 | 指数退避重试 (1s, 2s, 4s, ...) | 等待主从同步 |
-| 部分 delivery 缺失 | 缺失的重新入队（**request_kwargs 全继承），可用的立即处理 | 分批分流，不阻塞 |
-| 重试超过 max_retries=12 次 | MaxRetriesExceededError | 记录错误日志，放弃 |
-| delivery 最终可用 | 生成 payload 并入队发送 | Webhook 正常发送 |
-| 补排队任务中的 send_webhook_queue | 通过 **request_kwargs 完整继承 | 最终发送队列与原始任务一致 |
+| 全部 delivery 在从库不可见 | `raise self.retry(countdown=1*2^retries)` | 指数退避重试，等待主从同步 |
+| 部分 delivery 在从库不可见 | 缺失的重新入队 `generate_deferred_payloads.apply_async(**request_kwargs)`，可用的立即调用 `_generate_deferred_payloads` | 分批分流，不阻塞 |
+| 重试超过 max_retries=12 次 | `MaxRetriesExceededError`，记录错误日志 | delivery 放弃处理 |
+| delivery 最终在从库可见 | 生成 payload 并入队 `send_webhook_request_async` | Webhook 正常发送 |
 
 ### 13.6 send_webhook_queue 继承链路
 
@@ -1164,4 +1156,4 @@ send_webhook_request_async.apply_async(
 | 补排队任务自身 | 延迟 payload 生成队列 | WEBHOOK_DEFERRED_PAYLOAD_QUEUE_NAME |
 | 最终 send_webhook_request_async | 最终发送队列（继承 send_webhook_queue） | ORDER_WEBHOOK_EVENTS_CELERY_QUEUE_NAME |
 
-> **设计要点：generate_deferred_payloads 任务始终在延迟队列执行，send_webhook_queue 只影响最终发送任务的队列
+> **设计要点**: `generate_deferred_payloads` 任务始终在延迟队列执行，`send_webhook_queue` 只影响最终发送任务的队列。补排队时通过 `**request_kwargs` 完整继承 `send_webhook_queue`。

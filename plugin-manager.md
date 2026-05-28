@@ -53,7 +53,7 @@ for entry_point in installed_plugins:
 PLUGINS: list[str] = BUILTIN_PLUGINS + EXTERNAL_PLUGINS
 ```
 
-### 2.2 Entry Points 配置示例
+### 2.2 Entry Points 配置示例与属性详解
 
 外部插件包需要在 `pyproject.toml` 或 `setup.py` 中声明 entry points：
 
@@ -63,11 +63,29 @@ PLUGINS: list[str] = BUILTIN_PLUGINS + EXTERNAL_PLUGINS
 my_custom_plugin = "my_custom_plugin.plugin:MyCustomPlugin"
 ```
 
-其中：
-- `entry_point.name` = `"my_custom_plugin"` → 注入到 `INSTALLED_APPS`
-- `entry_point.module` = `"my_custom_plugin.plugin"`
-- `entry_point.attr` = `"MyCustomPlugin"`
-- 最终 `plugin_path` = `"my_custom_plugin.plugin:MyCustomPlugin"`
+#### Entry Point 各属性的含义
+
+当 Python 解析上述 entry point 配置时，会生成一个 `EntryPoint` 对象，其属性如下：
+
+| 属性 | 值 | 来源 | 用途 |
+|------|----|------|------|
+| `entry_point.name` | `"my_custom_plugin"` | entry point 左侧的键名 | 注入到 `INSTALLED_APPS`，作为 Django App 名称 |
+| `entry_point.value` | `"my_custom_plugin.plugin:MyCustomPlugin"` | entry point 右侧的完整值 | 原始配置字符串 |
+| `entry_point.module` | `"my_custom_plugin.plugin"` | 冒号 `:` 左侧部分 | 插件类所在的模块路径 |
+| `entry_point.attr` | `"MyCustomPlugin"` | 冒号 `:` 右侧部分 | 插件类名 |
+| **`plugin_path` (代码构建)** | **`"my_custom_plugin.plugin.MyCustomPlugin"`** | **`module + "." + attr`** | **传给 `import_string` 用于导入插件类** |
+
+#### 关键拼接规则（代码实现）
+
+```python
+# saleor/settings.py:916
+# 注意：使用点号 "." 连接，而非冒号 ":"
+plugin_path = f"{entry_point.module}.{entry_point.attr}"
+```
+
+**为什么不用 `entry_point.value` 直接作为 plugin_path？**
+
+因为 `import_string`（Django 的工具函数）只接受 **点号分隔** 的导入路径（如 `"module.submodule.ClassName"`），而 entry point value 使用冒号分隔（如 `"module.submodule:ClassName"`）。因此必须通过 `module` 和 `attr` 重新拼接。
 
 ### 2.3 注入到 INSTALLED_APPS 的意义
 
@@ -77,6 +95,17 @@ my_custom_plugin = "my_custom_plugin.plugin:MyCustomPlugin"
 2. **模型发现**：Django 能够发现插件包中定义的模型
 3. **管理命令发现**：插件包中定义的 `management/commands` 可被发现
 4. **迁移发现**：插件包的 `migrations` 目录可被 Django 迁移系统识别
+
+**注意**：`entry_point.name` 必须与插件包的 Django App 名称一致。插件包的 `apps.py` 通常如下定义：
+
+```python
+# my_custom_plugin/apps.py
+from django.apps import AppConfig
+
+class MyCustomPluginConfig(AppConfig):
+    name = "my_custom_plugin"  # 必须与 entry_point.name 一致
+    verbose_name = "My Custom Plugin"
+```
 
 ### 2.4 注册流程时序图
 

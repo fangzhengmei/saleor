@@ -2,7 +2,7 @@
 
 ## 一、整体架构概览
 
-Saleor 的权限系统采用**三层防护机制**：字段级访问控制、查询接口守卫、业务逻辑校验。它们之间的关系如下：
+Saleor 的权限系统采用**四层防护机制**：字段级访问控制、查询接口守卫、核心权限校验、业务逻辑校验。它们之间的关系如下：
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -83,6 +83,18 @@ class Group(ModelObjectType[models.Group]):
 | `user_can_manage` | 当前用户是否可管理此组 | 动态业务逻辑判断 |
 | `accessible_channels` | 组可访问的渠道 | DataLoader 异步加载 |
 | `restricted_access_to_channels` | 是否限制渠道访问 | 无直接权限限制 |
+
+### 2.3 Group 数据库模型
+
+**文件位置：** `saleor/account/models.py:396-434`
+
+```python
+class Group(models.Model):
+    name = models.CharField("name", max_length=150, unique=True)
+    permissions = models.ManyToManyField(Permission, blank=True)
+    restricted_access_to_channels = models.BooleanField(default=False)
+    channels = models.ManyToManyField("channel.Channel", blank=True)
+```
 
 ---
 
@@ -221,11 +233,419 @@ def _get_result_of_permissions_checks(
     return perm_checks_results
 ```
 
+### 4.5 requestor 提取逻辑
+
+**文件位置：** `saleor/graphql/utils/__init__.py:204-207`
+
+```python
+def get_user_or_app_from_context(context: "SaleorContext") -> App | User | None:
+    # order is important
+    # app can be None but user if None then is passed as anonymous
+    return context.app or context.user
+```
+
 ---
 
-## 五、查询接口守卫：Query 与 Mutation 的权限声明
+## 五、查询守卫中的拦截分支详解
 
-### 5.1 Query 接口守卫
+### 5.1 四类拦截分支
+
+查询守卫在 `_get_result_of_permissions_checks` 中会遇到四种情况，每种情况的拦截逻辑不同：
+
+```
+get_user_or_app_from_context(context)
+          │
+          ├─► 情况1：requestor is None（未认证用户）
+          │       └─► 返回空列表 → any([]) = False → 拦截
+          │
+          ├─► 情况2：requestor 是 User（已认证用户）
+          │       └─► 调用 user.has_perm(perm) 逐个检查
+          │
+          └─► 情况3：requestor 是 App（应用请求）
+                  ├─► 检查 app.is_active
+                  ├─► 调用 app.has_perm(perm) 逐个检查
+                  └─► 特殊限制：某些操作（如创建权限组）直接拒绝 App
+```
+
+### 5.2 分支 1：未认证用户拦截
+
+**触发条件：** `context.app is None` 且 `context.user is None` 或为 AnonymousUser
+
+**拦截路径：**
+```python
+# _get_result_of_permissions_checks()
+requestor = get_user_or_app_from_context(context)  # 返回 None
+perm_checks_results = []  # 空列表
+return []
+
+# one_of_permissions_or_auth_filter_required()
+any([]) = False
+any([]) = False  # auth_filters_results 也为空
+return False
+
+# one_of_permissions_required()
+raise PermissionDenied(permissions=perms)
+```
+
+**返回结果：**
+```json
+{
+  "errors": [
+    {
+      "message": "To access this path, you need one of the following permissions: MANAGE_STAFF",
+      "extensions": {
+        "exception": {
+          "code": "PermissionDenied"
+        }
+      }
+    }
+  ],
+  "data": null
+}
+```
+
+### 5.3 分支 2：无权限用户拦截
+
+**触发条件：** requestor 是 User，但 `user.has_perm(perm)` 对所有权限都返回 False
+
+**User.has_perm() 实现：** `saleor/account/models.py:303-310`
+
+```python
+def has_perm(self, perm: BasePermissionEnum | str, obj=None) -> bool:
+    # 转换为字符串格式，如 "account.manage_staff"
+    perm = perm.value if isinstance(perm, BasePermissionEnum) else perm
+
+    # 超级用户直接通过（除非被 effective_permissions 覆盖）
+    if self.is_active and self.is_superuser and not self._effective_permissions:
+        return True
+    
+    # 调用认证后端链检查
+    return _user_has_perm(self, perm, obj)
+```
+
+**_user_has_perm 后端链检查：** `saleor/permission/models.py:8-18`
+
+```python
+def _user_has_perm(user, perm, obj):
+    """Backend can raise `PermissionDenied` to short-circuit permission checking."""
+    for backend in auth.get_backends():
+        if not hasattr(backend, "has_perm"):
+            continue
+        try:
+            if backend.has_perm(user, perm, obj):
+                return True
+        except PermissionDenied:
+            return False
+    return False
+```
+
+**JSONWebTokenBackend.has_perm()：** `saleor/core/auth_backend.py:103-104`
+
+```python
+def has_perm(self, user_obj, perm, obj=None):
+    return user_obj.is_active and super().has_perm(user_obj, perm, obj=obj)
+```
+
+**BaseBackend.has_perm()：** `saleor/core/auth_backend.py:45-46`
+
+```python
+def has_perm(self, user_obj, perm, obj=None):
+    return perm in self.get_all_permissions(user_obj, obj=obj)
+```
+
+### 5.4 分支 3：App 请求拦截
+
+**App.has_perm() 实现：** `saleor/app/models.py:122-128`
+
+```python
+def has_perm(self, perm: BasePermissionEnum | str) -> bool:
+    """Return True if the app has the specified permission."""
+    if not self.is_active:
+        return False
+
+    perm_value = perm.value if isinstance(perm, BasePermissionEnum) else perm
+    return perm_value in self.get_permissions()
+```
+
+**App.get_permissions() 实现：** `saleor/app/models.py:98-107`
+
+```python
+def get_permissions(self) -> set[str]:
+    """Return the permissions of the app."""
+    if not self.is_active:
+        return set()
+    perm_cache_name = "_app_perm_cache"
+    if not hasattr(self, perm_cache_name):
+        perms = self.permissions.all()
+        perms = perms.values_list("content_type__app_label", "codename").order_by()
+        setattr(self, perm_cache_name, {f"{ct}.{name}" for ct, name in perms})
+    return getattr(self, perm_cache_name)
+```
+
+**App 特殊限制拦截示例：** `saleor/graphql/account/mutations/permission_group/permission_group_create.py:140-148`
+
+```python
+@classmethod
+def check_permissions(
+    cls, context, permissions=None, require_all_permissions=False, **data
+):
+    app = get_app_promise(context).get()
+    if app:
+        # 🔴 直接拦截：App 不允许创建权限组
+        raise PermissionDenied(message="Apps are not allowed to perform this mutation.")
+    return super().check_permissions(context, permissions)
+```
+
+### 5.5 PermissionDenied 异常类
+
+**文件位置：** `saleor/core/exceptions.py:72-84`
+
+```python
+class PermissionDenied(Exception):
+    def __init__(self, message=None, *, permissions: Iterable[Enum] | None = None):
+        if not message:
+            if permissions:
+                permission_list = ", ".join(p.name for p in permissions)
+                message = (
+                    "To access this path, you need one of the "
+                    f"following permissions: {permission_list}"
+                )
+            else:
+                message = "You do not have permission to perform this action"
+        super().__init__(message)
+        self.permissions = permissions
+```
+
+---
+
+## 六、用户权限汇总链路：从 Group 到 has_perm
+
+### 6.1 完整链路图
+
+```
+用户发起请求
+    │
+    ▼
+JWT 认证 → 加载 User 对象
+    │
+    ▼
+权限检查调用 user.has_perm("account.manage_staff")
+    │
+    ├─► 1. User.has_perm()
+    │     ├─► 检查 is_superuser
+    │     └─► 调用 _user_has_perm()
+    │
+    ├─► 2. _user_has_perm()
+    │     └─► 遍历认证后端，调用 backend.has_perm()
+    │
+    ├─► 3. JSONWebTokenBackend.has_perm()
+    │     ├─► 检查 user.is_active
+    │     └─► 调用 get_all_permissions()
+    │
+    ├─► 4. get_all_permissions()
+    │     ├─► get_user_permissions() → _get_permissions("user")
+    │     └─► get_group_permissions() → _get_permissions("group")
+    │
+    └─► 5. _get_permissions()
+          ├─► 检查缓存 _effective_permissions_cache
+          └─► 调用 user.effective_permissions
+                │
+                ├─► 5.1 检查缓存 _effective_permissions
+                ├─► 5.2 构建权限 QuerySet
+                │     ├─► 用户直接权限 (user_permissions)
+                │     └─► 用户所属组权限 (groups__permissions)
+                └─► 5.3 返回合并后的权限 QuerySet
+```
+
+### 6.2 effective_permissions 核心实现
+
+**文件位置：** `saleor/account/models.py:247-288`
+
+```python
+@property
+def effective_permissions(self) -> models.QuerySet[Permission]:
+    if self._effective_permissions is None:
+        # 1. 获取所有可用权限的基础 QuerySet
+        self._effective_permissions = get_permissions()
+        
+        if not self.is_superuser:
+            # 2. 关联表：用户-权限 中间表
+            UserPermission = User.user_permissions.through
+            user_permission_queryset = UserPermission._default_manager.filter(
+                user_id=self.pk
+            ).values("permission_id")
+
+            # 3. 关联表：用户-组 和 组-权限 中间表
+            UserGroup = User.groups.through
+            GroupPermission = Group.permissions.through
+            
+            # 🔑 关键：找出用户所属的所有组
+            user_group_queryset = UserGroup._default_manager.filter(
+                user_id=self.pk
+            ).values("group_id")
+            
+            # 🔑 关键：找出这些组拥有的所有权限
+            group_permission_queryset = GroupPermission.objects.filter(
+                Exists(user_group_queryset.filter(group_id=OuterRef("group_id")))
+            ).values("permission_id")
+
+            # 4. 合并权限：用户直接权限 OR 组权限
+            self._effective_permissions = self._effective_permissions.filter(
+                Q(
+                    Exists(
+                        user_permission_queryset.filter(
+                            permission_id=OuterRef("pk")
+                        )
+                    )
+                )
+                | Q(
+                    Exists(
+                        group_permission_queryset.filter(
+                            permission_id=OuterRef("pk")
+                        )
+                    )
+                )
+            )
+    return self._effective_permissions
+```
+
+### 6.3 组权限汇总 SQL 逻辑
+
+```sql
+-- 伪代码：查询用户的所有有效权限
+SELECT p.*
+FROM permission p
+WHERE 
+  -- 用户直接拥有该权限
+  EXISTS (
+    SELECT 1 
+    FROM user_user_permissions uup 
+    WHERE uup.user_id = ? AND uup.permission_id = p.id
+  )
+  OR
+  -- 用户所属的某个组拥有该权限
+  EXISTS (
+    SELECT 1 
+    FROM group_permissions gp
+    WHERE gp.permission_id = p.id
+    AND EXISTS (
+      SELECT 1 
+      FROM user_groups ug 
+      WHERE ug.user_id = ? AND ug.group_id = gp.group_id
+    )
+  )
+```
+
+### 6.4 后端权限缓存机制
+
+**文件位置：** `saleor/core/auth_backend.py:67-82`
+
+```python
+def _get_permissions(self, user_obj, obj, from_name):
+    """Return the permissions of `user_obj` from `from_name`."""
+    if not user_obj.is_active or user_obj.is_anonymous or obj is not None:
+        return set()
+
+    perm_cache_name = "_effective_permissions_cache"
+    if not getattr(user_obj, perm_cache_name, None):
+        # 从 effective_permissions QuerySet 转换为字符串集合
+        perms = getattr(self, f"_get_{from_name}_permissions")(user_obj)
+        perms = perms.using(settings.DATABASE_CONNECTION_REPLICA_NAME)
+        perms = perms.values_list("content_type__app_label", "codename").order_by()
+        # 缓存格式：{"account.manage_staff", "order.manage_orders", ...}
+        setattr(user_obj, perm_cache_name, {f"{ct}.{name}" for ct, name in perms})
+    return getattr(user_obj, perm_cache_name)
+```
+
+### 6.5 has_perms 多权限检查
+
+**User.has_perms()：** `saleor/account/models.py:312-320`
+
+```python
+def has_perms(
+    self, perm_list: Iterable[BasePermissionEnum | str], obj=None
+) -> bool:
+    # 转换为字符串列表
+    perm_list = [
+        perm.value if isinstance(perm, BasePermissionEnum) else perm
+        for perm in perm_list
+    ]
+    # 🔑 调用 Django 父类方法，逐个调用 has_perm
+    return super().has_perms(perm_list, obj)
+```
+
+**PermissionsMixin.has_perms()：** `saleor/permission/models.py:158-163`
+
+```python
+def has_perms(self, perm_list, obj=None):
+    """Return True if the user has each of the specified permissions."""
+    # 🔑 AND 逻辑：必须拥有所有权限
+    return all(self.has_perm(perm, obj) for perm in perm_list)
+```
+
+---
+
+## 七、拒绝路径触发点和返回结果汇总
+
+### 7.1 拒绝触发点一览
+
+| 层级 | 触发点 | 代码位置 | 异常类型 |
+|------|--------|---------|---------|
+| 字段级 | `one_of_permissions_required` 装饰器 | `saleor/graphql/decorators.py:84-89` | `PermissionDenied` |
+| Mutation 级 | `BaseMutation.check_permissions` | `saleor/graphql/core/mutations.py` | `PermissionDenied` |
+| App 限制 | `PermissionGroupCreate.check_permissions` | `saleor/graphql/account/mutations/permission_group/permission_group_create.py:140-148` | `PermissionDenied` |
+| 业务逻辑 | `ensure_requestor_can_manage_group` | `saleor/graphql/account/mutations/permission_group/permission_group_update.py:120-136` | `ValidationError` |
+| 业务逻辑 | `ensure_can_manage_permissions` | `saleor/graphql/account/mutations/permission_group/permission_group_create.py:150-168` | `ValidationError` |
+| 字段级 | `CustomerEvent.resolve_user` | `saleor/graphql/account/types.py:240-256` | `PermissionDenied` |
+
+### 7.2 PermissionDenied 返回格式
+
+```json
+{
+  "errors": [
+    {
+      "message": "To access this path, you need one of the following permissions: MANAGE_STAFF",
+      "locations": [{"line": 2, "column": 3}],
+      "path": ["permissionGroups"],
+      "extensions": {
+        "exception": {
+          "code": "PermissionDenied"
+        }
+      }
+    }
+  ],
+  "data": {
+    "permissionGroups": null
+  }
+}
+```
+
+### 7.3 ValidationError（业务逻辑校验失败）返回格式
+
+```json
+{
+  "errors": [],
+  "data": {
+    "permissionGroupUpdate": {
+      "errors": [
+        {
+          "field": "addPermissions",
+          "message": "You can't add permission that you don't have.",
+          "code": "OUT_OF_SCOPE_PERMISSION",
+          "permissions": ["MANAGE_APPS"]
+        }
+      ],
+      "group": null
+    }
+  }
+}
+```
+
+---
+
+## 八、查询接口守卫：Query 与 Mutation 的权限声明
+
+### 8.1 Query 接口守卫
 
 **文件位置：** `saleor/graphql/account/schema.py:163-181`
 
@@ -251,7 +671,7 @@ class AccountQueries(graphene.ObjectType):
     )
 ```
 
-### 5.2 Mutation 接口守卫
+### 8.2 Mutation 接口守卫
 
 **文件位置：** `saleor/graphql/core/mutations.py:158-212`
 
@@ -277,7 +697,7 @@ class BaseMutation(graphene.Mutation):
         super().__init_subclass_with_meta__(description=description, _meta=_meta, **options)
 ```
 
-### 5.3 Mutation 权限检查时机
+### 8.3 Mutation 权限检查时机
 
 **文件位置：** `saleor/graphql/account/mutations/permission_group/permission_group_create.py:140-148`
 
@@ -300,7 +720,7 @@ class PermissionGroupCreate(DeprecatedModelMutation):
 
 ---
 
-## 六、权限组管理的四层校验
+## 九、权限组管理的四层校验
 
 以 `PermissionGroupUpdate` 为例，权限校验分为四层：
 
@@ -371,7 +791,7 @@ def ensure_can_manage_permissions(
 
 ---
 
-## 七、权限枚举定义
+## 十、权限枚举定义
 
 **文件位置：** `saleor/permission/enums.py:1-100`
 
@@ -395,12 +815,12 @@ class OrderPermissions(BasePermissionEnum):
 
 ---
 
-## 八、完整调用链路示例
+## 十一、完整调用链路示例
 
-### 示例 1：查询 permission_groups 接口
+### 示例 1：查询 permission_groups 接口（无权限用户）
 
 ```
-客户端请求
+客户端请求（未认证）
     │
     ▼
 GraphQL 执行引擎
@@ -427,16 +847,62 @@ account_passes_test 包装函数
     ▼
 one_of_permissions_or_auth_filter_required()
     │
-    ├─► get_user_or_app_from_context(context)
-    ├─► 对每个权限调用 requestor.has_perm(perm)
-    └─► 任一返回 True 则通过
+    ├─► get_user_or_app_from_context(context) → None
+    ├─► perm_checks_results = []
+    └─► any([]) = False
     │
     ▼
-校验通过 → 执行实际 resolver
-校验失败 → 抛出 PermissionDenied
+抛出 PermissionDenied(permissions=[MANAGE_STAFF])
+    │
+    ▼
+GraphQL 错误格式化
+    │
+    ▼
+返回错误响应
 ```
 
-### 示例 2：执行 PermissionGroupUpdate mutation
+### 示例 2：User.has_perm() 完整调用链
+
+```python
+user.has_perm(AccountPermissions.MANAGE_STAFF)
+    │
+    ├─► perm = "account.manage_staff"
+    │
+    ├─► 检查：is_active and is_superuser and not _effective_permissions
+    │     └─► 如果是超级用户且未被覆盖，直接返回 True
+    │
+    ▼
+_user_has_perm(user, "account.manage_staff", None)
+    │
+    ├─► 遍历 auth.get_backends()
+    │
+    ├─► JSONWebTokenBackend.has_perm(user, "account.manage_staff")
+    │     │
+    │     ├─► 检查 user.is_active
+    │     │
+    │     └─► BaseBackend.has_perm()
+    │           │
+    │           └─► "account.manage_staff" in get_all_permissions(user)
+    │                 │
+    │                 ├─► get_user_permissions(user)
+    │                 │     └─► _get_permissions(user, None, "user")
+    │                 │           │
+    │                 │           ├─► 检查缓存 _effective_permissions_cache
+    │                 │           └─► user.effective_permissions
+    │                 │                 │
+    │                 │                 ├─► 构建 QuerySet：
+    │                 │                 │     ├─► 用户直接权限
+    │                 │                 │     └─► 组权限（通过 groups 关联）
+    │                 │                 │
+    │                 │                 └─► 转换为 {"account.manage_staff", ...}
+    │                 │
+    │                 └─► get_group_permissions(user)
+    │                       └─► 同上（也返回 effective_permissions）
+    │
+    └─► 返回 True/False
+```
+
+### 示例 3：执行 PermissionGroupUpdate mutation
 
 ```
 mutation 调用
@@ -445,11 +911,15 @@ mutation 调用
 BaseMutation.mutate()
     │
     ├─► check_permissions() 检查 MANAGE_STAFF
+    │     ├─► 检查是否为 App → 如果是，直接拒绝
+    │     └─► 调用 user.has_perm(MANAGE_STAFF)
+    │
     └─► clean_input()
           │
           ├─► ensure_requestor_can_manage_group()
-          │    ├─► 检查权限范围
-          │    └─► 检查渠道范围
+          │    ├─► can_user_manage_group_permissions()
+          │    │     └─► user.has_perms(group_permissions)
+          │    └─► can_user_manage_group_channels()
           │
           ├─► clean_permissions()
           │    └─► ensure_can_manage_permissions()
@@ -468,32 +938,40 @@ save() 执行
 
 ---
 
-## 九、关键设计模式总结
+## 十二、关键设计模式总结
 
-### 9.1 声明式 vs 程序化
+### 12.1 声明式 vs 程序化
 
 | 方式 | 适用场景 | 示例 |
 |------|---------|------|
 | **声明式** | 简单的权限要求 | `PermissionsField(permissions=[...])` |
 | **程序化** | 复杂业务逻辑 | `can_user_manage_group()` |
 
-### 9.2 OR 逻辑 vs AND 逻辑
+### 12.2 OR 逻辑 vs AND 逻辑
 
 | 校验层次 | 逻辑 | 说明 |
 |---------|------|------|
 | 字段/接口级权限 | **OR** | 拥有任一权限即可访问 |
 | 权限组管理权限范围 | **AND** | 必须拥有目标组的**所有**权限才能管理 |
 
-### 9.3 关键安全原则
+### 12.3 关键安全原则
 
 1. **最小权限原则**：用户不能授予自己没有的权限
 2. **范围封闭原则**：不能管理超出自己权限范围的组
 3. **不可自毁原则**：不能把自己从最后一个组中移除
 4. **权限连续性原则**：操作后必须仍有人能管理这些权限
 
+### 12.4 缓存机制
+
+| 缓存位置 | 作用 | 代码位置 |
+|---------|------|---------|
+| `user._effective_permissions` | 缓存权限 QuerySet | `saleor/account/models.py:240, 285` |
+| `user._effective_permissions_cache` | 缓存权限字符串集合 | `saleor/core/auth_backend.py:76-81` |
+| `app._app_perm_cache` | 缓存 App 权限字符串集合 | `saleor/app/models.py:102-106` |
+
 ---
 
-## 十、常见问题解答
+## 十三、常见问题解答
 
 ### Q: 为什么需要两层权限检查（字段级 + 业务逻辑级）？
 
@@ -516,3 +994,20 @@ save() 执行
 - 权限组管理属于**超级用户级**操作
 - App 的权限范围通常受限
 - 代码中显式判断：`PermissionGroupCreate.check_permissions()` 中如果是 App 直接抛出异常
+
+### Q: 未认证用户和无权限用户的返回结果有区别吗？
+
+**A:** 
+- 从 GraphQL 响应格式来看，两者都返回 `PermissionDenied` 错误
+- 但在内部逻辑中：
+  - 未认证用户：`requestor is None` → `perm_checks_results = []` → `any([]) = False`
+  - 无权限用户：`requestor.has_perm(perm)` 逐个返回 `False` → `any([False, False]) = False`
+- 错误消息相同，都是提示需要哪些权限
+
+### Q: 权限是如何从 Group 汇总到 User 的？
+
+**A:** 
+1. 用户与组通过 `user_groups` 中间表关联
+2. 组与权限通过 `group_permissions` 中间表关联
+3. `effective_permissions` 使用 `EXISTS` 子查询合并用户直接权限和组权限
+4. 最终转换为 `{"app_label.codename", ...}` 字符串集合进行快速查找

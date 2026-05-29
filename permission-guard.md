@@ -1042,9 +1042,306 @@ raise PermissionDenied(permissions=[MANAGE_APPS, OWNER])
 
 ---
 
-## 八、查询接口守卫：Query 与 Mutation 的权限声明
+## 八、两条校验链并排对比：查询守卫链 vs 业务逻辑链
 
-### 8.1 Query 接口守卫
+### 8.1 核心架构对比图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        查询守卫链（声明式）                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│  触发点：PermissionsField / BaseMutation.check_permissions              │
+│  核心函数：one_of_permissions_or_auth_filter_required                  │
+│  权限检查：直接调用 requestor.has_perm(perm)                            │
+│  授权过滤器：is_app / is_user / is_staff_user 内置函数                  │
+│  OWNER 处理：跳过（无内置函数）                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        业务逻辑链（程序化）                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│  触发点：resolver / clean_input 内部显式调用                            │
+│  核心函数：has_one_of_permissions / check_is_owner_or_has_one_of_perms  │
+│  权限检查：通过 permission_required 间接调用 has_perm                   │
+│  OWNER 处理：显式判断 requestor == owner                                │
+│  MANAGE_STAFF：App 被特殊拦截！                                        │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 查询守卫链：one_of_permissions_or_auth_filter_required
+
+**完整调用链：**
+
+```
+BaseMutation.mutate()
+    ↓
+check_permissions()  [saleor/graphql/core/mutations.py:498-514]
+    ↓
+one_of_permissions_or_auth_filter_required(context, permissions)
+    ├─► _get_result_of_permissions_checks(context, permissions)
+    │     ├─► 过滤掉 AuthorizationFilters
+    │     ├─► get_user_or_app_from_context(context) → requestor
+    │     └─► [requestor.has_perm(perm) for perm in permissions]  ← 直接调用 has_perm
+    │
+    └─► _get_result_of_authorization_filters_checks(context, permissions)
+          ├─► 只提取 AuthorizationFilters
+          ├─► resolve_authorization_filter_fn(perm) → 检查函数
+          └─► [perm_fn(context) for perm in auth_filters]
+    ↓
+any(perm_results) or any(auth_filters_results)  ← OR 逻辑
+```
+
+**关键特征：**
+- 直接调用 `App.has_perm(perm)` 检查权限
+- **不经过** `permission_required` 函数
+- **不会**对 MANAGE_STAFF 做特殊拦截
+
+### 8.3 业务逻辑链：has_one_of_permissions
+
+**完整调用链：**
+
+```
+check_is_owner_or_has_one_of_perms(requestor, owner, *perms)
+    ↓
+is_owner_or_has_one_of_perms(requestor, owner, *perms)
+    ├─► requestor == owner  ← OWNER 判断
+    └─► has_one_of_permissions(requestor, perms)  ← 业务逻辑链入口
+          ↓
+          for perm in permissions:
+              permission_required(requestor, (perm,))  ← 关键！经过此函数
+                  ↓
+                  if isinstance(requestor, User):
+                      return requestor.has_perms(perms)
+                  if requestor:  ← App 分支
+                      # 🔴 MANAGE_STAFF 特殊拦截
+                      if AccountPermissions.MANAGE_STAFF in perms:
+                          return False  ← App 永远无法通过！
+                      return requestor.has_perms(perms)
+                  return False
+```
+
+### 8.4 MANAGE_STAFF 语义下 App 请求的差异详解
+
+#### 8.4.1 差异根源：两条链使用不同的检查函数
+
+| 检查路径 | 核心函数 | MANAGE_STAFF 对 App 的行为 |
+|---------|---------|--------------------------|
+| 查询守卫链 | `one_of_permissions_or_auth_filter_required` → `requestor.has_perm()` | ✅ 正常检查 App 的权限表 |
+| 业务逻辑链 | `has_one_of_permissions` → `permission_required` | ❌ 直接返回 `False`，强制拦截 |
+
+#### 8.4.2 permission_required 的特殊拦截代码
+
+**文件位置：** `saleor/permission/utils.py:82-94`
+
+```python
+def permission_required(
+    requestor: Union["User", "App", None], perms: Iterable[BasePermissionEnum]
+) -> bool:
+    from ..account.models import User
+
+    if isinstance(requestor, User):
+        return requestor.has_perms(perms)
+    if requestor:
+        # 🔴 关键注释：for now MANAGE_STAFF permission for app is not supported
+        if AccountPermissions.MANAGE_STAFF in perms:
+            return False  # 直接拦截，不检查 App 的权限表
+        return requestor.has_perms(perms)
+    return False
+```
+
+#### 8.4.3 实际场景示例
+
+**场景 1：App 拥有 MANAGE_STAFF 权限，调用 PermissionGroup Mutation**
+
+```python
+# Mutation 层检查（查询守卫链）
+BaseMutation.check_permissions()
+    → one_of_permissions_or_auth_filter_required(context, [MANAGE_STAFF])
+    → app.has_perm(MANAGE_STAFF) → True (App 表中确实有这个权限)
+    → ✅ 通过！
+
+# PermissionGroupCreate 额外检查（业务逻辑链）
+PermissionGroupCreate.check_permissions()
+    → if app:
+          raise PermissionDenied(
+              message="Apps are not allowed to perform this mutation."
+          )  # 🔴 直接拦截，自定义消息
+```
+
+**场景 2：App 拥有 MANAGE_STAFF 权限，调用 check_is_owner_or_has_one_of_perms**
+
+```python
+# 业务逻辑链
+check_is_owner_or_has_one_of_perms(app, owner, MANAGE_STAFF)
+    → requestor == owner → False (App 不是所有者)
+    → has_one_of_permissions(app, [MANAGE_STAFF])
+        → permission_required(app, (MANAGE_STAFF,))
+            → MANAGE_STAFF in perms → True
+            → return False  # 🔴 强制拦截！
+    → raise PermissionDenied(permissions=[MANAGE_STAFF, OWNER])
+```
+
+#### 8.4.4 设计意图分析
+
+这种不对称设计的原因：
+1. **权限组管理是敏感操作**：涉及员工权限分配，通常只允许人类管理员操作
+2. **App 权限模型设计限制**：App 主要用于集成，不应该管理人类员工的权限
+3. **两层防护**：
+   - 第一层：`permission_required` 中硬编码拦截（通用防护）
+   - 第二层：具体 Mutation 中再次检查并自定义错误消息（特定防护）
+
+---
+
+## 九、嵌套字段拒绝时的返回格式详解
+
+### 9.1 嵌套字段权限控制示例
+
+**文件位置：** `saleor/graphql/account/types.py:240-256`
+
+```python
+class CustomerEvent(ModelObjectType[models.CustomerEvent]):
+    @staticmethod
+    def resolve_user(root: models.CustomerEvent, info: ResolveInfo):
+        user = info.context.user
+        user = cast(User, user)
+        if (
+            user == root.user  # OWNER 判断
+            or user.has_perm(AccountPermissions.MANAGE_USERS)
+            or user.has_perm(AccountPermissions.MANAGE_STAFF)
+        ):
+            return root.user
+        # 🔴 嵌套字段拒绝
+        raise PermissionDenied(
+            permissions=[
+                AccountPermissions.MANAGE_STAFF,
+                AccountPermissions.MANAGE_USERS,
+                AuthorizationFilters.OWNER,
+            ]
+        )
+```
+
+### 9.2 嵌套字段拒绝的返回格式
+
+**GraphQL 查询：**
+```graphql
+query {
+  me {
+    events(first: 10) {
+      edges {
+        node {
+          id
+          user {  # 🔴 这个嵌套字段会被拒绝
+            id
+            email
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+**返回结果：**
+```json
+{
+  "errors": [
+    {
+      "message": "To access this path, you need one of the following permissions: MANAGE_STAFF, MANAGE_USERS, OWNER",
+      "locations": [{"line": 6, "column": 11}],
+      "path": ["me", "events", "edges", 0, "node", "user"],  // 🔑 完整路径！
+      "extensions": {
+        "exception": {
+          "code": "PermissionDenied"
+        }
+      }
+    }
+  ],
+  "data": {
+    "me": {
+      "events": {
+        "edges": [
+          {
+            "node": {
+              "id": "Q3VzdG9tZXJFdmVudDox",
+              "user": null  // 🔑 嵌套字段为 null，外层数据正常返回
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+### 9.3 关键特征说明
+
+| 特征 | 说明 |
+|------|------|
+| `errors.path` | 包含从根到被拒绝字段的完整路径，数组下标表示列表索引 |
+| 局部 `null` | 被拒绝的字段返回 `null`，不影响其他字段和外层数据 |
+| 部分成功 | 查询整体成功（HTTP 200），只是部分字段被拒绝 |
+| 错误定位 | `locations` 指向 GraphQL 查询文档中具体的字段位置 |
+
+### 9.4 多层嵌套拒绝示例
+
+**查询：**
+```graphql
+query {
+  app(id: "QXBwOjE=") {
+    id
+    name
+    privateMeta {  # 第一层嵌套，可能被拒绝
+      key
+      value
+    }
+    extensions {  # 第二层嵌套
+      id
+      app {  # 第三层嵌套，可能被拒绝
+        id
+        token
+      }
+    }
+  }
+}
+```
+
+**返回结果（两个嵌套字段都被拒绝）：**
+```json
+{
+  "errors": [
+    {
+      "message": "To access this path, you need one of the following permissions: MANAGE_APPS, OWNER",
+      "path": ["app", "privateMeta"],
+      "extensions": {"code": "PermissionDenied"}
+    },
+    {
+      "message": "To access this path, you need one of the following permissions: OWNER",
+      "path": ["app", "extensions", 0, "app"],
+      "extensions": {"code": "PermissionDenied"}
+    }
+  ],
+  "data": {
+    "app": {
+      "id": "QXBwOjE=",
+      "name": "My App",
+      "privateMeta": null,  // 第一层嵌套被拒绝
+      "extensions": [
+        {
+          "id": "QXBwRXh0ZW5zaW9uOjE=",
+          "app": null  // 第三层嵌套被拒绝
+        }
+      ]
+    }
+  }
+}
+```
+
+---
+
+## 十、查询接口守卫：Query 与 Mutation 的权限声明
+
+### 10.1 Query 接口守卫
 
 **文件位置：** `saleor/graphql/account/schema.py:163-181`
 
@@ -1070,7 +1367,7 @@ class AccountQueries(graphene.ObjectType):
     )
 ```
 
-### 8.2 Mutation 接口守卫
+### 10.2 Mutation 接口守卫
 
 **文件位置：** `saleor/graphql/core/mutations.py:158-212`
 
@@ -1096,7 +1393,7 @@ class BaseMutation(graphene.Mutation):
         super().__init_subclass_with_meta__(description=description, _meta=_meta, **options)
 ```
 
-### 8.3 Mutation 权限检查时机
+### 10.3 Mutation 权限检查时机
 
 **文件位置：** `saleor/graphql/account/mutations/permission_group/permission_group_create.py:140-148`
 
@@ -1119,7 +1416,7 @@ class PermissionGroupCreate(DeprecatedModelMutation):
 
 ---
 
-## 九、权限组管理的四层校验
+## 十一、权限组管理的四层校验
 
 以 `PermissionGroupUpdate` 为例，权限校验分为四层：
 
@@ -1190,7 +1487,7 @@ def ensure_can_manage_permissions(
 
 ---
 
-## 十、权限枚举定义
+## 十二、权限枚举定义
 
 **文件位置：** `saleor/permission/enums.py:1-100`
 
@@ -1214,7 +1511,7 @@ class OrderPermissions(BasePermissionEnum):
 
 ---
 
-## 十一、完整调用链路示例
+## 十三、完整调用链路示例
 
 ### 示例 1：查询 permission_groups 接口（无权限用户）
 
@@ -1337,30 +1634,30 @@ save() 执行
 
 ---
 
-## 十二、关键设计模式总结
+## 十四、关键设计模式总结
 
-### 12.1 声明式 vs 程序化
+### 14.1 声明式 vs 程序化
 
 | 方式 | 适用场景 | 示例 |
 |------|---------|------|
 | **声明式** | 简单的权限要求 | `PermissionsField(permissions=[...])` |
 | **程序化** | 复杂业务逻辑 | `can_user_manage_group()` |
 
-### 12.2 OR 逻辑 vs AND 逻辑
+### 14.2 OR 逻辑 vs AND 逻辑
 
 | 校验层次 | 逻辑 | 说明 |
 |---------|------|------|
 | 字段/接口级权限 | **OR** | 拥有任一权限即可访问 |
 | 权限组管理权限范围 | **AND** | 必须拥有目标组的**所有**权限才能管理 |
 
-### 12.3 关键安全原则
+### 14.3 关键安全原则
 
 1. **最小权限原则**：用户不能授予自己没有的权限
 2. **范围封闭原则**：不能管理超出自己权限范围的组
 3. **不可自毁原则**：不能把自己从最后一个组中移除
 4. **权限连续性原则**：操作后必须仍有人能管理这些权限
 
-### 12.4 缓存机制
+### 14.4 缓存机制
 
 | 缓存位置 | 作用 | 代码位置 |
 |---------|------|---------|
@@ -1370,7 +1667,7 @@ save() 执行
 
 ---
 
-## 十三、常见问题解答
+## 十五、常见问题解答
 
 ### Q: 为什么需要两层权限检查（字段级 + 业务逻辑级）？
 
@@ -1433,3 +1730,28 @@ save() 执行
 - 例如 `permissions = [MANAGE_APPS, OWNER]` 会显示：
   `"To access this path, you need one of the following permissions: MANAGE_APPS, OWNER"`
 - 枚举的 `.name` 是大写的，如 `OWNER`、`AUTHENTICATED_APP`，而不是枚举值字符串
+
+### Q: 为什么 App 拥有 MANAGE_STAFF 权限却被拒绝？两条校验链有什么差异？
+
+**A:**
+这是因为 Saleor 有两条独立的权限校验链，对 MANAGE_STAFF 的处理不同：
+
+1. **查询守卫链**：`one_of_permissions_or_auth_filter_required` → 直接调用 `app.has_perm()`，正常检查 App 的权限表
+2. **业务逻辑链**：`has_one_of_permissions` → `permission_required` → 硬编码拦截 MANAGE_STAFF
+
+关键代码在 `saleor/permission/utils.py:90-92`：
+```python
+if AccountPermissions.MANAGE_STAFF in perms:
+    return False  # App 永远无法通过业务逻辑链！
+```
+
+**设计意图**：权限组管理是敏感操作，只允许人类管理员操作，App 不应该管理员工权限。
+
+### Q: 嵌套字段被拒绝时，为什么外层数据还能正常返回？
+
+**A:**
+这是 GraphQL 的标准错误处理机制：
+- 单个 resolver 抛出异常时，只会影响该字段的返回值（设为 null）
+- `errors` 数组中会记录具体错误，包含完整的 `path` 路径定位被拒绝的字段
+- HTTP 状态码仍为 200，表示查询"部分成功"
+- 客户端可以根据 `errors.path` 精确定位哪个字段出了问题

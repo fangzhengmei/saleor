@@ -740,3 +740,286 @@ mutation {
   }
 }
 ```
+
+---
+
+## 十、附录 C：配送方法失效原因到错误码映射链路
+
+### 10.1 链路总览
+
+```
+Webhook 返回 excluded_methods
+        ↓ [shipping/webhooks/shared.py]
+get_excluded_shipping_data() → 合并多 webhook reason
+        ↓ [checkout/delivery_context.py:633-634]
+initialize_shipping_method_active_status() → 设置 active=False + message=reason
+        ↓ [两种校验场景]
+        ├─ 选配送时 → SHIPPING_METHOD_NOT_APPLICABLE
+        └─ 下单时 → INVALID_SHIPPING_METHOD
+```
+
+### 10.2 第一段：Excluded Reason 写入 active/message
+
+#### 10.2.1 数据结构定义 [shipping/interface.py:16-59]
+
+```python
+@dataclass
+class ShippingMethodData:
+    id: str
+    price: Money
+    name: str | None = None
+    # ... 其他字段
+    active: bool = True       # 标记是否可用
+    message: str = ""         # 失效原因描述
+
+@dataclass
+class ExcludedShippingMethod:
+    id: str                    # 配送方法 ID
+    reason: str | None         # 排除原因
+```
+
+#### 10.2.2 Webhook 响应解析流程 [shipping/webhooks/shared.py]
+
+**四步处理链**：
+
+```
+Webhook 响应 JSON
+    ↓
+FilterShippingMethodsSchema.model_validate() → Pydantic 校验
+    ↓
+_get_excluded_shipping_methods_from_response() → 提取 excluded_methods
+    ↓
+_parse_excluded_shipping_methods() → 转为 {method_id: [ExcludedShippingMethod]}
+    ↓
+merge_excluded_methods_map() → 合并多 webhook reason（空格连接）
+```
+
+**合并逻辑** [shipping/webhooks/shared.py:164-173]：
+```python
+def merge_excluded_methods_map(excluded_methods_map):
+    excluded_methods = []
+    for method_id, methods in excluded_methods_map.items():
+        reason = None
+        if reasons := [m.reason for m in methods if m.reason]:
+            reason = " ".join(reasons)  # 多原因空格连接
+        excluded_methods.append(ExcludedShippingMethod(id=method_id, reason=reason))
+    return excluded_methods
+```
+
+#### 10.2.3 写入 ShippingMethodData [shipping/utils.py:130-141]
+
+```python
+def initialize_shipping_method_active_status(
+    shipping_methods: list["ShippingMethodData"],
+    excluded_methods: list["ExcludedShippingMethod"],
+):
+    reason_map = {str(method.id): method.reason for method in excluded_methods}
+    for instance in shipping_methods:
+        instance.active = True      # 默认激活
+        instance.message = ""
+        reason = reason_map.get(str(instance.id))
+        if reason is not None:
+            instance.active = False  # 被排除 → 标记为失效
+            instance.message = reason  # 写入失效原因
+```
+
+**调用点** [checkout/delivery_context.py:632-634]：
+```python
+def with_excluded_methods(excluded_methods: list[ExcludedShippingMethod]):
+    initialize_shipping_method_active_status(all_methods, excluded_methods)
+    # ... 后续处理 CheckoutDelivery
+```
+
+### 10.3 第二段：选配送方法时报错
+
+**Mutation**：`checkoutShippingMethodUpdate` [graphql/checkout/mutations/checkout_shipping_method_update.py]
+
+#### 10.3.1 校验流程
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Mutation
+    participant DeliveryCtx
+
+    Client->>Mutation: checkoutShippingMethodUpdate(shipping_method_id)
+    Mutation->>DeliveryCtx: get_or_fetch_checkout_deliveries()
+    Note over DeliveryCtx: 返回 CheckoutDelivery 列表<br/>(仅 is_valid=True)
+    
+    Mutation->>Mutation: 遍历 checkout_deliveries
+    Note over Mutation: 只考虑 method.active == True 的方法
+    
+    alt 找到匹配的 active 方法
+        Mutation->>DeliveryCtx: assign_delivery_method_to_checkout()
+        Mutation-->>Client: 返回成功
+    else 未找到匹配
+        Mutation-->>Client: 抛出 ValidationError<br/>code=SHIPPING_METHOD_NOT_APPLICABLE
+    end
+```
+
+#### 10.3.2 核心校验代码 [graphql/checkout/mutations/checkout_shipping_method_update.py:109-139]
+
+```python
+@classmethod
+def get_checkout_delivery(cls, checkout_info, shipping_method_id, requestor):
+    if shipping_method_id is None:
+        return None
+    
+    # 1. 获取有效配送列表（含 active 标记）
+    checkout_deliveries = get_or_fetch_checkout_deliveries(
+        checkout_info, requestor=requestor
+    ).get()
+    
+    internal_shipping_method_id = cls._resolve_delivery_method_id(shipping_method_id)
+    
+    # 2. 只在 active=True 的方法中查找
+    for method in checkout_deliveries:
+        if not method.active:  # 🔴 关键点：跳过失效方法
+            continue
+        if method.shipping_method_id == internal_shipping_method_id:
+            return method  # ✅ 找到有效方法
+    
+    # 3. 未找到 → 抛出错误
+    raise ValidationError(
+        {
+            "shipping_method": ValidationError(
+                "This shipping method is not applicable.",
+                code=CheckoutErrorCode.SHIPPING_METHOD_NOT_APPLICABLE.value,
+            )
+        }
+    )
+```
+
+**关键特性**：
+- 错误消息："This shipping method is not applicable."
+- 错误码：`SHIPPING_METHOD_NOT_APPLICABLE`
+- 不暴露具体失效原因（message 字段不传递到错误响应）
+
+### 10.4 第三段：下单最终校验时报错
+
+**入口**：`clean_checkout_shipping()` [checkout/checkout_cleaner.py:25-65]
+
+#### 10.4.1 校验流程
+
+```mermaid
+sequenceDiagram
+    participant Complete
+    participant Cleaner
+    participant ShippingMethodInfo
+
+    Complete->>Cleaner: clean_checkout_shipping()
+    Note over Cleaner: 第1重：delivery_method 是否设置？
+    alt 未设置
+        Cleaner-->>Complete: SHIPPING_METHOD_NOT_SET
+    else 已设置
+        Note over Cleaner: 第2重：is_valid_delivery_method()？
+        alt 无效（无 shipping_address）
+            Cleaner-->>Complete: SHIPPING_ADDRESS_NOT_SET
+        else 有效
+            Note over Cleaner: 第3重：is_method_in_valid_methods()？
+            Cleaner->>ShippingMethodInfo: is_method_in_valid_methods(checkout_info)
+            ShippingMethodInfo-->>Cleaner: return delivery_method.active
+            alt active=False（已失效）
+                Cleaner-->>Complete: INVALID_SHIPPING_METHOD
+            else active=True（有效）
+                Cleaner-->>Complete: 校验通过
+            end
+        end
+    end
+```
+
+#### 10.4.2 三重校验代码 [checkout/checkout_cleaner.py:25-65]
+
+```python
+def clean_checkout_shipping(checkout_info, lines, error_code):
+    delivery_method_info = checkout_info.get_delivery_method_info()
+
+    if is_shipping_required(lines):
+        # 第1重：配送方法是否设置
+        if not delivery_method_info.delivery_method:
+            raise ValidationError(
+                {
+                    "shipping_method": ValidationError(
+                        "Shipping method is not set",
+                        code=error_code.SHIPPING_METHOD_NOT_SET.value,
+                    )
+                }
+            )
+        
+        # 第2重：配送地址是否设置
+        if not delivery_method_info.is_valid_delivery_method():
+            raise ValidationError(
+                {
+                    "shipping_address": ValidationError(
+                        "Shipping address is not set",
+                        code=error_code.SHIPPING_ADDRESS_NOT_SET.value,
+                    )
+                }
+            )
+        
+        # 第3重：配送方法是否对当前地址有效 🔴
+        if not delivery_method_info.is_method_in_valid_methods(checkout_info):
+            if checkout_info.checkout.collection_point_id:
+                clear_cc_delivery_method(checkout_info)
+            raise ValidationError(
+                {
+                    "shipping_method": ValidationError(
+                        "Delivery method is not valid for your shipping address",
+                        code=error_code.INVALID_SHIPPING_METHOD.value,
+                    )
+                }
+            )
+```
+
+#### 10.4.3 `is_method_in_valid_methods()` 实现
+
+**ShippingMethodInfo** [checkout/delivery_context.py:97-98]：
+```python
+def is_method_in_valid_methods(self, checkout_info) -> bool:
+    return self.delivery_method.active  # 直接读取 active 字段
+```
+
+**CollectionPointInfo** [checkout/delivery_context.py:158-162]（自提场景）：
+```python
+def is_method_in_valid_methods(self, checkout_info) -> bool:
+    valid_delivery_methods = checkout_info.valid_pick_up_points
+    return bool(
+        valid_delivery_methods and self.delivery_method in valid_delivery_methods
+    )
+```
+
+### 10.5 失效原因到错误码映射汇总
+
+| 场景 | 触发条件 | 错误码 | 错误消息 |
+|------|----------|--------|----------|
+| **选配送时** | 配送方法在 excluded_methods 列表中 → active=False → 遍历跳过 → 未找到 | `SHIPPING_METHOD_NOT_APPLICABLE` | "This shipping method is not applicable." |
+| **下单时** | 已选择的配送方法 active=False → is_method_in_valid_methods 返回 False | `INVALID_SHIPPING_METHOD` | "Delivery method is not valid for your shipping address" |
+| **下单时** | 未选择任何配送方法 | `SHIPPING_METHOD_NOT_SET` | "Shipping method is not set" |
+| **下单时** | 未设置配送地址 | `SHIPPING_ADDRESS_NOT_SET` | "Shipping address is not set" |
+
+### 10.6 关键设计说明
+
+#### 10.6.1 message 字段的作用
+
+`ShippingMethodData.message` 存储了具体失效原因（来自 Webhook 的 reason），但**不会直接传递到错误响应中**，主要用于：
+- 内部日志记录
+- 前端展示可用配送方法列表时，标记为灰色并显示 tooltip 提示
+- GraphQL 查询 `shippingMethods` 时返回给客户端展示
+
+#### 10.6.2 两次校验的差异
+
+| 维度 | 选配送时校验 | 下单时校验 |
+|------|------------|-----------|
+| 校验点 | `get_checkout_delivery()` | `clean_checkout_shipping()` |
+| 检查目标 | 检查选择的方法是否在有效列表中 | 检查已选择的方法当前是否仍然有效 |
+| 错误码 | `SHIPPING_METHOD_NOT_APPLICABLE` | `INVALID_SHIPPING_METHOD` |
+| 触发时机 | 用户主动选择配送方法时 | 提交订单前的最终检查 |
+| 防护目的 | 防止用户选择已失效的方法 | 防止地址/商品变化后原方法不再适用 |
+
+#### 10.6.3 可能的失效场景
+
+1. **邮编不匹配**：地址邮编不在配送方法的 INCLUDE 范围内或在 EXCLUDE 范围内
+2. **价格超限**：订单小计超过 maximum_order_price 或低于 minimum_order_price
+3. **重量超限**：订单重量超过 maximum_order_weight 或低于 minimum_order_weight
+4. **产品排除**：订单包含配送方法排除的产品
+5. **Webhook 排除**：外部 Webhook 返回该配送方法不可用（携带自定义 reason）

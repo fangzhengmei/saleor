@@ -395,3 +395,348 @@ def is_method_in_valid_methods(self, checkout_info) -> bool:
 | `saleor/checkout/complete_checkout.py` | 完整下单流程编排 |
 | `saleor/graphql/checkout/mutations/checkout_shipping_address_update.py` | 更新配送地址 Mutation |
 | `saleor/graphql/checkout/mutations/checkout_shipping_method_update.py` | 选择配送方法 Mutation |
+
+---
+
+## 八、附录 A：I18nMixin 归属与继承体系
+
+### 8.1 Mixin 归属澄清
+
+**常见误解**：I18nMixin 归属于 `account` 模块
+
+**实际归属**：`saleor/graphql/account/i18n.py:58`
+
+- **位置**：`graphql/account/` 命名空间下，而非 `account/`
+- **性质**：纯 GraphQL 层工具类，与业务模型层解耦
+- **设计意图**：为 Mutation 提供地址校验的横向能力
+
+### 8.2 继承关系图
+
+```
+graphene.Mutation
+    ↓
+BaseMutation [graphql/core/mutations.py:142]
+    ↓  (多继承)
+CheckoutShippingAddressUpdate(AddressMetadataMixin, BaseMutation, I18nMixin)
+                                  ↑
+                        地址校验能力注入点
+```
+
+**继承顺序说明**：
+1. `AddressMetadataMixin`：提供元数据处理能力
+2. `BaseMutation`：提供基础 Mutation 框架（错误处理、权限检查等）
+3. `I18nMixin`：注入地址校验方法
+
+### 8.3 使用 I18nMixin 的 Mutation 清单
+
+| Mutation | 用途 |
+|----------|------|
+| `CheckoutShippingAddressUpdate` | 更新结账配送地址 |
+| `CheckoutBillingAddressUpdate` | 更新结账账单地址 |
+| `CheckoutCreate` | 创建结账 |
+| `CheckoutComplete` | 完成结账（下单） |
+| `CheckoutPaymentCreate` | 创建支付 |
+| `AddressCreate` | 创建用户地址 |
+| `BaseAddressUpdate` | 更新地址基类 |
+| `BaseCustomerCreate` | 创建客户基类 |
+| `CustomerBulkUpdate` | 批量更新客户 |
+| `OrderUpdate` | 更新订单 |
+| `DraftOrderCreate` | 创建草稿订单 |
+| `DraftOrderUpdate` | 更新草稿订单 |
+| `OrderBulkCreate` | 批量创建订单 |
+| `WarehouseShippingZoneAssign` | 仓库配送区分配 |
+| `WarehouseShippingZoneUnassign` | 仓库配送区解除 |
+| `ShopAddressUpdate` | 更新店铺地址 |
+
+### 8.4 Skip Validation 机制完整流程
+
+#### 8.4.1 权限映射表 [graphql/account/i18n.py:20-55]
+
+每个 Mutation 有独立的跳过校验权限配置：
+
+```python
+SKIP_ADDRESS_VALIDATION_PERMISSION_MAP = {
+    "checkoutCreate": [
+        CheckoutPermissions.HANDLE_CHECKOUTS,
+        AuthorizationFilters.AUTHENTICATED_APP,
+    ],
+    "checkoutShippingAddressUpdate": [
+        CheckoutPermissions.HANDLE_CHECKOUTS,
+        AuthorizationFilters.AUTHENTICATED_APP,
+    ],
+    # ... 其他 Mutation
+}
+```
+
+#### 8.4.2 执行时序
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Mutation
+    participant I18nMixin
+    participant Permission
+
+    Client->>Mutation: 提交地址 + skipValidation: true
+    Mutation->>I18nMixin: validate_address(address_data, skip_validation=True)
+    
+    Note over I18nMixin: 第一步：权限检查
+    I18nMixin->>Permission: can_skip_address_validation(info)
+    Note over Permission: 根据 info.field_name（Mutation 名）<br/>查询 SKIP_ADDRESS_VALIDATION_PERMISSION_MAP
+    
+    alt 权限不足
+        Permission-->>I18nMixin: 抛出 PermissionDenied
+        I18nMixin-->>Mutation: 异常终止
+        Mutation-->>Client: 返回权限错误
+    else 权限通过
+        Permission-->>I18nMixin: 验证通过
+        Note over I18nMixin: format_check = False
+    end
+    
+    Note over I18nMixin: 第二步：表单验证
+    I18nMixin->>I18nMixin: _validate_address_form()
+    Note over I18nMixin: 即使 is_valid() 返回 False<br/>因 format_check=False 不抛出异常
+    
+    Note over I18nMixin: 第三步：标记状态
+    I18nMixin->>I18nMixin: cleaned_data["validation_skipped"] = True
+    
+    Note over I18nMixin: 第四步：持久化标记
+    I18nMixin-->>Mutation: 返回 Address 实例<br/>(validation_skipped=True)
+    
+    Mutation->>DB: 保存 Address，validation_skipped 字段写入数据库
+    Mutation-->>Client: 返回成功响应
+```
+
+#### 8.4.3 validation_skipped 标记的下游影响
+
+| 模块 | 检测点 | 行为 |
+|------|--------|------|
+| `Address.as_data()` | `account/models.py:118` | 若 `validation_skipped=True`，跳过电话号码 E.164 格式化 |
+| `Avatax Plugin` | `plugins/avatax/plugin.py:364` | 税金计算前输出警告日志 |
+| `Order Calculations` | `order/calculations.py:442` | 税金计算前输出警告日志 |
+| `CheckoutComplete` | `graphql/checkout/mutations/checkout_complete.py:205,228` | 若未跳过校验，则调用 I18n 重新校验地址 |
+
+**警告日志示例**：
+```python
+# checkout/utils.py:947-956
+def log_address_if_validation_skipped_for_checkout(checkout_info, logger):
+    address = get_address_for_checkout_taxes(checkout_info)
+    if address and address.validation_skipped:
+        logger.warning(
+            "Fetching tax data for checkout with address validation skipped. "
+            "Address ID: %s",
+            address.id,
+        )
+```
+
+---
+
+## 九、附录 B：校验失败原因传递路径
+
+### 9.1 错误消息完整链路
+
+```
+Django Form Errors (dict)
+        ↓ [attach_params_to_address_form_errors]
+    按 format_check/required_check 过滤
+        ↓
+ValidationError(error_dict)
+        ↓ [BaseMutation.mutate 捕获]
+handle_errors(e) → validation_error_to_error_type()
+        ↓
+ErrorType 实例列表 (含 field/message/code)
+        ↓
+GraphQL Response { errors: [...] }
+```
+
+### 9.2 关键节点详解
+
+#### 9.2.1 Django Form → ValidationError 转换 [graphql/account/i18n.py:73-122]
+
+```python
+def _validate_address_form(cls, address_data, ...):
+    # 1. 执行表单验证
+    if not address_form.is_valid():
+        validation_skipped = True
+        
+        # 2. 错误处理入口
+        errors = cls.attach_params_to_address_form_errors(
+            address_form, params, format_check, required_check
+        )
+        
+        # 3. 有错误才抛出
+        if errors:
+            raise ValidationError(errors)
+```
+
+#### 9.2.2 错误过滤逻辑 [graphql/account/i18n.py:125-152]
+
+`attach_params_to_address_form_errors()` 实现了条件性错误抛出：
+
+```python
+def attach_params_to_address_form_errors(...):
+    address_errors_dict = address_form.errors.as_data()
+    
+    for field, errors in address_errors_dict.items():
+        for error in errors:
+            
+            # 情形 A：格式错误（code != "required"）
+            if error.code != "required":
+                if values_check:  # 即 format_check
+                    errors_dict[field] = errors  # 加入错误
+                else:
+                    # 跳过校验：保留原始值到 cleaned_data
+                    address_form.cleaned_data[field] = address_form.data[field]
+            
+            # 情形 B：必填错误（code == "required"）
+            if error.code == "required":
+                field_value = address_form.data.get(field)
+                if required_check:
+                    errors_dict[field] = errors  # 加入错误
+                elif field_value is not None:
+                    # 有值则接受：即使不符合表单要求
+                    address_form.cleaned_data[field] = field_value
+    
+    return errors_dict
+```
+
+**过滤矩阵**：
+
+| 错误类型 | format_check | required_check | 结果 |
+|----------|-------------|----------------|------|
+| 格式错误 | True | 任意 | 抛出错误 |
+| 格式错误 | False | 任意 | 忽略，保留原始值 |
+| 必填错误 | 任意 | True | 抛出错误 |
+| 必填错误 | 任意 | False | 有值则接受，无值则忽略 |
+
+#### 9.2.3 ValidationError → GraphQL Error 转换 [graphql/core/mutations.py:87-118]
+
+`validation_error_to_error_type()` 负责将 Django 异常转换为 GraphQL 错误对象：
+
+```python
+def validation_error_to_error_type(validation_error: ValidationError, error_type_class):
+    err_list = []
+    error_class_fields = set(error_type_class._meta.fields.keys())
+    
+    if hasattr(validation_error, "error_dict"):
+        # 字段级错误
+        for field_label, field_errors in validation_error.error_dict.items():
+            # 转换字段名：snake_case → camelCase
+            field = snake_to_camel_case(field_label) if field_label != NON_FIELD_ERRORS else None
+            
+            for err in field_errors:
+                error = error_type_class(
+                    field=field,
+                    message=err.messages[0],  # 取第一条消息
+                    code=get_error_code_from_error(err),
+                )
+                # 附加额外参数（如 address_type）
+                attach_error_params(error, err.params, error_class_fields)
+                err_list.append(error)
+    else:
+        # 非字段错误
+        for err in validation_error.error_list:
+            error = error_type_class(
+                message=err.messages[0],
+                code=get_error_code_from_error(err),
+            )
+            attach_error_params(error, err.params, error_class_fields)
+            err_list.append(error)
+    
+    return err_list
+```
+
+#### 9.2.4 BaseMutation 异常捕获机制 [graphql/core/mutations.py:518-547]
+
+```python
+def mutate(cls, root, info: ResolveInfo, **data):
+    disallow_replica_in_context(info.context)
+    setup_context_user(info.context)
+
+    if not cls.check_permissions(info.context, data=data):
+        raise PermissionDenied(permissions=cls._meta.permissions)
+
+    try:
+        # 执行具体 Mutation 逻辑
+        response = cls.perform_mutation(root, info, **data)
+        if response.errors is None:
+            response.errors = []
+        return response
+    except ValidationError as e:
+        # 统一转换为 GraphQL 错误格式
+        return cls.handle_errors(e)
+
+@classmethod
+def handle_errors(cls, error: ValidationError, **extra):
+    error_list = validation_error_to_error_type(error, cls._meta.error_type_class)
+    return cls.handle_typed_errors(error_list, **extra)
+
+@classmethod
+def handle_typed_errors(cls, errors: list, **extra):
+    if cls._meta.error_type_field is not None:
+        extra.update({cls._meta.error_type_field: errors})
+    # 返回包含 errors 字段的响应，而非抛出异常
+    return cls(errors=errors, **extra)
+```
+
+### 9.3 典型错误响应示例
+
+**请求**（邮编格式错误）：
+```graphql
+mutation {
+  checkoutShippingAddressUpdate(
+    id: "Q2hlY2tvdXQ6MQ=="
+    shippingAddress: {
+      country: US
+      postalCode: "INVALID"
+      streetAddress1: "123 Main St"
+      city: "New York"
+    }
+  ) {
+    checkout {
+      id
+    }
+    errors {
+      field
+      message
+      code
+    }
+  }
+}
+```
+
+**响应**（校验失败）：
+```json
+{
+  "data": {
+    "checkoutShippingAddressUpdate": {
+      "checkout": null,
+      "errors": [
+        {
+          "field": "postalCode",
+          "message": "Invalid postal code format.",
+          "code": "INVALID"
+        }
+      ]
+    }
+  }
+}
+```
+
+**响应**（skipValidation + 权限通过）：
+```json
+{
+  "data": {
+    "checkoutShippingAddressUpdate": {
+      "checkout": {
+        "id": "Q2hlY2tvdXQ6MQ==",
+        "shippingAddress": {
+          "postalCode": "INVALID",
+          "validationSkipped": true
+        }
+      },
+      "errors": []
+    }
+  }
+}
+```

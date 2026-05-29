@@ -51,36 +51,250 @@ AssignedVariantAttributeValue
 
 ---
 
-## 二、属性归集逻辑
+## 二、属性归集逻辑（带执行顺序和代码证据）
 
-### 2.1 搜索向量生成入口
+### 2.0 属性保存到数据库的完整流程（批量创建为例）
 
-`saleor/product/search.py:77-96`
+**执行顺序**：
+```
+Step 1: GraphQL Mutation 入口
+        ↓ product_variant_bulk_create.py:886
+Step 2: AttributeAssignmentMixin.save()
+        ↓ attribute_assignment.py:368-389
+Step 3: pre_save_values() 准备批量操作
+        ↓ attribute_assignment.py:299-365
+Step 4: _bulk_create_pre_save_values() 执行批量数据库操作
+        ↓ attribute_assignment.py:425-446
+Step 5: associate_attribute_values_to_instance() 建立关联
+        ↓ attribute/utils/__init__.py
+Step 6: 标记 search_index_dirty = True
+        ↓ product_variant_bulk_create.py:919-920
+```
 
+**代码证据 Step 1 - 批量创建入口**：
+`saleor/graphql/product/bulk_mutations/product_variant_bulk_create.py:878-886`
 ```python
-def prepare_product_search_vector_value(
-    product: "Product",
-    *,
-    already_prefetched=False,
-    page_id_to_title_map: dict[int, str] | None = None,
-) -> list[NoValidationSearchVector]:
+if attributes := cleaned_input.get("attributes"):
+    attributes_to_save.append((variant, attributes))
+
+if not variant.name:
+    cls.set_variant_name(variant, cleaned_input)
+
+models.ProductVariant.objects.bulk_create(variants_to_create)
+
+for variant, attributes in attributes_to_save:
+    AttributeAssignmentMixin.save(variant, attributes)  # ← 属性保存入口
+```
+
+**代码证据 Step 2 - AttributeAssignmentMixin.save()**：
+`saleor/graphql/attribute/utils/attribute_assignment.py:368-389`
+```python
+@classmethod
+def save(cls, instance: T_INSTANCE, cleaned_input: T_INPUT_MAP,
+         pre_save_bulk: T_PRE_SAVE_BULK | None = None):
+    if pre_save_bulk is None:
+        pre_save_bulk = cls.pre_save_values(instance, cleaned_input)
+    attribute_and_values = cls._bulk_create_pre_save_values(pre_save_bulk)
+
+    attr_val_map = defaultdict(list)
+    clean_assignment_pks = []
+    for attribute, values in attribute_and_values.items():
+        if not values:
+            clean_assignment_pks.append(attribute.pk)
+        else:
+            attr_val_map[attribute.pk].extend(values)
+
+    associate_attribute_values_to_instance(instance, attr_val_map)  # ← 建立关联
+    cls._clean_assignments(instance, clean_assignment_pks)
+```
+
+**代码证据 Step 3 - pre_save_values()**：
+`saleor/graphql/attribute/utils/attribute_assignment.py:299-365`
+```python
+@classmethod
+def pre_save_values(cls, instance: T_INSTANCE, cleaned_input: T_INPUT_MAP) -> T_PRE_SAVE_BULK:
+    pre_save_bulk: T_PRE_SAVE_BULK = defaultdict(lambda: defaultdict(list))
+    for attribute, values_input in cleaned_input:
+        # 根据input_type选择处理器
+        handler_class = cls.HANDLER_MAPPING.get(attribute.input_type)
+        handler = handler_class(attribute, values_input)
+        prepared_values = handler.pre_save_value(instance)  # ← 各类型处理器准备值
+        
+        for action, value_data in prepared_values:
+            pre_save_bulk[action][attribute].append(value_data)
+    return pre_save_bulk
+```
+
+**处理器映射**（attribute_assignment.py:54-67）：
+```python
+HANDLER_MAPPING = {
+    AttributeInputType.DROPDOWN: SelectableAttributeHandler,
+    AttributeInputType.SWATCH: SelectableAttributeHandler,
+    AttributeInputType.MULTISELECT: MultiSelectableAttributeHandler,
+    AttributeInputType.FILE: FileAttributeHandler,
+    AttributeInputType.REFERENCE: ReferenceAttributeHandler,
+    AttributeInputType.SINGLE_REFERENCE: ReferenceAttributeHandler,
+    AttributeInputType.RICH_TEXT: RichTextAttributeHandler,
+    AttributeInputType.PLAIN_TEXT: PlainTextAttributeHandler,
+    AttributeInputType.NUMERIC: NumericAttributeHandler,
+    AttributeInputType.DATE: DateTimeAttributeHandler,
+    AttributeInputType.DATE_TIME: DateTimeAttributeHandler,
+    AttributeInputType.BOOLEAN: BooleanAttributeHandler,
+}
+```
+
+**代码证据 Step 4 - _bulk_create_pre_save_values()**：
+`saleor/graphql/attribute/utils/attribute_assignment.py:425-446`
+```python
+@classmethod
+def _bulk_create_pre_save_values(cls, pre_save_bulk):
+    results: dict[attribute_models.Attribute, list[AttributeValue]] = defaultdict(list)
+    for action, attribute_data in pre_save_bulk.items():
+        for attribute, values in attribute_data.items():
+            if action == AttributeValueBulkActionEnum.CREATE:
+                values = AttributeValue.objects.bulk_create(values)
+            elif action == AttributeValueBulkActionEnum.UPDATE_OR_CREATE:
+                values = AttributeValue.objects.bulk_update_or_create(values)
+            elif action == AttributeValueBulkActionEnum.GET_OR_CREATE:
+                values = AttributeValue.objects.bulk_get_or_create(values)
+            results[attribute].extend(values)
+    return results
+```
+
+**代码证据 Step 5 - associate_attribute_values_to_instance()**：
+`saleor/attribute/utils/__init__.py`
+```python
+def associate_attribute_values_to_instance(
+    instance: Union[Product, ProductVariant, Page],
+    attribute_values: dict[int, list[AttributeValue]],
+):
+    """将属性值关联到实例。对于Variant，创建AssignedVariantAttribute和AssignedVariantAttributeValue记录。"""
+```
+
+**代码证据 Step 6 - 标记脏标**：
+`saleor/graphql/product/bulk_mutations/product_variant_bulk_create.py:909-920`
+```python
+@classmethod
+def post_save_actions(cls, info, instances, product):
+    # ... 省略其他逻辑
+    product.search_index_dirty = True
+    product.save(update_fields=["search_index_dirty"])  # ← 标记需要刷新索引
+```
+
+### 2.1 搜索向量生成入口（索引刷新时调用）
+
+**执行顺序**：
+```
+Step 1: update_products_search_vector_task() 定时任务触发
+        ↓ product/tasks.py:352-360
+Step 2: update_products_search_vector() 处理批次
+        ↓ product/search.py:52-74
+Step 3: _prep_product_search_vector_index() 预取并生成向量
+        ↓ product/search.py:32-49
+Step 4: prepare_product_search_vector_value() 组装各部分向量
+        ↓ product/search.py:77-96
+Step 5: generate_variants_search_vector_value() 归集Variant属性
+        ↓ product/search.py:99-118
+Step 6: generate_attributes_search_vector_value_with_assignment() 归集属性值
+        ↓ product/search.py:155-172
+Step 7: get_search_vectors_for_attribute_values() 按类型生成向量
+        ↓ attribute/search.py:11-78
+```
+
+**代码证据 Step 1 - 定时任务**：
+`saleor/product/tasks.py:348-360`
+```python
+@app.task(queue=settings.UPDATE_SEARCH_VECTOR_INDEX_QUEUE_NAME)
+def update_products_search_vector_task():
+    products = (
+        Product.objects.using(settings.DATABASE_CONNECTION_REPLICA_NAME)
+        .filter(search_index_dirty=True)
+        .order_by("updated_at")[:PRODUCTS_BATCH_SIZE]
+        .values_list("id", flat=True)
+    )
+    with allow_writer():
+        update_products_search_vector(products)
+```
+
+**代码证据 Step 2 - 批次处理**：
+`saleor/product/search.py:52-74`
+```python
+def update_products_search_vector(product_ids: Iterable[int]):
+    db_conn = settings.DATABASE_CONNECTION_REPLICA_NAME
+    products = Product.objects.using(db_conn).filter(pk__in=product_ids).order_by("pk")
+    for product_pks in queryset_in_batches(products, PRODUCTS_BATCH_SIZE):
+        # 预取关联的Page title（用于reference类型属性）
+        value_ids = (
+            AssignedProductAttributeValue.objects.using(db_conn)
+            .filter(product_id__in=product_pks)
+            .values_list("value_id", flat=True)
+        )
+        value_to_page_id = (
+            AttributeValue.objects.using(db_conn)
+            .filter(id__in=value_ids, reference_page_id__isnull=False)
+            .values_list("id", "reference_page_id")
+        )
+        page_id_to_title_map = dict(
+            Page.objects.using(db_conn)
+            .filter(id__in=[page_id for _, page_id in value_to_page_id])
+            .values_list("id", "title")
+        )
+        products_batch = list(Product.objects.using(db_conn).filter(id__in=product_pks))
+        _prep_product_search_vector_index(products_batch, page_id_to_title_map)
+```
+
+**代码证据 Step 3 - 预取并生成向量**：
+`saleor/product/search.py:32-49`
+```python
+def _prep_product_search_vector_index(products, page_id_to_title_map=None):
+    prefetch_related_objects(products, *PRODUCT_FIELDS_TO_PREFETCH)  # ← 关键预取
+    
+    for product in products:
+        product.search_vector = FlatConcatSearchVector(
+            *prepare_product_search_vector_value(
+                product, already_prefetched=True,
+                page_id_to_title_map=page_id_to_title_map,
+            )
+        )
+        product.search_index_dirty = False
+    
+    Product.objects.bulk_update(
+        products, ["search_vector", "updated_at", "search_index_dirty"]
+    )
+```
+
+**预取字段定义**（product/search.py:19-24）：
+```python
+PRODUCT_FIELDS_TO_PREFETCH = [
+    "variants__attributes__values",                    # Variant属性值
+    "variants__attributes__assignment__attribute",     # Variant属性定义
+    "attributevalues__value",                          # Product属性值
+    "product_type__attributeproduct__attribute",       # Product属性定义
+]
+```
+
+**代码证据 Step 4 - 组装搜索向量**：
+`saleor/product/search.py:77-96`
+```python
+def prepare_product_search_vector_value(product, *, already_prefetched=False,
+                                        page_id_to_title_map=None):
     search_vectors = [
         NoValidationSearchVector(Value(product.name), config="simple", weight="A"),
-        NoValidationSearchVector(Value(product.description_plaintext), config="simple", weight="C"),
-        *generate_attributes_search_vector_value(product, page_id_to_title_map=page_id_to_title_map),
-        *generate_variants_search_vector_value(product),  # Variant属性归集入口
+        NoValidationSearchVector(
+            Value(product.description_plaintext), config="simple", weight="C"
+        ),
+        *generate_attributes_search_vector_value(
+            product, page_id_to_title_map=page_id_to_title_map
+        ),
+        *generate_variants_search_vector_value(product),  # ← Variant属性归集
     ]
     return search_vectors
 ```
 
-### 2.2 Variant属性归集
-
+**代码证据 Step 5 - Variant属性归集**：
 `saleor/product/search.py:99-118`
-
 ```python
-def generate_variants_search_vector_value(
-    product: "Product",
-) -> list[NoValidationSearchVector]:
+def generate_variants_search_vector_value(product):
     variants = list(product.variants.all()[: settings.PRODUCT_MAX_INDEXED_VARIANTS])
     
     # 1. 归集Variant的sku和name（权重A）
@@ -108,17 +322,13 @@ def generate_variants_search_vector_value(
 - `PRODUCT_MAX_INDEXED_ATTRIBUTES` - 最多索引的属性数量
 - `PRODUCT_MAX_INDEXED_ATTRIBUTE_VALUES` - 每个属性最多索引的值数量
 
-### 2.3 Variant属性值向量生成
-
+**代码证据 Step 6 - Variant属性值向量生成**：
 `saleor/product/search.py:155-172`
-
 ```python
-def generate_attributes_search_vector_value_with_assignment(
-    assigned_attributes: "QuerySet",
-) -> list[NoValidationSearchVector]:
+def generate_attributes_search_vector_value_with_assignment(assigned_attributes):
     search_vectors = []
     for assigned_attribute in assigned_attributes:
-        attribute = assigned_attribute.assignment.attribute
+        attribute = assigned_attribute.assignment.attribute  # ← 通过assignment获取Attribute
         values = assigned_attribute.values.all()[
             : settings.PRODUCT_MAX_INDEXED_ATTRIBUTE_VALUES
         ]
@@ -128,11 +338,63 @@ def generate_attributes_search_vector_value_with_assignment(
     return search_vectors
 ```
 
-### 2.4 属性值类型处理
-
+**代码证据 Step 7 - 按类型生成搜索向量**：
 `saleor/attribute/search.py:11-78`
-
-根据不同的`AttributeInputType`生成不同的搜索向量：
+```python
+def get_search_vectors_for_attribute_values(attribute, values, page_id_to_title_map=None, weight="B"):
+    search_vectors = []
+    input_type = attribute.input_type
+    
+    if input_type in [AttributeInputType.DROPDOWN, AttributeInputType.MULTISELECT]:
+        search_vectors += [
+            NoValidationSearchVector(Value(value.name), config="simple", weight=weight)
+            for value in values
+        ]
+    elif input_type == AttributeInputType.RICH_TEXT:
+        search_vectors += [
+            NoValidationSearchVector(
+                Value(editorjs_to_text(value.rich_text)),
+                config="simple", weight=weight,
+            )
+            for value in values
+        ]
+    elif input_type == AttributeInputType.PLAIN_TEXT:
+        search_vectors += [
+            NoValidationSearchVector(
+                Value(value.plain_text), config="simple", weight=weight
+            )
+            for value in values
+        ]
+    elif input_type == AttributeInputType.NUMERIC:
+        unit = attribute.unit
+        search_vectors += [
+            NoValidationSearchVector(
+                Value(value.name + " " + unit if unit else value.name),
+                config="simple", weight=weight,
+            )
+            for value in values
+        ]
+    elif input_type in [AttributeInputType.DATE, AttributeInputType.DATE_TIME]:
+        search_vectors += [
+            NoValidationSearchVector(
+                Value(value.date_time.strftime("%Y-%m-%d %H:%M:%S")),
+                config="simple", weight=weight,
+            )
+            for value in values
+        ]
+    elif input_type in [AttributeInputType.REFERENCE, AttributeInputType.SINGLE_REFERENCE]:
+        search_vectors += [
+            NoValidationSearchVector(
+                Value(get_reference_attribute_search_value(
+                    value, page_id_to_title_map=page_id_to_title_map
+                )),
+                config="simple", weight=weight,
+            )
+            for value in values
+            if value.reference_page_id is not None
+        ]
+    return search_vectors
+```
 
 | 输入类型 | 处理方式 | 权重 |
 |---------|---------|------|
@@ -145,35 +407,89 @@ def generate_attributes_search_vector_value_with_assignment(
 
 ---
 
-## 三、索引刷新机制
+## 三、索引刷新机制（带执行顺序和代码证据）
 
-### 3.1 脏标记触发点
+### 3.1 脏标记触发点汇总
 
-索引刷新采用"标记-异步更新"模式。以下场景会标记`search_index_dirty=True`：
+**执行顺序（以批量更新为例）**：
+```
+Step 1: productVariantBulkUpdate Mutation
+        ↓ product_variant_bulk_update.py:821-883
+Step 2: clean_variants() 验证输入
+        ↓ product_variant_bulk_update.py:469-558
+Step 3: update_variants() 构造更新对象
+        ↓ product_variant_bulk_update.py:561-610
+Step 4: save_variants() 执行数据库更新
+        ↓ product_variant_bulk_update.py:666-753
+Step 5: AttributeAssignmentMixin.save() 保存属性（如有变更）
+        ↓ product_variant_bulk_update.py:700-701
+Step 6: post_save_actions() 标记脏标
+        ↓ product_variant_bulk_update.py:771-772
+```
 
-#### 场景1：Variant创建/更新
-`saleor/graphql/product/mutations/product_variant/product_variant_create.py:247-248`
+**代码证据 Step 4-5 - 保存属性变更**：
+`saleor/graphql/product/bulk_mutations/product_variant_bulk_update.py:700-701`
+```python
+if attributes := cleaned_input.get("attributes"):
+    AttributeAssignmentMixin.save(variant, attributes)  # ← 属性变更时调用
+```
 
+**代码证据 Step 6 - 标记脏标**：
+`saleor/graphql/product/bulk_mutations/product_variant_bulk_update.py:771-772`
+```python
+product.search_index_dirty = True
+product.save(update_fields=["search_index_dirty"])
+```
+
+### 3.2 各场景脏标记触发点
+
+#### 场景1：Variant创建/更新/删除
+
+**单个创建** - `saleor/graphql/product/mutations/product_variant/product_variant_create.py:247-248`
 ```python
 instance.product.search_index_dirty = True
 instance.product.save(update_fields=["search_index_dirty"])
 ```
 
-**相关文件**：
-- `product_variant_create.py` - 创建Variant时
-- `product_variant_update.py` - 更新Variant时
-- `product_variant_bulk_update.py` - 批量更新时
-- `product_variant_bulk_delete.py` - 批量删除时（直接同步更新search_vector）
+**批量创建** - `saleor/graphql/product/bulk_mutations/product_variant_bulk_create.py:919-920`
+```python
+product.search_index_dirty = True
+product.save(update_fields=["search_index_dirty"])
+```
+
+**批量更新** - `saleor/graphql/product/bulk_mutations/product_variant_bulk_update.py:771-772`
+```python
+product.search_index_dirty = True
+product.save(update_fields=["search_index_dirty"])
+```
+
+**批量删除（特殊 - 同步更新）** - `saleor/graphql/product/bulk_mutations/product_variant_bulk_delete.py:146-156`
+```python
+# 批量删除时直接同步更新search_vector，不经过异步流程
+for product in products:
+    product.search_vector = FlatConcatSearchVector(
+        *prepare_product_search_vector_value(product)
+    )
+    product.default_variant = product.variants.first()
+    product.save(
+        update_fields=[
+            "default_variant",
+            "search_vector",
+            "updated_at",
+        ]
+    )
+```
 
 #### 场景2：属性值更新
 `saleor/graphql/attribute/mutations/attribute_value_update.py:86-110`
-
 ```python
 @classmethod
 def _mark_products_search_index_dirty(cls, instance):
+    # 查找使用该AttributeValue的所有ProductVariant
     variants = product_models.ProductVariant.objects.filter(
         Exists(instance.variantassignments.filter(variant_id=OuterRef("id")))
     )
+    # 查找关联的所有Product（且search_index_dirty=False）
     products = product_models.Product.objects.filter(
         Q(search_index_dirty=False)
         & (
@@ -181,16 +497,14 @@ def _mark_products_search_index_dirty(cls, instance):
             | Q(Exists(variants.filter(product_id=OuterRef("id"))))
         )
     ).order_by("pk")
+    # 批量标记
     mark_products_search_vector_as_dirty_in_batches(
         list(products.values_list("id", flat=True))
     )
 ```
 
-**触发时机**：当AttributeValue的name、value等字段更新时，所有使用该属性值的Product都会被标记为脏。
-
 #### 场景3：属性分配变更
 `saleor/graphql/product/mutations/attributes.py:348-353`
-
 ```python
 product_ids = list(
     models.Product.objects.filter(product_type=product_type).values_list("id", flat=True)
@@ -198,11 +512,8 @@ product_ids = list(
 mark_products_search_vector_as_dirty_in_batches(product_ids)
 ```
 
-**触发时机**：从ProductType中取消分配属性时。
-
 #### 场景4：ProductType更新
 `saleor/graphql/product/mutations/product_type/product_type_update.py:51-54`
-
 ```python
 if has_variants_changed and not instance.has_variants:
     product_ids = list(instance.products.values_list("id", flat=True))
@@ -210,23 +521,31 @@ if has_variants_changed and not instance.has_variants:
         mark_products_search_vector_as_dirty_in_batches(product_ids)
 ```
 
-### 3.2 批量标记工具
+### 3.3 批量标记工具
 
+**执行顺序**：
+```
+Step 1: mark_products_search_vector_as_dirty_in_batches() 分批
+        ↓ product/utils/search_helpers.py:7-11
+Step 2: mark_products_search_vector_as_dirty.delay() 异步任务
+        ↓ product/tasks.py:337-345
+Step 3: 使用select_for_update行锁更新
+        ↓ product/lock_objects.py:6-7
+```
+
+**代码证据 Step 1 - 分批**：
 `saleor/product/utils/search_helpers.py:7-11`
-
 ```python
 MARK_SEARCH_VECTOR_DIRTY_BATCH_SIZE = 1000
 
 def mark_products_search_vector_as_dirty_in_batches(product_ids: list[int]):
     for i in range(0, len(product_ids), MARK_SEARCH_VECTOR_DIRTY_BATCH_SIZE):
         batch_ids = product_ids[i : i + MARK_SEARCH_VECTOR_DIRTY_BATCH_SIZE]
-        mark_products_search_vector_as_dirty.delay(batch_ids)
+        mark_products_search_vector_as_dirty.delay(batch_ids)  # ← 每批1000个
 ```
 
-### 3.3 脏标记任务
-
+**代码证据 Step 2-3 - 行锁更新**：
 `saleor/product/tasks.py:337-345`
-
 ```python
 @app.task
 @allow_writer()
@@ -238,12 +557,28 @@ def mark_products_search_vector_as_dirty(product_ids: list[int]):
         Product.objects.filter(id__in=ids).update(search_index_dirty=True)
 ```
 
-**关键点**：使用`select_for_update`行锁避免并发更新冲突。
+`saleor/product/lock_objects.py:6-7`
+```python
+def product_qs_select_for_update() -> QuerySet[Product]:
+    return Product.objects.order_by("pk").select_for_update(of=(["self"]))  # ← 行锁
+```
 
 ### 3.4 定时更新任务
 
-`saleor/product/tasks.py:348-360`
+**执行顺序**：
+```
+Step 1: Celery Beat 定时触发
+        ↓ 配置在 settings.py 中
+Step 2: update_products_search_vector_task()
+        ↓ product/tasks.py:348-360
+Step 3: update_products_search_vector() 批次处理
+        ↓ product/search.py:52-74
+Step 4: _prep_product_search_vector_index() 生成向量并保存
+        ↓ product/search.py:32-49
+```
 
+**代码证据 Step 2 - 定时任务**：
+`saleor/product/tasks.py:348-360`
 ```python
 @app.task(
     queue=settings.UPDATE_SEARCH_VECTOR_INDEX_QUEUE_NAME,
@@ -253,93 +588,134 @@ def update_products_search_vector_task():
     products = (
         Product.objects.using(settings.DATABASE_CONNECTION_REPLICA_NAME)
         .filter(search_index_dirty=True)
-        .order_by("updated_at")[:PRODUCTS_BATCH_SIZE]  # 300
+        .order_by("updated_at")[:PRODUCTS_BATCH_SIZE]  # 每次取300个
         .values_list("id", flat=True)
     )
     with allow_writer():
         update_products_search_vector(products)
 ```
 
-**调度**：由Celery Beat定时触发，轮询处理脏数据。
-
-### 3.5 索引更新核心逻辑
-
+**代码证据 Step 3-4 - 批次处理并保存**：
 `saleor/product/search.py:32-49`
-
 ```python
-def _prep_product_search_vector_index(
-    products, page_id_to_title_map: dict[int, str] | None = None
-):
+def _prep_product_search_vector_index(products, page_id_to_title_map=None):
     prefetch_related_objects(products, *PRODUCT_FIELDS_TO_PREFETCH)
     
     for product in products:
         product.search_vector = FlatConcatSearchVector(
             *prepare_product_search_vector_value(
-                product,
-                already_prefetched=True,
+                product, already_prefetched=True,
                 page_id_to_title_map=page_id_to_title_map,
             )
         )
-        product.search_index_dirty = False
+        product.search_index_dirty = False  # ← 清除脏标记
     
     Product.objects.bulk_update(
         products, ["search_vector", "updated_at", "search_index_dirty"]
     )
 ```
 
-**预取字段**：
-```python
-PRODUCT_FIELDS_TO_PREFETCH = [
-    "variants__attributes__values",
-    "variants__attributes__assignment__attribute",
-    "attributevalues__value",
-    "product_type__attributeproduct__attribute",
-]
-```
-
-**批量处理**：`PRODUCTS_BATCH_SIZE = 100`，每批处理100个产品。
-
 ---
 
-## 四、查询匹配逻辑
+## 四、查询匹配逻辑（带执行顺序和代码证据）
 
 ### 4.1 全文搜索（使用search_vector）
 
-#### 搜索过滤入口
-`saleor/graphql/product/filters/product_helpers.py:324-325`
-
-```python
-def filter_search(qs, _, value):
-    return prefix_search(qs, value)
+**执行顺序**：
+```
+Step 1: GraphQL Query (products) 入口
+        ↓ graphql/product/schema.py
+Step 2: resolve_products() 获取基础QuerySet
+        ↓ graphql/product/resolvers.py
+Step 3: ProductFilter 应用过滤
+        ↓ graphql/product/filters/product.py:94-231
+Step 4: filter_search() 调用前缀搜索
+        ↓ graphql/product/filters/product_helpers.py:324-325
+Step 5: prefix_search() 核心搜索算法
+        ↓ core/search.py:144-179
+Step 6: parse_search_query() 解析搜索语法
+        ↓ core/search.py:89-141
+Step 7: 返回带search_rank注解的QuerySet
 ```
 
-#### 核心搜索算法
-`saleor/core/search.py:144-179`
+**代码证据 Step 3 - ProductFilter定义**：
+`saleor/graphql/product/filters/product.py:140`
+```python
+search = django_filters.CharFilter(method=filter_search)
+```
 
+**代码证据 Step 4 - filter_search()**：
+`saleor/graphql/product/filters/product_helpers.py:324-325`
+```python
+def filter_search(qs, _, value):
+    return prefix_search(qs, value)  # ← 委托给核心搜索函数
+```
+
+**代码证据 Step 5 - prefix_search()**：
+`saleor/core/search.py:144-179`
 ```python
 def prefix_search(qs: "QuerySet", value: str) -> "QuerySet":
-    value = strip_accents(value)
+    if not value:
+        return qs.annotate(search_rank=Value(0))
     
-    parsed_query = parse_search_query(value)
+    value = strip_accents(value)  # ← 去除重音
+    
+    parsed_query = parse_search_query(value)  # ← 解析搜索语法
     if not parsed_query:
         return qs.annotate(search_rank=Value(0)).none()
     
-    # 前缀查询 - 用于过滤
+    # 前缀查询 - 用于过滤（ broad match ）
     prefix_query = SearchQuery(parsed_query, search_type="raw", config="simple")
     
-    # 精确查询 - 仅用于排序
+    # 精确查询 - 仅用于排序（ higher rank for exact matches ）
     exact_query = SearchQuery(value, search_type="websearch", config="simple")
     
-    qs = qs.filter(search_vector=prefix_query).annotate(
+    qs = qs.filter(search_vector=prefix_query).annotate(  # ← 使用search_vector过滤
         prefix_rank=SearchRank(F("search_vector"), prefix_query),
         exact_rank=SearchRank(F("search_vector"), exact_query),
-        search_rank=F("exact_rank") * 2 + F("prefix_rank"),  # 精确匹配权重翻倍
+        search_rank=F("exact_rank") * 2 + F("prefix_rank"),  # ← 精确匹配权重翻倍
     )
     
     return qs
 ```
 
-**搜索语法支持**（`parse_search_query`函数）：
+**代码证据 Step 6 - parse_search_query()**：
+`saleor/core/search.py:89-141`
+```python
+def parse_search_query(value: str) -> str | None:
+    tokens = _tokenize(value)  # ← 分词处理
+    if not tokens:
+        return None
+    
+    parts: list[str] = []
+    pending_connector = " & "
+    
+    for token in tokens:
+        if token["type"] == "or":
+            pending_connector = " | "
+            continue
+        
+        if parts:
+            parts.append(pending_connector)
+        pending_connector = " & "
+        
+        neg = "!" if token["negated"] else ""
+        
+        if token["type"] == "word":
+            parts.append(f"{neg}{token['word']}:*")  # ← 前缀匹配
+        
+        elif token["type"] == "phrase":
+            words = token["words"]
+            if len(words) == 1:
+                parts.append(f"{neg}{words[0]}")
+            else:
+                phrase_tsquery = " <-> ".join(words)  # ← 短语匹配（followed-by）
+                parts.append(f"!({phrase_tsquery})" if neg else f"({phrase_tsquery})")
+    
+    return "".join(parts) if parts else None
+```
+
+**搜索语法支持**：
 - 多词隐式AND：`"coffee shop"` → `coffee:* & shop:*`
 - OR运算符：`"coffee OR tea"` → `coffee:* | tea:*`
 - 否定：`"-decaf"` → `!decaf:*`
@@ -349,38 +725,80 @@ def prefix_search(qs: "QuerySet", value: str) -> "QuerySet":
 - 精确匹配(websearch)：2x权重
 - 前缀匹配：1x权重
 
-### 4.2 属性过滤（不使用search_vector）
+### 4.2 属性过滤（不使用search_vector，直接联表）
 
-属性过滤采用直接联表查询方式，不依赖search_vector索引。
+**执行顺序（新版属性过滤）**：
+```
+Step 1: ProductFilter.filter_attributes() 入口
+        ↓ graphql/product/filters/product.py:164-167
+Step 2: filter_products_by_attributes() 路由到新旧版
+        ↓ graphql/product/filters/product_attributes.py:976-984
+Step 3: _filter_products_by_attributes() 新版逻辑
+        ↓ graphql/product/filters/product_attributes.py:851-931
+Step 4: 根据值类型分发到具体过滤函数
+        ↓ product_attributes.py:893-928
+Step 5: filter_by_slug_or_name() / filter_by_numeric_attribute() 等
+        ↓ product_attributes.py:339-416
+Step 6: _get_assigned_product_attribute_for_attribute_value() 构建Exists查询
+        ↓ product_attributes.py:325-336
+Step 7: 返回过滤后的QuerySet
+```
 
-#### 属性过滤入口
-`saleor/graphql/product/filters/product_attributes.py:976-984`
-
+**代码证据 Step 1 - 入口**：
+`saleor/graphql/product/filters/product.py:164-167`
 ```python
-def filter_products_by_attributes(
-    qs: QuerySet[Product], value: list[dict[str, str | dict | list | bool]]
-) -> QuerySet[Product]:
+def filter_attributes(self, queryset, name, value):
+    if not value:
+        return queryset
+    return filter_products_by_attributes(queryset, value)
+```
+
+**代码证据 Step 2 - 路由新旧版**：
+`saleor/graphql/product/filters/product_attributes.py:976-984`
+```python
+def filter_products_by_attributes(qs, value):
     if not value:
         return qs.none()
     
+    # 检测是否使用旧版格式（包含slug和value以外的字段）
     if set(value[0].keys()).difference({"slug", "value"}):
-        return deprecated_filter_attributes(qs, value)
-    return _filter_products_by_attributes(qs, value)
+        return deprecated_filter_attributes(qs, value)  # ← 旧版
+    return _filter_products_by_attributes(qs, value)    # ← 新版
 ```
 
-#### 新属性过滤逻辑
+**代码证据 Step 3 - 新版过滤逻辑**：
 `saleor/graphql/product/filters/product_attributes.py:851-931`
-
 ```python
-def _filter_products_by_attributes(
-    qs: QuerySet[Product], value: list[dict]
-) -> QuerySet[Product]:
+def _filter_products_by_attributes(qs: QuerySet[Product], value: list[dict]):
+    attribute_slugs = {attr_filter["slug"] for attr_filter in value if "slug" in attr_filter}
+    attributes_map = {
+        attr.slug: attr
+        for attr in Attribute.objects.using(qs.db).filter(slug__in=attribute_slugs)
+    }
+    
     attr_filter_expression = Q()
     
+    # 处理没有value的属性（只要有值即可）
+    attr_without_values_input = []
+    for attr_filter in value:
+        if "slug" in attr_filter and "value" not in attr_filter:
+            attr_without_values_input.append(attributes_map[attr_filter["slug"]])
+    
+    if attr_without_values_input:
+        atr_value_qs = AttributeValue.objects.using(qs.db).filter(
+            attribute_id__in=[attr.id for attr in attr_without_values_input]
+        )
+        attr_filter_expression = _get_assigned_product_attribute_for_attribute_value(
+            atr_value_qs, qs.db
+        )
+    
+    # 处理带value的属性（按类型分发）
     for attr_filter in value:
         attr_value = attr_filter.get("value")
-        attr_slug = attr_filter.get("slug")
-        attr_id = attributes_map[attr_slug].id if attr_slug else None
+        if not attr_value:
+            continue
+        
+        attr_id = attributes_map[attr_filter["slug"]].id if "slug" in attr_filter else None
         
         # 根据值类型选择不同的过滤函数
         if "slug" in attr_value or "name" in attr_value:
@@ -396,34 +814,42 @@ def _filter_products_by_attributes(
         elif "reference" in attr_value:
             attr_filter_expression &= filter_objects_by_reference_attributes(attr_id, attr_value["reference"], qs.db)
     
-    if attr_filter_expression != Q():
-        return qs.filter(attr_filter_expression)
-    return qs.none()
+    return qs.filter(attr_filter_expression) if attr_filter_expression != Q() else qs.none()
 ```
 
-#### Product属性值查询
-`saleor/graphql/product/filters/product_attributes.py:325-336`
+**代码证据 Step 5-6 - 具体过滤函数和Exists查询**：
+`saleor/graphql/product/filters/product_attributes.py:339-352`
+```python
+def filter_by_slug_or_name(attr_id, attr_value, db_connection_name):
+    attribute_values = get_attribute_values_by_slug_or_name_value(
+        attr_id=attr_id, attr_value=attr_value,
+        db_connection_name=db_connection_name,
+    )
+    return _get_assigned_product_attribute_for_attribute_value(
+        attribute_values=attribute_values,
+        db_connection_name=db_connection_name,
+    )
+```
 
+`saleor/graphql/product/filters/product_attributes.py:325-336`
 ```python
 def _get_assigned_product_attribute_for_attribute_value(
-    attribute_values: QuerySet[AttributeValue],
-    db_connection_name: str,
+    attribute_values: QuerySet[AttributeValue], db_connection_name: str,
 ):
     return Q(
         Exists(
             AssignedProductAttributeValue.objects.using(db_connection_name).filter(
-                Exists(attribute_values.filter(id=OuterRef("value_id"))),
-                product_id=OuterRef("id"),
+                Exists(attribute_values.filter(id=OuterRef("value_id"))),  # ← 子查询匹配值
+                product_id=OuterRef("id"),  # ← 关联到Product
             )
         )
     )
 ```
 
-#### 旧版属性过滤（同时支持Product和Variant属性）
+**旧版属性过滤（同时支持Product和Variant属性）**：
 `saleor/graphql/product/filters/product_attributes.py:200-229`
-
 ```python
-def filter_products_by_attributes_values(qs, queries: T_PRODUCT_FILTER_QUERIES):
+def filter_products_by_attributes_values(qs, queries):
     filters = []
     for values in queries.values():
         # Product属性过滤
@@ -434,7 +860,7 @@ def filter_products_by_attributes_values(qs, queries: T_PRODUCT_FILTER_QUERIES):
             Exists(assigned_product_attribute_values.filter(product_id=OuterRef("pk")))
         )
         
-        # Variant属性过滤
+        # Variant属性过滤（三层嵌套Exists）
         assigned_variant_attribute_values = AssignedVariantAttributeValue.objects.using(
             qs.db
         ).filter(value_id__in=values)
@@ -452,102 +878,155 @@ def filter_products_by_attributes_values(qs, queries: T_PRODUCT_FILTER_QUERIES):
             Exists(product_variants.filter(product_id=OuterRef("pk")))
         )
         
-        filters.append(product_attribute_filter | variant_attribute_filter)
+        filters.append(product_attribute_filter | variant_attribute_filter)  # ← OR合并
     
     return qs.filter(*filters)
 ```
 
-**关键点**：旧版过滤同时查询Product和Variant的属性，使用`OR`条件合并。
+**关键点**：旧版过滤同时查询Product和Variant的属性，使用`OR`条件合并。新版过滤（`_filter_products_by_attributes`）目前只查Product属性，不查Variant属性。
 
 ---
 
-## 五、完整流程时序图
+## 五、完整流程时序图（带代码证据）
 
-### 5.1 Variant创建时索引更新流程
+### 5.1 批量创建Variant时索引更新流程
 
 ```
-GraphQL Mutation (productVariantCreate)
-    ↓
-save() 方法
-    ├─ 保存ProductVariant
-    ├─ 保存属性值 (AttributeAssignmentMixin.save)
-    ├─ 生成Variant名称
-    └─ 标记Product.search_index_dirty = True
-        ↓
-Celery Beat定时任务
-    ↓
-update_products_search_vector_task()
-    ├─ 查询search_index_dirty=True的Product（按updated_at排序）
-    └─ 调用update_products_search_vector(products)
-        ↓
-update_products_search_vector()
-    ├─ 批量获取关联数据（Prefetch）
-    ├─ 生成search_vector（包含Product和Variant属性）
-    └─ 批量更新Product.search_vector和search_index_dirty=False
+Step 1: GraphQL Mutation (productVariantBulkCreate)
+        ↓ saleor/graphql/product/bulk_mutations/product_variant_bulk_create.py:930-981
+        perform_mutation()
+        ├─ clean_variants() 验证输入 [line 940-942]
+        ├─ create_variants() 构造对象 [line 943-945]
+        ├─ save_variants() 保存到数据库 [line 963]
+        │   ├─ bulk_create(variants_to_create) [line 883]
+        │   ├─ AttributeAssignmentMixin.save(variant, attributes) [line 885-886]
+        │   └─ 设置default_variant [line 891-893]
+        └─ post_save_actions() [line 970]
+            └─ product.search_index_dirty = True [line 919-920]
+                ↓
+Step 2: Celery Beat定时任务
+        ↓ saleor/product/tasks.py:348-360
+        update_products_search_vector_task()
+        ├─ 查询search_index_dirty=True的Product（按updated_at排序，取300个）
+        └─ 调用update_products_search_vector(products)
+            ↓
+Step 3: update_products_search_vector()
+        ↓ saleor/product/search.py:52-74
+        ├─ 按100个一批处理
+        ├─ 预取关联Page的title
+        └─ 调用_prep_product_search_vector_index()
+            ↓
+Step 4: _prep_product_search_vector_index()
+        ↓ saleor/product/search.py:32-49
+        ├─ prefetch_related_objects() 预取关联数据
+        ├─ prepare_product_search_vector_value() 生成搜索向量
+        │   ├─ Product.name (权重A)
+        │   ├─ Product.description_plaintext (权重C)
+        │   ├─ Product属性值 (权重B)
+        │   └─ generate_variants_search_vector_value()
+        │       ├─ Variant.sku / Variant.name (权重A)
+        │       └─ Variant属性值 (权重B)
+        ├─ 设置product.search_index_dirty = False
+        └─ bulk_update() 保存到数据库
 ```
 
 ### 5.2 属性值更新时索引更新流程
 
 ```
-GraphQL Mutation (attributeValueUpdate)
-    ↓
-post_save_action()
-    ↓
-mark_search_index_dirty(instance)
-    ├─ 查找使用该AttributeValue的所有ProductVariant
-    ├─ 查找关联的所有Product（且search_index_dirty=False）
-    └─ 批量调用mark_products_search_vector_as_dirty.delay()
-        ↓
-Celery任务执行
-    ↓
-mark_products_search_vector_as_dirty()
-    └─ 使用select_for_update行锁更新Product.search_index_dirty=True
-        ↓
-（后续流程同上，由定时任务处理）
+Step 1: GraphQL Mutation (attributeValueUpdate)
+        ↓ saleor/graphql/attribute/mutations/attribute_value_update.py
+        perform_mutation()
+        ├─ 更新AttributeValue
+        └─ post_save_action()
+            ↓
+Step 2: _mark_products_search_index_dirty(instance)
+        ↓ saleor/graphql/attribute/mutations/attribute_value_update.py:86-110
+        ├─ 查找使用该AttributeValue的所有ProductVariant
+        ├─ 查找关联的所有Product（且search_index_dirty=False）
+        └─ mark_products_search_vector_as_dirty_in_batches()
+            ↓
+Step 3: mark_products_search_vector_as_dirty_in_batches()
+        ↓ saleor/product/utils/search_helpers.py:7-11
+        └─ 按1000个一批，调用mark_products_search_vector_as_dirty.delay()
+            ↓
+Step 4: mark_products_search_vector_as_dirty() 任务执行
+        ↓ saleor/product/tasks.py:337-345
+        └─ 使用select_for_update行锁，设置search_index_dirty=True
+            ↓
+Step 5: （后续流程同上，由定时任务处理）
 ```
 
 ### 5.3 搜索查询流程
 
 ```
-GraphQL Query (products)
-    ↓
-resolve_products() → 获取基础QuerySet
-    ↓
-ProductFilter.filter_search()
-    ↓
-prefix_search(qs, value)
-    ├─ strip_accents() - 去除重音
-    ├─ parse_search_query() - 解析搜索语法
-    ├─ 构建prefix_query（前缀匹配，用于过滤）
-    ├─ 构建exact_query（精确匹配，用于排序）
-    └─ 返回带search_rank注解的QuerySet
-        ↓
-（可选）ProductFilter.filter_attributes()
-    ↓
-filter_products_by_attributes()
-    └─ 直接联表查询AssignedProductAttributeValue/AssignedVariantAttributeValue
-        ↓
-返回最终结果
+Step 1: GraphQL Query (products)
+        ↓ saleor/graphql/product/schema.py
+        resolve_products() → 获取基础QuerySet
+            ↓
+Step 2: ProductFilter 应用过滤条件
+        ↓ saleor/graphql/product/filters/product.py:94-231
+        ├─ filter_search() → prefix_search() [line 140]
+        │   ↓ saleor/core/search.py:144-179
+        │   ├─ strip_accents() - 去除重音
+        │   ├─ parse_search_query() - 解析搜索语法（AND/OR/NOT/短语）
+        │   ├─ 构建prefix_query（前缀匹配，用于过滤）
+        │   ├─ 构建exact_query（精确匹配，用于排序）
+        │   ├─ qs.filter(search_vector=prefix_query) - 使用索引过滤
+        │   └─ annotate(search_rank=...) - 计算评分
+        │
+        └─ (可选) filter_attributes() [line 164-167]
+            ↓ saleor/graphql/product/filters/product_attributes.py:976-984
+            filter_products_by_attributes()
+            ├─ 检测新旧版格式
+            ├─ 新版: _filter_products_by_attributes() - 仅查Product属性
+            └─ 旧版: filter_products_by_attributes_values() - 查Product+Variant属性
+                ↓
+Step 3: 返回最终结果（按search_rank排序）
 ```
+
+### 5.4 批量删除Variant时索引更新流程（特殊 - 同步更新）
+
+```
+Step 1: GraphQL Mutation (productVariantBulkDelete)
+        ↓ saleor/graphql/product/bulk_mutations/product_variant_bulk_delete.py:73-159
+        perform_mutation()
+        ├─ 验证参数
+        ├─ select_for_update() 锁定Product和Variant [line 97-114]
+        ├─ 删除属性值 [line 116]
+        ├─ 删除Channel Listing [line 117-119]
+        ├─ 删除Variant [line 120]
+        └─ 同步更新search_vector [line 145-156]
+            ├─ 对每个Product:
+            │   ├─ product.search_vector = FlatConcatSearchVector(
+            │   │   *prepare_product_search_vector_value(product)
+            │   │ )  ← 同步计算新的搜索向量
+            │   ├─ 设置新的default_variant
+            │   └─ product.save() 立即保存
+            └─ post_save_actions() - 触发webhook
+```
+
+**特殊说明**：批量删除时不经过异步流程，而是同步计算并保存search_vector，确保删除后搜索结果立即反映变化。
 
 ---
 
 ## 六、关键设计特点
 
 ### 6.1 读写分离
-- 写入：标记`search_index_dirty=True`，快速返回
-- 读取：定时任务异步批量更新`search_vector`
-- 查询：直接使用`search_vector`进行全文搜索
+- **写入路径**：标记`search_index_dirty=True`，快速返回（O(1)单字段更新）
+- **更新路径**：定时任务异步批量更新`search_vector`（O(n)批量处理）
+- **查询路径**：直接使用`search_vector`进行全文搜索（O(log n)GIN索引）
 
 ### 6.2 并发控制
-- 使用`select_for_update`行锁避免并发标记冲突
-- 批量处理减少数据库压力
-- 队列机制（Celery）削峰填谷
+- 使用`select_for_update`行锁避免并发标记冲突 [saleor/product/lock_objects.py:6-7]
+- 批量处理减少数据库压力（100-1000条/批）
+- 队列机制（Celery）削峰填谷，避免高并发时数据库压力过大
 
-### 6.3 索引分层
-- **全文搜索**：使用`search_vector`（tsvector + GIN索引），支持复杂语法
-- **属性过滤**：直接联表查询，不依赖search_vector，保证实时性
-- **Trigram搜索**：使用`search_document` + gin_trgm_ops索引，支持模糊匹配
+### 6.3 索引分层设计
+| 索引类型 | 实现方式 | 用途 | 实时性 |
+|---------|---------|------|--------|
+| 全文搜索 | `search_vector` + tsvector + GIN索引 | 关键词搜索（名称、描述、属性值） | 最终一致（异步更新） |
+| 属性过滤 | 直接联表查询 `AssignedProductAttributeValue` | 按属性值精确筛选 | 强一致（实时查询） |
+| Trigram搜索 | `search_document` + gin_trgm_ops索引 | 模糊匹配、拼写容错 | 最终一致 |
 
 ### 6.4 权重设计
 | 内容 | 权重 | 说明 |
@@ -557,8 +1036,10 @@ filter_products_by_attributes()
 | 属性值（所有类型） | B | 中等优先级 |
 | Product.description_plaintext | C | 最低优先级 |
 
-### 6.5 性能优化
-- 预取关联数据（`prefetch_related_objects`）减少N+1查询
-- 批量更新（`bulk_update`）减少数据库交互
-- 只读副本查询（`using(db_conn)`）降低主库压力
-- 合理的批量大小（100-1000）平衡内存和性能
+### 6.5 性能优化手段
+1. **预取关联数据**：`prefetch_related_objects()` 减少N+1查询 [saleor/product/search.py:35]
+2. **批量更新**：`bulk_update()` 减少数据库交互次数 [saleor/product/search.py:47-48]
+3. **只读副本**：`using(db_conn)` 查询从副本，降低主库压力 [saleor/product/search.py:53-54]
+4. **合理批次大小**：100（索引更新）、1000（脏标记）平衡内存和性能
+5. **Exists子查询**：属性过滤使用多层Exists而非JOIN，提高查询效率
+6. **行锁保护**：避免并发标记导致的更新丢失

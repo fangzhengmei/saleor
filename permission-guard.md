@@ -1339,9 +1339,307 @@ query {
 
 ---
 
-## 十、查询接口守卫：Query 与 Mutation 的权限声明
+## 十、权限组创建的校验调用顺序与短路点
 
-### 10.1 Query 接口守卫
+### 10.1 PermissionGroupCreate 完整调用栈
+
+以 `PermissionGroupCreate` 为例，App 请求的完整校验流程如下：
+
+```
+mutation PermissionGroupCreate($input: PermissionGroupCreateInput!) {
+  permissionGroupCreate(input: $input) {
+    group { id name }
+    permissionGroupErrors { field message code }
+  }
+}
+        ↓
+BaseMutation.mutate()  [saleor/graphql/core/mutations.py:517-531]
+        ├─► 第 522 行：if not cls.check_permissions(info.context, data=data):
+        │           raise PermissionDenied(permissions=cls._meta.permissions)
+        │
+        └─► PermissionGroupCreate.check_permissions()  ← 🔴 override 方法！
+                ├─► 第 143 行：app = get_app_promise(context).get()
+                │    ├─► if app:  ← 🔴 短路点！不调用父类校验
+                │    │       raise PermissionDenied(
+                │    │           message="Apps are not allowed to perform this mutation."
+                │    │       )
+                │    └─► 只有非 App 请求才继续：
+                │           return super().check_permissions(context, permissions)
+                │                   ↓
+                │           BaseMutation.check_permissions()
+                │                   ├─► 提取 all_permissions = (MANAGE_STAFF,)
+                │                   └─► one_of_permissions_or_auth_filter_required()
+                │                           └─► user.has_perm(MANAGE_STAFF)
+                │
+                └─► clean_input()  ← 校验通过后才执行
+                      ├─► clean_channels()
+                      ├─► clean_permissions()
+                      │     └─► ensure_can_manage_permissions()
+                      └─► clean_users()
+                            └─► ensure_users_are_staff()
+```
+
+### 10.2 App 请求的短路点位置详解
+
+#### 短路点 1：PermissionGroupCreate.check_permissions 第 144-147 行
+
+**文件位置：** `saleor/graphql/account/mutations/permission_group/permission_group_create.py:140-148`
+
+```python
+@classmethod
+def check_permissions(
+    cls, context, permissions=None, require_all_permissions=False, **data
+):
+    app = get_app_promise(context).get()  # 🔴 第 143 行
+    if app:  # 🔴 第 144 行 - 短路条件
+        # 🔴 短路：直接抛出异常，不调用 super()
+        raise PermissionDenied(
+            message="Apps are not allowed to perform this mutation."
+        )
+    # 只有非 App 请求才会执行到这里
+    return super().check_permissions(context, permissions)
+```
+
+**关键特征：**
+- **短路时机**：在 `super().check_permissions()` 之前
+- **触发条件**：`get_app_promise(context).get()` 返回非 None 值
+- **短路效果**：完全跳过父类的 MANAGE_STAFF 权限检查
+- **相同逻辑**：`PermissionGroupDelete.check_permissions` 也有完全相同的短路逻辑
+
+#### 短路点 2：permission_required 函数（业务逻辑链）
+
+**文件位置：** `saleor/permission/utils.py:82-94`
+
+```python
+def permission_required(
+    requestor: Union["User", "App", None], perms: Iterable[BasePermissionEnum]
+) -> bool:
+    if isinstance(requestor, User):
+        return requestor.has_perms(perms)
+    if requestor:
+        # 🔴 MANAGE_STAFF 硬编码拦截
+        if AccountPermissions.MANAGE_STAFF in perms:
+            return False  # 🔴 短路：不检查 App 的权限表
+        return requestor.has_perms(perms)
+    return False
+```
+
+**短路时机**：在调用 `requestor.has_perms(perms)` 之前
+
+### 10.3 三类校验的触发条件与错误返回对比
+
+| 校验类型 | 触发点 | 触发条件 | 异常类型 | 错误消息示例 |
+|---------|--------|---------|---------|-------------|
+| **BaseMutation 通用校验** | `BaseMutation.check_permissions` → `one_of_permissions_or_auth_filter_required` | `cls._meta.permissions` 非空，且请求者无对应权限 | `PermissionDenied` | `"To access this path, you need one of the following permissions: MANAGE_STAFF"` |
+| **Override check_permissions 短路** | `PermissionGroupCreate.check_permissions` 第 144 行 | `get_app_promise(context).get()` 返回 App | `PermissionDenied` | `"Apps are not allowed to perform this mutation." |
+| **OWNER helper 校验** | `check_is_owner_or_has_one_of_perms` | `requestor != owner` 且 `!has_one_of_permissions(requestor, perms)` | `PermissionDenied` | `"To access this path, you need one of the following permissions: MANAGE_APPS, OWNER"` |
+
+### 10.4 三类校验的详细对比
+
+#### 对比 1：BaseMutation 通用校验
+
+**触发时机**：`BaseMutation.mutate()` 第 522 行调用 `cls.check_permissions()`
+
+**适用场景**：所有继承 `BaseMutation` 的类，通过 `Meta.permissions` 声明权限
+
+**核心代码**：
+```python
+# saleor/graphql/core/mutations.py:518-523
+def mutate(cls, root, info: ResolveInfo, **data):
+    if not cls.check_permissions(info.context, data=data):
+        # 🔴 通用校验失败时，使用 cls._meta.permissions 构造错误
+        raise PermissionDenied(permissions=cls._meta.permissions)
+```
+
+**错误返回格式**：
+```json
+{
+  "errors": [
+    {
+      "message": "To access this path, you need one of the following permissions: MANAGE_STAFF",
+      "path": ["permissionGroupCreate"],
+      "extensions": {
+        "exception": {
+          "code": "PermissionDenied"
+        }
+      }
+    }
+  ],
+  "data": {
+    "permissionGroupCreate": null
+  }
+}
+```
+
+**关键特征**：
+- 错误消息自动生成，包含所有 `Meta.permissions` 的枚举名称
+- `permissions` 参数传入的是 `cls._meta.permissions`
+- 用于通用的、基于声明的权限检查
+
+---
+
+#### 对比 2：Override check_permissions 短路
+
+**触发时机**：子类重写 `check_permissions` 方法，在调用 `super()` 之前
+
+**适用场景**：需要对特定请求者类型（如 App）做额外限制的 Mutation
+
+**核心代码**：
+```python
+# saleor/graphql/account/mutations/permission_group/permission_group_create.py:140-148
+def check_permissions(cls, context, permissions=None, require_all_permissions=False, **data):
+    app = get_app_promise(context).get()
+    if app:
+        # 🔴 自定义错误消息，不使用自动生成的消息
+        raise PermissionDenied(
+            message="Apps are not allowed to perform this mutation."
+        )
+    return super().check_permissions(context, permissions)
+```
+
+**错误返回格式**：
+```json
+{
+  "errors": [
+    {
+      "message": "Apps are not allowed to perform this mutation.",
+      "path": ["permissionGroupCreate"],
+      "extensions": {
+        "exception": {
+          "code": "PermissionDenied"
+        }
+      }
+    }
+  ],
+  "data": {
+    "permissionGroupCreate": null
+  }
+}
+```
+
+**关键特征**：
+- 自定义错误消息，更具描述性
+- 不传入 `permissions` 参数给 `PermissionDenied`
+- 短路 `super()` 调用，父类的通用校验完全不执行
+- 同类 Mutation：`PermissionGroupDelete.check_permissions` 也有相同逻辑
+
+---
+
+#### 对比 3：OWNER helper 校验
+
+**触发时机**：resolver 或业务逻辑中显式调用 `check_is_owner_or_has_one_of_perms`
+
+**适用场景**：需要判断请求者是否为资源所有者或拥有特定权限的场景
+
+**核心代码**：
+```python
+# saleor/graphql/account/utils.py:379-394
+def check_is_owner_or_has_one_of_perms(
+    requestor: Union["User", "App", None], owner: Optional["User"], *perms
+) -> None:
+    if not is_owner_or_has_one_of_perms(requestor, owner, *perms):
+        # 🔴 权限列表 = 常规权限 + OWNER
+        raise PermissionDenied(permissions=list(perms) + [AuthorizationFilters.OWNER])
+```
+
+**使用示例**：
+```python
+# saleor/graphql/account/types.py:259-264
+def resolve_app(root: models.CustomerEvent, info: ResolveInfo):
+    requestor = get_user_or_app_from_context(info.context)
+    check_is_owner_or_has_one_of_perms(
+        requestor, root.user, AppPermission.MANAGE_APPS
+    )
+    return AppByIdLoader(info.context).load(root.app_id) if root.app_id else None
+```
+
+**错误返回格式**：
+```json
+{
+  "errors": [
+    {
+      "message": "To access this path, you need one of the following permissions: MANAGE_APPS, OWNER",
+      "path": ["customerEvent", "app"],
+      "extensions": {
+        "exception": {
+          "code": "PermissionDenied"
+        }
+      }
+    }
+  ],
+  "data": {
+    "customerEvent": {
+      "app": null
+    }
+  }
+}
+```
+
+**关键特征**：
+- 错误消息自动生成，包含常规权限 + `OWNER`
+- `permissions` 参数包含 `AuthorizationFilters.OWNER`
+- 用于业务逻辑层的所有权判断
+- 经过业务逻辑链，会触发 `permission_required` 中的 MANAGE_STAFF 拦截
+
+### 10.5 三类校验的执行顺序总结
+
+以 App 请求 `PermissionGroupCreate` 为例：
+
+```
+时间线：
+T1: BaseMutation.mutate() 开始执行
+T2: 调用 cls.check_permissions() → 实际调用 PermissionGroupCreate.check_permissions()
+T3: ├─► get_app_promise(context).get() → 返回 App 对象
+T4: ├─► if app: → True，进入短路分支
+T5: └─► raise PermissionDenied(message="Apps are not allowed...")
+    ← 在此处终止，后续的 super().check_permissions() 和 clean_input() 都不会执行
+```
+
+以无 MANAGE_STAFF 权限的用户请求 `PermissionGroupCreate` 为例：
+
+```
+时间线：
+T1: BaseMutation.mutate() 开始执行
+T2: 调用 cls.check_permissions() → PermissionGroupCreate.check_permissions()
+T3: ├─► get_app_promise(context).get() → None
+T4: ├─► 不进入短路分支
+T5: └─► return super().check_permissions(context, permissions)
+            ↓
+T6:       BaseMutation.check_permissions()
+            ├─► all_permissions = (MANAGE_STAFF,)
+            └─► one_of_permissions_or_auth_filter_required()
+                    └─► user.has_perm(MANAGE_STAFF) → False
+            ↓
+T7:       return False
+            ↓
+T8: BaseMutation.mutate() 第 523 行：
+    raise PermissionDenied(permissions=cls._meta.permissions)
+    ← 在此处终止，clean_input() 不会执行
+```
+
+以通过 `check_is_owner_or_has_one_of_perms` 校验的场景为例：
+
+```
+时间线：
+T1: resolver 开始执行
+T2: 调用 check_is_owner_or_has_one_of_perms(requestor, owner, MANAGE_APPS)
+T3: ├─► requestor == owner → False
+T4: └─► has_one_of_permissions(requestor, [MANAGE_APPS])
+          └─► permission_required(requestor, (MANAGE_APPS,))
+                  ├─► 不是 MANAGE_STAFF，不触发硬编码拦截
+                  └─► requestor.has_perms([MANAGE_APPS]) → False
+          ↓
+T5:    return False
+        ↓
+T6: raise PermissionDenied(permissions=[MANAGE_APPS, OWNER])
+    ← 在此处终止，resolver 后续逻辑不执行
+```
+
+---
+
+## 十一、查询接口守卫：Query 与 Mutation 的权限声明
+
+### 11.1 Query 接口守卫
 
 **文件位置：** `saleor/graphql/account/schema.py:163-181`
 
@@ -1367,7 +1665,7 @@ class AccountQueries(graphene.ObjectType):
     )
 ```
 
-### 10.2 Mutation 接口守卫
+### 11.2 Mutation 接口守卫
 
 **文件位置：** `saleor/graphql/core/mutations.py:158-212`
 
@@ -1393,7 +1691,7 @@ class BaseMutation(graphene.Mutation):
         super().__init_subclass_with_meta__(description=description, _meta=_meta, **options)
 ```
 
-### 10.3 Mutation 权限检查时机
+### 11.3 Mutation 权限检查时机
 
 **文件位置：** `saleor/graphql/account/mutations/permission_group/permission_group_create.py:140-148`
 
@@ -1755,3 +2053,33 @@ if AccountPermissions.MANAGE_STAFF in perms:
 - `errors` 数组中会记录具体错误，包含完整的 `path` 路径定位被拒绝的字段
 - HTTP 状态码仍为 200，表示查询"部分成功"
 - 客户端可以根据 `errors.path` 精确定位哪个字段出了问题
+
+### Q: PermissionGroupCreate 重写 check_permissions 的短路点在哪里？为什么不调用父类？
+
+**A:**
+短路点在 `saleor/graphql/account/mutations/permission_group/permission_group_create.py:144`：
+```python
+app = get_app_promise(context).get()
+if app:
+    raise PermissionDenied(
+        message="Apps are not allowed to perform this mutation."
+    )
+return super().check_permissions(context, permissions)
+```
+
+**为什么不先调用父类：**
+- 这是一种优化：如果 App 请求直接被禁止，就不需要再检查 MANAGE_STAFF 权限
+- 同时也避免了 App 拥有 MANAGE_STAFF 权限时可能出现的逻辑漏洞
+- 设计原则：先做最严格的拦截，再做通用校验
+
+### Q: BaseMutation 通用校验、override 短路、OWNER helper 三种方式的错误返回有什么不同？
+
+**A:**
+主要差异体现在三个方面：
+
+| 差异点 | BaseMutation 通用校验 | Override 短路 | OWNER helper |
+|--------|---------------------|--------------|-------------|
+| **错误消息** | 自动生成，列出所有需要的权限 | 自定义，更具描述性 | 自动生成，包含常规权限 + OWNER |
+| **permissions 参数** | 传入 `cls._meta.permissions` | 不传入 | 传入 `list(perms) + [OWNER]` |
+| **触发时机** | `super().check_permissions()` 返回 False 时 | `app` 不为 None 时 | `requestor != owner` 且无权限时 |
+| **消息示例** | `"To access this path, you need one of the following permissions: MANAGE_STAFF"` | `"Apps are not allowed to perform this mutation."` | `"To access this path, you need one of the following permissions: MANAGE_APPS, OWNER"` |

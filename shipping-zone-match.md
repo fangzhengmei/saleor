@@ -38,7 +38,25 @@ Checkout 生命周期管理层（地址变更 → 配送方法选择 → 下单�
 
 ## 三、地址规整与校验层
 
-### 3.1 调用链总览
+### 3.1 模块归属澄清（关键修正）
+
+**存在两个 `i18n.py` 文件，各司其职，互不包含**：
+
+| 文件 | 归属层级 | 核心内容 |
+|------|----------|----------|
+| `saleor/account/i18n.py` | **业务层** | `CountryAwareAddressForm`、`get_address_form_class()`、地址规范化逻辑 |
+| `saleor/graphql/account/i18n.py` | **GraphQL 层** | `I18nMixin`、`validate_address()` 类方法、跳过校验权限逻辑 |
+
+**调用关系**：
+```
+GraphQL 层 I18nMixin [graphql/account/i18n.py]
+    ↓ 调用
+account/forms.py [get_address_form()]
+    ↓ 调用
+业务层表单 [account/i18n.py: CountryAwareAddressForm]
+```
+
+### 3.2 调用链总览
 
 ```
 GraphQL Mutation
@@ -56,9 +74,9 @@ CountryAwareAddressForm.validate_address() [account/i18n.py:196]
 i18naddress.normalize_address() [第三方库]
 ```
 
-### 3.2 关键节点详解
+### 3.3 关键节点详解
 
-#### 3.2.1 `I18nMixin.validate_address()` [graphql/account/i18n.py:155]
+#### 3.3.1 `I18nMixin.validate_address()` [graphql/account/i18n.py:155]
 
 **参数控制**：
 - `format_check`: 是否校验字段格式（默认 `True`）
@@ -68,14 +86,14 @@ i18naddress.normalize_address() [第三方库]
 
 **核心逻辑**：
 ```python
-# 1. 检查 country 必填
+# 1. 检查 country 必填（不受任何参数影响，始终校验）
 if address_data.get("country") is None:
     raise ValidationError(...)
 
-# 2. 处理 skip_validation 权限
+# 2. 处理 skip_validation 权限（🔴 关键：只设置 format_check = False）
 if address_data.get("skip_validation"):
     cls.can_skip_address_validation(info)
-    format_check = False
+    format_check = False  # 不影响 required_check
 
 # 3. 调用表单验证
 address_form = cls._validate_address_form(...)
@@ -87,7 +105,9 @@ if not instance:
 cls.construct_instance(instance, address_data)
 ```
 
-#### 3.2.2 `CountryAwareAddressForm.validate_address()` [account/i18n.py:196]
+**关键发现**：`skip_validation` 只影响 `format_check`，`required_check` 始终保持默认 `True`，没有任何调用方传入 `required_check=False`。
+
+#### 3.3.2 `CountryAwareAddressForm.validate_address()` [account/i18n.py:196]
 
 **地址规整四步走**：
 
@@ -109,6 +129,36 @@ cls.construct_instance(instance, address_data)
 3. **规范化**：`i18naddress.normalize_address(data)` 调用第三方库进行地址标准化
 
 4. **非标准字段恢复**：`_restore_non_allowed_fields()` 恢复被规范化过滤掉的、但原始数据中存在的字段
+
+### 3.4 skip_validation 与 required_check 的行为界限
+
+#### 3.4.1 参数交互逻辑
+
+```python
+# graphql/account/i18n.py:176-178
+if address_data.get("skip_validation"):
+    cls.can_skip_address_validation(info)
+    format_check = False  # ← 只修改 format_check，required_check 保持 True
+```
+
+#### 3.4.2 错误过滤矩阵（实际行为）
+
+| 错误类型 | format_check | required_check | 结果 |
+|----------|-------------|----------------|------|
+| 格式错误（邮编/电话格式不对） | True | 任意 | 抛出错误 |
+| 格式错误（邮编/电话格式不对） | False | 任意 | **跳过，保留原始值到 cleaned_data** |
+| 必填错误（字段为空） | 任意 | True | 抛出错误 |
+| 必填错误（字段为空） | 任意 | False | 有值则接受，无值则忽略 |
+
+#### 3.4.3 实际生效组合
+
+| 场景 | format_check | required_check | 行为 |
+|------|-------------|----------------|------|
+| **默认校验** | True | True | 格式+必填全部校验 |
+| **skip_validation=True** | False | True | 跳过格式校验，但必填字段仍然检查 |
+| **理论上的宽松模式** | False | False | 全部跳过（目前无调用方使用） |
+
+**重要结论**：`skip_validation=True` 并不意味着完全跳过校验，只是跳过格式校验，必填字段（如 country、postal_code 等）仍然会检查。`country` 字段在 `validate_address()` 入口处单独检查，不受任何参数影响。
 
 ---
 
@@ -400,13 +450,36 @@ def is_method_in_valid_methods(self, checkout_info) -> bool:
 
 ## 八、附录 A：I18nMixin 归属与继承体系
 
-### 8.1 Mixin 归属澄清
+### 8.1 双 i18n.py 模块边界澄清（与第三章结论统一）
 
-**常见误解**：I18nMixin 归属于 `account` 模块
+**核心发现**：存在**两个独立的 `i18n.py` 文件**，归属不同层级，各司其职：
 
-**实际归属**：`saleor/graphql/account/i18n.py:58`
+| 文件 | 归属层级 | 核心职责 | 关键类/函数 |
+|------|----------|----------|------------|
+| `saleor/account/i18n.py` | **业务层** | 地址表单定义、地址规范化逻辑 | `CountryAwareAddressForm`、`get_address_form_class()`、`validate_address()` 实例方法 |
+| `saleor/graphql/account/i18n.py` | **GraphQL 层** | Mutation 地址校验入口、权限控制、错误处理 | `I18nMixin`、`validate_address()` 类方法、`SKIP_ADDRESS_VALIDATION_PERMISSION_MAP` |
 
-- **位置**：`graphql/account/` 命名空间下，而非 `account/`
+**分层设计意图**：
+1. **业务层 `account/i18n.py`**：不感知 GraphQL，可独立被其他业务模块调用
+2. **GraphQL 层 `graphql/account/i18n.py`**：纯横向能力注入，为 Mutation 提供统一的地址校验入口
+
+**调用流向**：
+```
+Mutation（继承 I18nMixin）
+    ↓ [graphql/account/i18n.py]
+I18nMixin.validate_address() 类方法
+    ↓
+_validate_address_form()
+    ↓ [account/forms.py]
+get_address_form()
+    ↓ [account/i18n.py]
+CountryAwareAddressForm.validate_address() 实例方法
+    ↓
+i18naddress.normalize_address() [第三方库]
+```
+
+**I18nMixin 精确定位**：
+- **位置**：`saleor/graphql/account/i18n.py:58`
 - **性质**：纯 GraphQL 层工具类，与业务模型层解耦
 - **设计意图**：为 Mutation 提供地址校验的横向能力
 
@@ -506,6 +579,44 @@ sequenceDiagram
     Mutation->>DB: 保存 Address，validation_skipped 字段写入数据库
     Mutation-->>Client: 返回成功响应
 ```
+
+#### 8.4.2.1 skip_validation 与 required_check 的行为界限（关键澄清）
+
+**核心代码** [graphql/account/i18n.py:176-178]：
+```python
+if address_data.get("skip_validation"):
+    cls.can_skip_address_validation(info)
+    format_check = False  # ← 只修改 format_check，required_check 保持默认 True
+```
+
+**行为对照表**：
+
+| 参数 | 含义 | 受 skip_validation 影响？ | 默认值 |
+|------|------|--------------------------|--------|
+| `format_check` | 是否校验字段格式（邮编、电话格式等） | ✅ 是，设为 `False` | `True` |
+| `required_check` | 是否校验必填字段 | ❌ 否，保持不变 | `True` |
+
+**实际生效组合**：
+
+| 场景 | format_check | required_check | 行为 |
+|------|-------------|----------------|------|
+| **默认校验** | `True` | `True` | 格式+必填全部校验 |
+| **`skip_validation=True`** | `False` | `True` | 跳过格式校验，但必填字段仍然检查 |
+| **理论宽松模式** | `False` | `False` | 全部跳过（无调用方使用） |
+
+**错误过滤矩阵**：
+
+| 错误类型 | format_check | required_check | 结果 |
+|----------|-------------|----------------|------|
+| 格式错误（邮编/电话格式不对） | `True` | 任意 | 抛出错误 |
+| 格式错误（邮编/电话格式不对） | `False` | 任意 | 跳过，保留原始值到 `cleaned_data` |
+| 必填错误（字段为空） | 任意 | `True` | 抛出错误 |
+| 必填错误（字段为空） | 任意 | `False` | 有值则接受，无值则忽略 |
+
+**重要结论**：
+1. `skip_validation=True` 并不意味着完全跳过校验，只是跳过格式校验
+2. 必填字段（如 country、postal_code、city 等）仍然会检查
+3. `country` 字段在 `validate_address()` 入口处单独检查，**不受任何参数影响**，始终校验
 
 #### 8.4.3 validation_skipped 标记的下游影响
 

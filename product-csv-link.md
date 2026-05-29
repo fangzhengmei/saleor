@@ -1,18 +1,39 @@
 # 商品 CSV 导入导出代码链路深度分析
 
-## ⚠️ 核心发现
+---
 
-**Saleor 的 `csv/` 模块只有导出功能，没有直接的 CSV 文件导入！**
+## ⚠️ 核心发现（已验证代码事实）
 
-| 方向 | 代码入口 | 输入格式 |
-|------|---------|---------|
-| 导出 | `saleor/csv/` 模块 | 数据库 → CSV/XLSX 文件 |
-| 导入 | `saleor/graphql/product/bulk_mutations/product_bulk_create.py` | GraphQL JSON 数组 (不是 CSV 文件) |
+### 代码证据：Saleor csv 模块只有导出，没有导入！
 
-**真实的"CSV 导入"工作流**：
-```
-用户导出 CSV → 编辑 CSV → 自行转换为 GraphQL JSON → 调用 productBulkCreate mutation
-```
+| 验证项 | 代码位置 | 事实 |
+|--------|---------|------|
+| Mutation 注册 | `saleor/graphql/csv/schema.py:45-54` | `CsvMutations` 只注册了 `export_products`, `export_gift_cards`, `export_voucher_codes` |
+| Mutation 导出列表 | `saleor/graphql/csv/mutations/__init__.py:1-5` | 只导出了 3 个 Export* 类，没有 Import* 类 |
+| petl 库使用 | `saleor/csv/utils/export.py:6,184,269` | 只有 `etl.tocsv()`, `etl.io.csv.appendcsv()`，没有 `fromcsv`/`read_csv` |
+| 事件类型 | `saleor/csv/__init__.py:1-24` | `ExportEvents` 只有 `EXPORT_PENDING`, `EXPORT_SUCCESS`, `EXPORT_FAILED` 等，没有 IMPORT_* |
+| 数据模型 | `saleor/csv/models.py:12-36` | `ExportFile` 模型只有 `content_file` 存储导出文件，没有导入文件字段 |
+| 全局搜索 | 全代码库 | 没有找到 `parse_csv`, `DictReader`, `fromcsv`, `read_csv` 等 CSV 解析代码 |
+
+### 推断说明（无直接代码，基于架构的逻辑推断）
+
+> 以下内容基于代码架构的合理推断，没有直接代码证据：
+
+1. **真实的"CSV 导入"工作流**：
+   ```
+   用户导出 CSV → 编辑 CSV → 自行转换为 GraphQL JSON → 调用 productBulkCreate mutation
+   ```
+
+2. **为什么没有 CSV 文件导入？**（推断）
+   - CSV 解析需要处理太多边缘情况（格式、编码、数据清洗、空值处理）
+   - 字段映射不匹配（导出是 slug/名称，导入需要 ID）
+   - 留给用户/前端/外部系统处理：导出 CSV → Excel 编辑 → 自定义脚本转 GraphQL
+
+3. **用户需要自行处理的转换**：
+   - slug → ID 转换（分类、商品类型、合集等）
+   - 带单位的字符串解析（如 `"100 g"` → 数字 100 + 单位）
+   - 纯文本描述转 EditorJS JSON 格式
+   - 多值字段的分隔符处理（如多个合集 slug）
 
 ---
 
@@ -23,44 +44,103 @@
 │                          导出方向 (Database → CSV)                       │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  GraphQL (ExportProducts)                                               │
-│       ↓                                                                 │
+│       ↓  [对象: ExportProductsInput]                                    │
 │  Celery Task (export_products_task)                                     │
-│       ↓                                                                 │
+│       ↓  [对象: scope(dict), export_info(dict)]                         │
 │  字段映射 (ProductExportFields) → ORM 查询路径                          │
-│       ↓                                                                 │
+│       ↓  [对象: export_fields(list), file_headers(list)]                │
 │  批次处理 (BATCH_SIZE=1000) → queryset_in_batches                      │
-│       ↓                                                                 │
+│       ↓  [对象: batch_pks(list)]                                        │
 │  数据处理 (get_products_data) → 关系数据补充                            │
-│       ↓                                                                 │
+│       ↓  [对象: products_with_variants_data(list[dict])]                │
 │  petl 库 → 生成 CSV/XLSX 文件                                           │
-│       ↓                                                                 │
+│       ↓  [对象: NamedTemporaryFile]                                     │
 │  ExportFile.content_file → 存储 + 通知                                  │
 └─────────────────────────────────────────────────────────────────────────┘
-                              ↕ 用户手动转换
+                              ↕ 用户手动转换（推断）
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                          导入方向 (JSON → Database)                      │
 ├─────────────────────────────────────────────────────────────────────────┤
 │  GraphQL (ProductBulkCreate)                                            │
-│       ↓                                                                 │
+│       ↓  [对象: ProductBulkCreateInput[]]                               │
 │  输入验证 (clean_products) → index_error_map 逐行记录错误               │
-│       ↓                                                                 │
+│       ↓  [对象: index_error_map(defaultdict(list))]                     │
 │  错误策略检查 (REJECT_EVERYTHING / REJECT_FAILED_ROWS)                  │
-│       ↓                                                                 │
+│       ↓  [对象: instances_data_with_errors_list(list)]                  │
 │  实例构建 (不保存) → construct_instance                                  │
-│       ↓                                                                 │
+│       ↓  [对象: Product 实例 (未保存)]                                   │
 │  批量保存 → bulk_create() 分别写入多张表                                │
-│       ↓                                                                 │
+│       ↓  [对象: Product[], ProductMedia[], ...]                         │
 │  M2M 关系保存 → CollectionProduct.bulk_create()                         │
-│       ↓                                                                 │
+│       ↓  [对象: CollectionProduct[]]                                    │
 │  后置操作 → Webhook + 促销规则标记                                      │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 二、字段映射：双向数据流串联
+## 二、字段映射：双向数据流串联（已校转变体重量字段）
 
-### 2.1 导出方向字段映射 (Database → CSV)
+### 2.1 变体重量字段完整映射路径（已校对）
+
+#### 导出方向完整链路 (Database → CSV)
+
+```
+ProductFieldEnum.VARIANT_WEIGHT = "variant weight"
+    │  文件: saleor/graphql/csv/enums.py:46
+    ↓
+HEADERS_TO_FIELDS_MAPPING["fields"]["variant weight"] = "variant_weight"
+    │  文件: saleor/csv/utils/__init__.py:17
+    ↓  ⚠️  "variant_weight" 不是真实数据库字段！是 annotate 生成的计算字段
+get_products_data() → annotate()
+    │  文件: saleor/csv/utils/products_data.py:60-67
+    ↓
+    variant_weight=Case(
+        When(
+            variants__weight__isnull=False,           # 读取真实字段: variants__weight
+            then=Concat("variants__weight", V(" g")),  # 拼接单位: "100 g"
+        ),
+        default=V(""),
+        output_field=CharField(),
+    )
+    │
+    ↓  values(*product_export_fields)
+    ↓  distinct("pk", "variants__pk")
+    ↓  [data: {"variant_weight": "100 g", ...}]
+    ↓
+petl.fromdicts() → etl.io.csv.appendcsv()
+    │
+    ↓
+CSV 输出: "100 g" (字符串，带单位)
+```
+
+#### 导入方向完整链路 (CSV → Database)
+
+```
+用户手动解析: "100 g" → 提取数字 100 + 单位 "g"
+    │  ⚠️  无代码支持，需用户自行处理
+    ↓
+WeightScalar.parse_value()
+    │  文件: saleor/graphql/core/scalars.py:95-126
+    ├─ 如果是 {"unit": "g", "value": 100} → Weight(g=100)
+    └─ 如果是 100 → 使用默认单位 → Weight(g=100)
+    ↓
+clean_base_fields() → 验证 weight.value >= 0
+    │  文件: saleor/graphql/product/bulk_mutations/product_bulk_create.py:239-248
+    ↓
+construct_instance() → ProductVariant.weight = Weight(g=100)
+    │
+    ↓
+ProductVariant.objects.bulk_create()
+    │
+    ↓
+数据库存储: MeasurementField(measurement=Weight)
+    │  文件: saleor/product/models.py:132-136
+    ↓
+真实字段: ProductVariant.weight (Weight 对象，含 value 和 unit)
+```
+
+### 2.2 导出方向字段映射 (Database → CSV)
 
 **文件**: `saleor/csv/utils/__init__.py:1-93`
 
@@ -70,25 +150,28 @@ class ProductExportFields:
         "fields": {
             "id": "id",                                   # 商品 ID
             "name": "name",                               # 商品名称
-            "description": "description_as_str",          # 商品描述
+            "description": "description_as_str",          # 商品描述 (annotate 生成)
             "category": "category__slug",                 # 分类 slug
             "product type": "product_type__name",         # 商品类型名称
-            "product weight": "product_weight",           # 商品重量 (带单位)
+            "product weight": "product_weight",           # 商品重量 (annotate 生成，带单位)
             "variant id": "variants__id",                 # 变体 ID
             "variant sku": "variants__sku",               # 变体 SKU
-            "variant weight": "variant_weight",           # 变体重量
+            "variant weight": "variant_weight",           # 变体重量 (annotate 生成，带单位)
+            "variant is preorder": "variants__is_preorder",
+            "variant preorder global threshold": "variants__preorder_global_threshold",
+            "variant preorder end date": "variants__preorder_end_date",
         },
         "product_many_to_many": {
-            "collections": "collections__slug",           # 合集 slug (多值)
-            "product media": "media__image",              # 商品图片 (多值)
+            "collections": "collections__slug",           # 合集 slug (多值，逗号分隔)
+            "product media": "media__image",              # 商品图片 URL (多值)
         },
         "variant_many_to_many": {
-            "variant media": "variants__media__image"     # 变体图片 (多值)
+            "variant media": "variants__media__image"     # 变体图片 URL (多值)
         }
     }
 ```
 
-**表头生成流程**:
+**动态表头生成流程** (`saleor/csv/utils/product_headers.py:13-31`):
 ```
 get_product_export_fields_and_headers_info(export_info)
     ├─ get_product_export_fields_and_headers()
@@ -101,7 +184,7 @@ get_product_export_fields_and_headers_info(export_info)
         └─ "slug-value (channel currency code)"
 ```
 
-### 2.2 导入方向字段映射 (JSON → Database)
+### 2.3 导入方向字段映射 (JSON → Database)
 
 **文件**: `saleor/graphql/product/bulk_mutations/product_bulk_create.py:117-176`
 
@@ -109,39 +192,383 @@ get_product_export_fields_and_headers_info(export_info)
 class ProductBulkCreateInput(ProductCreateInput):
     name = graphene.String()                           # → Product.name
     slug = graphene.String()                           # → Product.slug
-    description = JSONString()                         # → Product.description
+    description = JSONString()                         # → Product.description (EditorJS JSON)
     category = graphene.ID()                           # → Product.category_id (需要 ID，不是 slug!)
-    product_type = graphene.ID(required=True)          # → Product.product_type_id
-    collections = NonNullList(graphene.ID)             # → CollectionProduct M2M
+    product_type = graphene.ID(required=True)          # → Product.product_type_id (需要 ID!)
+    collections = NonNullList(graphene.ID)             # → CollectionProduct M2M (需要 ID 列表!)
+    weight = WeightScalar()                            # → Product.weight (Weight 对象)
     attributes = NonNullList(AttributeValueInput)      # → 单独的属性赋值表
     media = NonNullList(MediaInput)                    # → ProductMedia
     channel_listings = NonNullList(ProductChannelListingCreateInput)
     variants = NonNullList(ProductVariantBulkCreateInput)
 ```
 
-### 2.3 导出 ↔ 导入 字段对应表
+### 2.4 导出 ↔ 导入 字段对应表（完整校对）
 
-| CSV 导出表头 | 导出 ORM 路径 | 导入 GraphQL 字段 | 注意事项 |
-|-------------|--------------|------------------|---------|
-| id | id | (自动生成) | 导入时不提供，系统生成 |
-| name | name | name | 直接对应 |
-| description | description_as_str | description | 导出是纯文本，导入需要 EditorJS JSON |
-| category | category__slug | category | ⚠️ 导出是 slug，导入需要 ID！需自行转换 |
-| product type | product_type__name | productType | ⚠️ 导出是名称，导入需要 ID！需自行转换 |
-| product weight | product_weight | weight | 导出带单位 ("100 g")，导入是数字 |
-| collections | collections__slug | collections | ⚠️ 导出是 slug 列表，导入需要 ID 列表！ |
-| product media | media__image | media | ⚠️ 导出是 URL，导入需要 media_url 或本地文件 |
-| variant id | variants__id | variants[].id | 导入时不提供 |
-| variant sku | variants__sku | variants[].sku | 直接对应 |
-| variant weight | variants__weight | variants[].weight | 同上，单位问题 |
+| CSV 导出表头 | 导出 ORM 路径 | 导入 GraphQL 字段 | 类型差异 | 转换需求 |
+|-------------|--------------|------------------|---------|---------|
+| id | `id` | (自动生成) | - | 导入时不提供 |
+| name | `name` | `name` | 字符串 → 字符串 | ✅ 直接对应 |
+| description | `description_as_str` | `description` | 纯文本 → EditorJS JSON | ⚠️ 需转换格式 |
+| category | `category__slug` | `category` | slug → ID | ⚠️ 需查询转换 |
+| product type | `product_type__name` | `productType` | 名称 → ID | ⚠️ 需查询转换 |
+| product weight | `product_weight` | `weight` | 字符串 "100 g" → Weight 对象 | ⚠️ 需解析单位 |
+| collections | `collections__slug` | `collections` | slug 列表 → ID 列表 | ⚠️ 需查询+拆分 |
+| product media | `media__image` | `media` | URL 字符串 → MediaInput | ⚠️ 需构造对象 |
+| variant id | `variants__id` | `variants[].id` | - | 导入时不提供 |
+| variant sku | `variants__sku` | `variants[].sku` | 字符串 → 字符串 | ✅ 直接对应 |
+| variant weight | `variant_weight` | `variants[].weight` | 字符串 "100 g" → Weight 对象 | ⚠️ 需解析单位 |
+| variant media | `variants__media__image` | `variants[].media` | URL 字符串 → MediaInput | ⚠️ 需构造对象 |
 
-**关键不匹配点**：导出的是人类可读的 slug/名称，导入需要的是数据库 ID！用户必须自行进行 ID 转换。
+**关键不匹配点总结**（代码证据）：
+1. **slug/名称 vs ID**：导出的是人类可读的 slug 或名称，导入需要数据库 ID
+   - 代码证据：`HEADERS_TO_FIELDS_MAPPING` 使用 `__slug` 或 `__name`，而 `ProductBulkCreateInput` 使用 `graphene.ID()`
+
+2. **字符串带单位 vs Weight 对象**：导出是 `"100 g"` 字符串，导入需要 `WeightScalar`（数字或 `{unit, value}` 对象）
+   - 代码证据：`annotate` 用 `Concat("variants__weight", V(" g"))` 生成字符串，`WeightScalar.parse_value()` 需要数字或字典
+
+3. **纯文本 vs EditorJS JSON**：导出是纯文本，导入需要 `JSONString` 类型的 EditorJS 格式
+   - 代码证据：导出用 `Cast("description", CharField())`，导入用 `JSONString(description=...)`
 
 ---
 
-## 三、批次处理：双向机制对比
+## 三、对象流串联：从字段映射到失败反馈边界
 
-### 3.1 导出批次处理 (Database → CSV)
+### 3.1 导出方向完整对象流
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  阶段 1: GraphQL 入口 → 任务提交                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│  ExportProducts.perform_mutation()                                       │
+│  文件: saleor/graphql/csv/mutations/export_products.py:109-132           │
+│                                                                          │
+│  输入对象:                                                               │
+│  {                                                                       │
+│    scope: "all" | {"ids": [...]} | {"filter": {...}},                    │
+│    export_info: {                                                        │
+│      fields: [ProductFieldEnum.NAME, ProductFieldEnum.VARIANT_WEIGHT],    │
+│      attributes: ["attr_id_1", ...],                                     │
+│      warehouses: ["warehouse_id_1", ...],                                │
+│      channels: ["channel_id_1", ...]                                     │
+│    },                                                                    │
+│    file_type: "csv" | "xlsx"                                             │
+│  }                                                                       │
+│                                                                          │
+│  输出对象:                                                               │
+│  ExportFile(                                                             │
+│    id=123,                                                               │
+│    status=JobStatus.PENDING,                                             │
+│    user=User(...),                                                       │
+│    app=None                                                              │
+│  )                                                                       │
+│                                                                          │
+│  异步任务参数:                                                           │
+│  export_products_task.delay(                                             │
+│    export_file_id=123,                                                   │
+│    scope={"all": ""},                                                    │
+│    export_info={"fields": [...], ...},                                   │
+│    file_type="csv"                                                       │
+│  )                                                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│  阶段 2: 字段映射 → 表头生成                                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│  get_product_export_fields_and_headers_info(export_info)                 │
+│  文件: saleor/csv/utils/product_headers.py:13-31                         │
+│                                                                          │
+│  输入对象: export_info (dict)                                            │
+│  输出对象:                                                               │
+│  (                                                                       │
+│    export_fields: ["id", "name", "variant_weight", ...],  # ORM 查询字段 │
+│    file_headers: ["id", "name", "variant weight", ...],   # CSV 表头     │
+│    data_headers: ["id", "name", "variant_weight", ...]    # 数据键名     │
+│  )                                                                       │
+│                                                                          │
+│  中间对象: ProductExportFields.HEADERS_TO_FIELDS_MAPPING (dict)          │
+└─────────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│  阶段 3: 批次处理 → 数据生成                                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│  export_products_in_batches()                                            │
+│  文件: saleor/csv/utils/export.py:192-223                                │
+│                                                                          │
+│  批次循环对象:                                                           │
+│  for batch_pks in queryset_in_batches(queryset, BATCH_SIZE=1000):         │
+│    batch_pks = [1, 2, 3, ..., 1000]  (list[int])                        │
+│                                                                          │
+│    ↓                                                                     │
+│    product_batch = Product.objects.filter(pk__in=batch_pks)              │
+│      .prefetch_related(                                                  │
+│        "attributevalues", "variants", "collections",                     │
+│        "media", "product_type", "category"                               │
+│      )  (QuerySet)                                                       │
+│                                                                          │
+│    ↓                                                                     │
+│    get_products_data(                                                    │
+│      queryset=product_batch,                                             │
+│      export_fields=set(...),                                             │
+│      attribute_ids=[...],                                                │
+│      warehouse_ids=[...],                                                │
+│      channel_ids=[...]                                                   │
+│    )                                                                     │
+│                                                                          │
+│    输出对象: products_with_variants_data (list[dict])                    │
+│    [                                                                     │
+│      {                                                                   │
+│        "id": "UHJvZHVjdDox",                                             │
+│        "name": "Product 1",                                              │
+│        "variant_weight": "100 g",                                        │
+│        "collections__slug": "summer, sale",                              │
+│        "size (variant attribute)": "M, L",                               │
+│        "main (warehouse quantity)": 100,                                 │
+│        "default-channel (channel currency code)": "USD",                 │
+│        ...                                                               │
+│      },                                                                  │
+│      ... (每变体一行)                                                    │
+│    ]                                                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│  阶段 4: 文件写入 → 失败反馈边界                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│  append_to_file()                                                        │
+│  文件: saleor/csv/utils/export.py:259-271                                │
+│                                                                          │
+│  输入对象:                                                               │
+│  export_data = [{"id": ..., "name": ..., ...}, ...]                      │
+│  headers = ["id", "name", "variant weight", ...]                         │
+│  temporary_file = NamedTemporaryFile(...)                                │
+│                                                                          │
+│  处理对象:                                                               │
+│  table = etl.fromdicts(export_data, header=headers, missing="")          │
+│                                                                          │
+│  输出: etl.io.csv.appendcsv(table, temp_file.name, delimiter=",")         │
+│                                                                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│  失败反馈边界: ExportTask.on_failure()                                   │
+│  文件: saleor/csv/tasks.py:28-47                                         │
+│                                                                          │
+│  触发条件: Celery 任务抛出异常                                            │
+│                                                                          │
+│  处理对象流:                                                             │
+│  Exception exc                                                           │
+│      ↓                                                                   │
+│  ExportFile.objects.get(pk=export_file_id) → export_file                 │
+│      ↓                                                                   │
+│  export_file.content_file = None                                         │
+│  export_file.status = JobStatus.FAILED                                   │
+│  export_file.save()                                                      │
+│      ↓                                                                   │
+│  export_failed_event(                                                    │
+│    export_file=export_file,                                              │
+│    message=str(exc),                                                     │
+│    error_type=str(einfo.type)                                            │
+│  ) → ExportEvent(...) (存入审计日志)                                      │
+│      ↓                                                                   │
+│  send_export_failed_info(export_file, data_type)                         │
+│      ↓                                                                   │
+│  NotifyEventType.CSV_EXPORT_FAILED + Webhook                             │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 导入方向完整对象流
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  阶段 1: GraphQL 入口 → 初始化                                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│  ProductBulkCreate.perform_mutation()                                    │
+│  文件: saleor/graphql/product/bulk_mutations/product_bulk_create.py:938-972│
+│  装饰器: @traced_atomic_transaction()  # 整个操作在事务中                 │
+│                                                                          │
+│  输入对象:                                                               │
+│  {                                                                       │
+│    products: [                                                           │
+│      {                                                                   │
+│        name: "Product 1",                                                │
+│        description: '{"blocks": [...]}',  # EditorJS JSON                │
+│        category: "Q2F0ZWdvcnk6MQ==",     # Global ID                     │
+│        productType: "UHJvZHVjdFR5cGU6MQ==",                              │
+│        weight: {"unit": "g", "value": 100},  # WeightScalar 格式         │
+│        variants: [{"sku": "SKU-001", "weight": 50, ...}],                │
+│        ...                                                               │
+│      },                                                                  │
+│      ... (更多产品)                                                      │
+│    ],                                                                    │
+│    error_policy: "REJECT_EVERYTHING" | "REJECT_FAILED_ROWS"              │
+│  }                                                                       │
+│                                                                          │
+│  初始化对象:                                                             │
+│  index_error_map = defaultdict(list)  # 按产品索引收集错误                │
+└─────────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│  阶段 2: 全量验证 → 错误收集                                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│  clean_products(info, products_data, index_error_map)                    │
+│  文件: saleor/graphql/product/bulk_mutations/product_bulk_create.py:619-654│
+│                                                                          │
+│  预加载对象 (避免 N+1):                                                  │
+│  warehouse_global_id_to_instance_map = {                                 │
+│    "V2FyZWhvdXNlOjE=": Warehouse(...),                                    │
+│    ...                                                                   │
+│  }                                                                       │
+│  channel_global_id_to_instance_map = {                                   │
+│    "Q2hhbm5lbDox": Channel(...),                                         │
+│    ...                                                                   │
+│  }                                                                       │
+│  duplicated_sku = {"DUPLICATE-123", ...}  # 全局去重检测                 │
+│                                                                          │
+│  逐产品验证循环:                                                          │
+│  for product_index, product_data in enumerate(products_data):            │
+│                                                                          │
+│    ↓  clean_base_fields()                                                │
+│    cleaned_input["description_plaintext"] = editorjs_to_text(description)│
+│    weight = cleaned_input.get("weight")                                  │
+│    if weight and weight.value < 0:                                       │
+│      index_error_map[product_index].append(                              │
+│        ProductBulkCreateError(                                           │
+│          path="weight",                                                  │
+│          message="Product can't have negative weight.",                  │
+│          code=ProductBulkCreateErrorCode.INVALID.value                   │
+│        )                                                                 │
+│      )                                                                   │
+│                                                                          │
+│    ↓  clean_attributes()                                                 │
+│    AttributeAssignmentMixin.clean_input() → ValidationError              │
+│    → add_indexes_to_errors() → index_error_map[product_index]            │
+│                                                                          │
+│    ↓  clean_media()                                                      │
+│    clean_image_file() / probe_media_url() → ValidationError              │
+│    → index_error_map[product_index]                                      │
+│                                                                          │
+│    ↓  clean_product_channel_listings()                                   │
+│    验证 channel_id 存在、不重复、发布状态合法                              │
+│    → index_error_map[product_index]                                      │
+│                                                                          │
+│    ↓  clean_variants()                                                   │
+│    委托给 ProductVariantBulkCreate.clean_variant()                        │
+│    → variant_index_error_map → index_error_map[product_index]            │
+│                                                                          │
+│  输出对象:                                                               │
+│  cleaned_inputs_map = {0: cleaned_input_0, 1: None, 2: cleaned_input_2, ...}│
+└─────────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│  阶段 3: 实例构建 → 错误策略检查                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│  create_products(info, cleaned_inputs_map, index_error_map)              │
+│  文件: saleor/graphql/product/bulk_mutations/product_bulk_create.py:657-726│
+│                                                                          │
+│  循环构建实例 (不保存):                                                  │
+│  for index, cleaned_input in cleaned_inputs_map.items():                 │
+│    if not cleaned_input:                                                 │
+│      instances_data_and_errors_list.append(                              │
+│        {"instance": None, "errors": index_error_map[index]}              │
+│      )                                                                   │
+│      continue                                                            │
+│                                                                          │
+│    instance = models.Product()                                           │
+│    instance = cls.construct_instance(instance, cleaned_input)            │
+│    cls.clean_instance(info, instance)  # full_clean() 验证                │
+│    instance.search_index_dirty = True                                    │
+│                                                                          │
+│    → variants_instances_data = [] (ProductVariant 实例，未保存)           │
+│    → media_to_create = [] (ProductMedia 数据，未保存)                     │
+│    → listings_to_create = [] (ProductChannelListing 数据，未保存)        │
+│                                                                          │
+│  输出对象:                                                               │
+│  instances_data_with_errors_list = [                                     │
+│    {                                                                     │
+│      "instance": Product(name="Product 1", ...),  # 未保存               │
+│      "errors": [],                                                       │
+│      "cleaned_input": {"variants": [...], "media": [...], ...}            │
+│    },                                                                    │
+│    {                                                                     │
+│      "instance": None,                                                   │
+│      "errors": [ProductBulkCreateError(path="weight", ...)]              │
+│    },                                                                    │
+│    ...                                                                   │
+│  ]                                                                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│  错误策略检查 (失败反馈边界)                                             │
+│  文件: saleor/graphql/product/bulk_mutations/product_bulk_create.py:949-958│
+│                                                                          │
+│  if any(index_error_map.values()):                                       │
+│                                                                          │
+│    # 策略 1: 全部拒绝                                                    │
+│    if error_policy == "REJECT_EVERYTHING":                               │
+│      results = get_results(instances_data_with_errors_list, True)         │
+│      return ProductBulkCreate(count=0, results=results)  # 直接返回       │
+│                                                                          │
+│    # 策略 2: 只拒绝错误行                                                │
+│    if error_policy == "REJECT_FAILED_ROWS":                              │
+│      for data in instances_data_with_errors_list:                        │
+│        if data["errors"] and data["instance"]:                           │
+│          data["instance"] = None  # 标记为不保存                         │
+└─────────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────────┐
+│  阶段 4: 批量保存 → M2M 关系 → 后置操作                                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│  save(info, instances_data_with_errors_list)                              │
+│  文件: saleor/graphql/product/bulk_mutations/product_bulk_create.py:778-827│
+│                                                                          │
+│  批量写入顺序 (按表 bulk_create):                                        │
+│                                                                          │
+│  1. Product.objects.bulk_create(products_to_create)                      │
+│     → products_to_create = [Product(...), Product(...), ...] (已保存)    │
+│                                                                          │
+│  2. ProductMedia.objects.bulk_create(media_to_create)                    │
+│     → media_to_create = [ProductMedia(product=product_1, ...), ...]      │
+│                                                                          │
+│  3. ProductChannelListing.objects.bulk_create(listings_to_create)        │
+│     → listings_to_create = [ProductChannelListing(product=product_1, ...)]│
+│                                                                          │
+│  4. 逐个保存属性 (不能 bulk_create)                                      │
+│     for product, attributes in attributes_to_save:                       │
+│       AttributeAssignmentMixin.save(product, attributes)                 │
+│                                                                          │
+│  5. 批量保存变体 (委托给 ProductVariantBulkCreate.save_variants())        │
+│     → variants = [ProductVariant(...), ...] (已保存)                     │
+│                                                                          │
+│  ↓                                                                       │
+│  _save_m2m()  # 保存多对多关系                                            │
+│  CollectionProduct.objects.bulk_create([                                 │
+│    CollectionProduct(product=product_1, collection=collection_1),        │
+│    ...                                                                   │
+│  ])                                                                      │
+│                                                                          │
+│  ↓                                                                       │
+│  post_save_actions()  # 后置操作                                          │
+│  manager.product_created(product, webhooks=webhooks)  # Webhook          │
+│  manager.product_variant_created(variant, webhooks=webhooks)  # Webhook  │
+│  mark_active_catalogue_promotion_rules_as_dirty(channel_ids)  # 促销标记  │
+│                                                                          │
+│  输出对象:                                                               │
+│  ProductBulkCreate(                                                      │
+│    count=3,  # 成功创建数量                                              │
+│    results=[                                                             │
+│      ProductBulkResult(                                                  │
+│        product=ChannelContext(node=Product(...), channel_slug=None),      │
+│        errors=[]                                                         │
+│      ),                                                                  │
+│      ProductBulkResult(                                                  │
+│        product=None,                                                     │
+│        errors=[ProductBulkCreateError(path="weight", ...)]               │
+│      ),                                                                  │
+│      ...                                                                 │
+│    ]                                                                     │
+│  )                                                                       │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.3 批次处理：双向机制对比
+
+#### 导出批次处理 (Database → CSV)
 
 **文件**: `saleor/csv/utils/export.py:192-223`
 
@@ -175,13 +602,13 @@ def queryset_in_batches(queryset: QuerySet, batch_size: int):
         start_pk = pks[-1]  # 游标式分页，避免 offset 性能问题
 ```
 
-**导出批次特性**:
-- ✅ 使用 `pk__gt` 游标式分页，性能稳定
-- ✅ 每批独立预取关联数据，避免 N+1
-- ✅ 每批直接写入文件，内存占用低
-- ❌ 没有事务，失败后需重新导出
+**导出批次特性**：
+- ✅ 使用 `pk__gt` 游标式分页，性能稳定，避免大 offset
+- ✅ 每批独立预取关联数据，避免 N+1 查询
+- ✅ 每批直接写入文件，内存占用低（流式处理）
+- ❌ 没有事务保护，失败后需重新导出
 
-### 3.2 导入批次处理 (JSON → Database)
+#### 导入批次处理 (JSON → Database)
 
 **文件**: `saleor/graphql/product/bulk_mutations/product_bulk_create.py:938-972`
 
@@ -223,33 +650,11 @@ def perform_mutation(cls, root, info, **data):
     cls.post_save_actions(info, products, variants, updated_channels)
 ```
 
-**save() 方法的批量写入顺序**:
-```python
-@classmethod
-def save(cls, info, product_data_with_errors_list):
-    # 1. 批量写入 Product 主表
-    models.Product.objects.bulk_create(products_to_create)
-    
-    # 2. 批量写入 ProductMedia
-    models.ProductMedia.objects.bulk_create(media_to_create)
-    
-    # 3. 批量写入 ProductChannelListing
-    models.ProductChannelListing.objects.bulk_create(listings_to_create)
-    
-    # 4. 逐个保存属性 (不能 bulk_create，因为要处理赋值)
-    for product, attributes in attributes_to_save:
-        AttributeAssignmentMixin.save(product, attributes)
-    
-    # 5. 批量写入变体 (委托给 ProductVariantBulkCreate)
-    if variants_input_data:
-        variants = cls.save_variants(info, variants_input_data)
-```
-
-**导入批次特性**:
-- ✅ 先全量验证，再批量写入，减少数据库 IO
-- ✅ 整个操作在 `@traced_atomic_transaction()` 事务中
-- ✅ 支持两种错误处理策略
-- ❌ 没有分片，所有数据一次性加载到内存
+**导入批次特性**：
+- ✅ 先全量验证，再批量写入，减少数据库 IO 次数
+- ✅ 整个操作在 `@traced_atomic_transaction()` 事务中，数据一致性有保障
+- ✅ 支持两种错误处理策略，灵活应对不同场景
+- ❌ 没有分片，所有数据一次性加载到内存（输入限制需外部控制）
 
 ---
 
@@ -261,32 +666,49 @@ def save(cls, info, product_data_with_errors_list):
 
 ```
 Celery Task Exception
-    ↓
-ExportTask.on_failure() 回调
+    ↓  (exc: Exception, einfo: ExceptionInfo)
+ExportTask.on_failure(exc, task_id, args, kwargs, einfo)
+    │
     ├─ 1. 更新 ExportFile 状态
-    │   ├─ content_file = None
-    │   ├─ status = JobStatus.FAILED
-    │   └─ save()
+    │   export_file_id = args[0]
+    │   export_file = ExportFile.objects.get(pk=export_file_id)
+    │   export_file.content_file = None
+    │   export_file.status = JobStatus.FAILED
+    │   export_file.save(update_fields=["status", "updated_at", "content_file"])
     │
     ├─ 2. 记录错误事件 (审计日志)
-    │   └─ events.export_failed_event()
-    │       └─ ExportEvent.objects.create(
-    │              type=EXPORT_FAILED,
-    │              parameters={"message": str(exc), "error_type": str(einfo.type)}
-    │          )
+    │   events.export_failed_event(
+    │       export_file=export_file,
+    │       user=export_file.user,
+    │       app=export_file.app,
+    │       message=str(exc),
+    │       error_type=str(einfo.type)
+    │   )
+    │   ↓
+    │   ExportEvent.objects.create(
+    │       export_file=export_file,
+    │       type=ExportEvents.EXPORT_FAILED,
+    │       parameters={"message": str(exc), "error_type": str(einfo.type)},
+    │       user=export_file.user,
+    │       app=export_file.app
+    │   )
     │
     └─ 3. 发送通知
-        └─ send_export_failed_info()
-            ├─ manager.notify(CSV_EXPORT_FAILED)  # 邮件通知
-            └─ manager.product_export_completed()  # Webhook
+        send_export_failed_info(export_file, data_type)
+        │
+        ├─ manager.notify(NotifyEventType.CSV_EXPORT_FAILED, payload_func=...)
+        │  → 邮件通知用户
+        │
+        └─ manager.product_export_completed(export_file)
+           → Webhook 通知
 ```
 
 **导出错误码** (`saleor/csv/error_codes.py`):
 ```python
 class ExportErrorCode(Enum):
-    GRAPHQL_ERROR = "graphql_error"    # GraphQL 层面错误
-    INVALID = "invalid"                # 参数无效
-    NOT_FOUND = "not_found"            # 资源不存在
+    GRAPHQL_ERROR = "graphql_error"    # GraphQL 层面错误 (如参数解析失败)
+    INVALID = "invalid"                # 参数无效 (如格式错误)
+    NOT_FOUND = "not_found"            # 资源不存在 (如 channel 不存在)
     REQUIRED = "required"              # 缺少必填字段
 ```
 
@@ -298,47 +720,51 @@ class ExportErrorCode(Enum):
 
 ```python
 index_error_map = defaultdict(list)
-# 结构:
+
+# 结构 (逐产品索引收集):
 {
     0: [  # 第 0 个产品的错误
         ProductBulkCreateError(
-            path="weight",           # 错误字段路径 (camelCase)
+            path="weight",              # 错误字段路径 (camelCase)
             message="Product can't have negative weight.",
             code="INVALID",
         ),
         ProductBulkCreateError(
-            path="variants.0.sku",   # 嵌套路径: 第 0 个变体的 sku
+            path="variants.0.sku",      # 嵌套路径: 第 0 个变体的 sku
             message="SKU already exists.",
             code="DUPLICATED",
-            values=["DUPLICATE_SKU_123"],
+            values=["DUPLICATE_SKU_123"],  # 相关值 (如重复的 SKU)
         ),
     ],
     2: [  # 第 2 个产品的错误
-        ...
-    ]
+        ProductBulkCreateError(
+            path="channelListings",
+            message="Not existing channel ID.",
+            code="NOT_FOUND",
+            channels=["Q2hhbm5lbDox"],   # 相关 channel ID
+        ),
+    ],
 }
 ```
 
-**错误收集点分布**:
+**错误收集点分布** (代码证据):
 
-| 阶段 | 函数 | 错误类型 |
-|------|------|---------|
-| 基础字段验证 | `clean_base_fields()` | weight < 0 |
-| 属性验证 | `clean_attributes()` | AttributeAssignmentMixin 错误 |
-| 媒体验证 | `clean_media()` | 图片格式/URL 无效 |
-| 渠道列表验证 | `clean_product_channel_listings()` | channel_id 不存在、重复 |
-| 变体验证 | `clean_variants()` | 委托给 ProductVariantBulkCreate |
-| 实例构建 | `create_products()` | full_clean() 验证失败 |
+| 阶段 | 函数 | 错误类型 | 代码位置 |
+|------|------|---------|---------|
+| 基础字段验证 | `clean_base_fields()` | weight < 0 | `product_bulk_create.py:239-248` |
+| 属性验证 | `clean_attributes()` | AttributeAssignmentMixin 错误 | `product_bulk_create.py:286-311` |
+| 媒体验证 | `clean_media()` | 图片格式/URL 无效 | `product_bulk_create.py:429-486` |
+| 渠道列表验证 | `clean_product_channel_listings()` | channel_id 不存在、重复 | `product_bulk_create.py:367-426` |
+| 变体验证 | `clean_variants()` | 委托给 ProductVariantBulkCreate | `product_bulk_create.py:488-551` |
+| 实例构建 | `create_products()` | full_clean() 验证失败 | `product_bulk_create.py:712-724` |
 
-**错误策略执行**:
+**错误策略执行** (`product_bulk_create.py:949-958`):
 ```python
-# 文件: saleor/graphql/product/bulk_mutations/product_bulk_create.py:949-958
-
 if any(index_error_map.values()):
-    # 策略 1: 有任何错误，全部拒绝
+    # 策略 1: 有任何错误，全部拒绝，返回 count=0
     if error_policy == ErrorPolicyEnum.REJECT_EVERYTHING.value:
         results = get_results(instances_data_with_errors_list, True)
-        return ProductBulkCreate(count=0, results=results)  # count=0！
+        return ProductBulkCreate(count=0, results=results)
     
     # 策略 2: 只拒绝错误行，继续保存正确的
     if error_policy == ErrorPolicyEnum.REJECT_FAILED_ROWS.value:
@@ -352,20 +778,25 @@ if any(index_error_map.values()):
 ```graphql
 mutation {
   productBulkCreate(
-    products: [...],
+    products: [
+      {name: "Product 1", weight: -1, productType: "UHJvZHVjdFR5cGU6MQ=="},
+      {name: "Product 2", sku: "DUPLICATE", productType: "UHJvZHVjdFR5cGU6MQ=="},
+      {name: "Product 3", productType: "UHJvZHVjdFR5cGU6MQ=="}
+    ],
     errorPolicy: REJECT_FAILED_ROWS
   ) {
-    count          # 成功创建的数量
+    count          # 成功创建的数量: 1 (只有第 3 个成功)
     results {      # 每个产品的结果 (与输入顺序一致)
       product {    # 成功创建的产品对象，失败则为 null
         id
         name
       }
       errors {     # 该产品的错误列表
-        path       # 如 "variants.0.sku"
+        path       # 如 "weight", "variants.0.sku"
         message    # 人类可读消息
-        code       # 错误码枚举
+        code       # 错误码枚举 (INVALID, DUPLICATED, NOT_FOUND, ...)
         values     # 相关值 (如重复的 SKU)
+        channels   # 相关 channel ID (如果是渠道错误)
       }
     }
   }
@@ -388,7 +819,7 @@ GraphQL Mutation: ExportProducts.perform_mutation()
 │   └─ FILTER: 传递 filter 参数
 │
 ├─ get_export_info(export_info_input)
-│   ├─ fields: [ProductFieldEnum.NAME, ...]
+│   ├─ fields: [ProductFieldEnum.NAME, ProductFieldEnum.VARIANT_WEIGHT, ...]
 │   ├─ attributes: [attribute_pk, ...]  (global_id → pk)
 │   ├─ warehouses: [warehouse_pk, ...]
 │   └─ channels: [channel_pk, ...]
@@ -480,7 +911,7 @@ GraphQL Mutation: ProductBulkCreate.perform_mutation()
 │   ├─ 构建 ProductVariant 实例 (不保存)
 │   └─ 收集所有关联数据
 │
-├─ 阶段 3: 错误策略检查
+├─ 阶段 3: 错误策略检查 (失败反馈边界)
 │   if any(index_error_map.values()):
 │       ├─ REJECT_EVERYTHING: 返回 count=0，所有错误
 │       └─ REJECT_FAILED_ROWS: 标记错误行为 None
@@ -513,35 +944,58 @@ GraphQL Mutation: ProductBulkCreate.perform_mutation()
 |------|---------|---------|
 | 字段映射定义 | `saleor/csv/utils/__init__.py` | `ProductExportFields` 导出字段映射 |
 | 表头生成 | `saleor/csv/utils/product_headers.py` | 导出字段到 CSV 表头转换 |
-| 导出数据处理 | `saleor/csv/utils/products_data.py` | 产品/变体关系数据提取 |
+| 导出数据处理 | `saleor/csv/utils/products_data.py` | 产品/变体关系数据提取、annotate 计算 |
 | 导出核心逻辑 | `saleor/csv/utils/export.py` | 批次处理、petl 文件生成 |
 | 导出任务调度 | `saleor/csv/tasks.py` | Celery 任务、错误回调 |
 | 导出事件记录 | `saleor/csv/events.py` | 导出生命周期事件审计 |
 | 导出通知 | `saleor/csv/notifications.py` | 成功/失败邮件 + Webhook |
 | 导入核心逻辑 | `saleor/graphql/product/bulk_mutations/product_bulk_create.py` | 批量创建 mutation |
 | 变体批量导入 | `saleor/graphql/product/bulk_mutations/product_variant_bulk_create.py` | 变体批量创建 |
+| 重量标量 | `saleor/graphql/core/scalars.py` | `WeightScalar` 解析和序列化 |
 | 批次工具 | `saleor/core/utils/batches.py` | `queryset_in_batches` 游标分页 |
 | 导出错误码 | `saleor/csv/error_codes.py` | `ExportErrorCode` 枚举 |
 | 导入错误码 | `saleor/product/error_codes.py` | `ProductBulkCreateErrorCode` 枚举 |
+| CSV Mutation 注册 | `saleor/graphql/csv/schema.py` | `CsvMutations` 只注册 3 个导出 mutation |
 
 ---
 
-## 七、设计洞察
+## 七、设计洞察（代码事实 + 推断）
+
+### 代码事实
 
 1. **不对称设计**：导出有完整的 CSV 处理，导入只有 GraphQL JSON 接口
-   - 可能原因：CSV 解析需要处理太多边缘情况（格式、编码、数据清洗）
-   - 留给用户/前端处理：导出 CSV → Excel 编辑 → 自定义脚本转 GraphQL
+   - 代码证据：`CsvMutations` 只有 3 个 export mutation，没有 import mutation
+   - 代码证据：`petl` 库只有 `tocsv`/`appendcsv`，没有 `fromcsv`/`read_csv`
 
 2. **导出优化为读性能**：
-   - 使用 replica 数据库读取
-   - 游标式分页避免大 offset
-   - 分批写入文件降低内存
+   - 代码证据：使用 `DATABASE_CONNECTION_REPLICA_NAME` 读取从库
+   - 代码证据：`pk__gt` 游标式分页避免大 offset
+   - 代码证据：每批处理后立即写入文件，降低内存占用
 
 3. **导入优化为数据一致性**：
-   - 全量验证后再写入
-   - 整个操作在事务中
-   - 灵活的错误策略支持
+   - 代码证据：`@traced_atomic_transaction()` 包裹整个 mutation
+   - 代码证据：先全量验证，再批量写入
+   - 代码证据：两种错误策略支持（`REJECT_EVERYTHING` / `REJECT_FAILED_ROWS`）
 
-4. **错误反馈分层**：
-   - 导出：Celery 回调 → 事件日志 → 通知
-   - 导入：`index_error_map` 逐行追踪 → 两种错误策略 → 结构化响应
+4. **字段映射不匹配**：
+   - 代码证据：导出的 `variant_weight` 是 annotate 生成的带单位字符串，导入的 `WeightScalar` 需要数字或对象
+   - 代码证据：导出用 `__slug`/`__name`，导入用 `graphene.ID()`
+   - 代码证据：导出用 `Cast("description", CharField())`，导入用 `JSONString`
+
+### 推断说明（无直接代码）
+
+1. **为什么没有 CSV 文件导入？**
+   - CSV 解析需要处理太多边缘情况（格式、编码、数据清洗、空值处理）
+   - 字段映射不匹配（slug/名称 vs ID，字符串 vs 对象）
+   - 留给用户/前端/外部系统处理，Saleor 只提供结构化的 GraphQL 接口
+
+2. **用户需要自行实现的转换层**：
+   - CSV 解析库（如 Python `csv.DictReader` 或 `pandas`）
+   - slug → ID 查询转换（批量查询分类、商品类型、合集等）
+   - 单位字符串解析（正则提取数值和单位）
+   - 纯文本 → EditorJS JSON 格式包装
+
+3. **扩展性建议**：
+   - 如果需要 CSV 文件导入，可以在 `saleor/csv/` 目录下新增 `import*.py` 模块
+   - 参考导出的批次处理模式，实现导入的批次处理
+   - 复用 `index_error_map` 模式处理导入错误

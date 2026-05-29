@@ -203,22 +203,63 @@ class ProductBulkCreateInput(ProductCreateInput):
     variants = NonNullList(ProductVariantBulkCreateInput)
 ```
 
-### 2.4 导出 ↔ 导入 字段对应表（完整校对）
+### 2.4 导出 ↔ 导入 字段对应表（完整校对，含 variant media 校准）
 
-| CSV 导出表头 | 导出 ORM 路径 | 导入 GraphQL 字段 | 类型差异 | 转换需求 |
-|-------------|--------------|------------------|---------|---------|
-| id | `id` | (自动生成) | - | 导入时不提供 |
-| name | `name` | `name` | 字符串 → 字符串 | ✅ 直接对应 |
-| description | `description_as_str` | `description` | 纯文本 → EditorJS JSON | ⚠️ 需转换格式 |
-| category | `category__slug` | `category` | slug → ID | ⚠️ 需查询转换 |
-| product type | `product_type__name` | `productType` | 名称 → ID | ⚠️ 需查询转换 |
-| product weight | `product_weight` | `weight` | 字符串 "100 g" → Weight 对象 | ⚠️ 需解析单位 |
-| collections | `collections__slug` | `collections` | slug 列表 → ID 列表 | ⚠️ 需查询+拆分 |
-| product media | `media__image` | `media` | URL 字符串 → MediaInput | ⚠️ 需构造对象 |
-| variant id | `variants__id` | `variants[].id` | - | 导入时不提供 |
-| variant sku | `variants__sku` | `variants[].sku` | 字符串 → 字符串 | ✅ 直接对应 |
-| variant weight | `variant_weight` | `variants[].weight` | 字符串 "100 g" → Weight 对象 | ⚠️ 需解析单位 |
-| variant media | `variants__media__image` | `variants[].media` | URL 字符串 → MediaInput | ⚠️ 需构造对象 |
+| CSV 导出表头 | 导出 ORM 路径 | 导入 GraphQL 字段 | 存在性 | 类型差异 | 转换需求 |
+|-------------|--------------|------------------|--------|---------|---------|
+| id | `id` | (自动生成) | - | - | 导入时不提供 |
+| name | `name` | `name` | ✅ 存在 | 字符串 → 字符串 | ✅ 直接对应 |
+| description | `description_as_str` | `description` | ✅ 存在 | 纯文本 → EditorJS JSON | ⚠️ 需转换格式 |
+| category | `category__slug` | `category` | ✅ 存在 | slug → ID | ⚠️ 需查询转换 |
+| product type | `product_type__name` | `productType` | ✅ 存在 | 名称 → ID | ⚠️ 需查询转换 |
+| product weight | `product_weight` | `weight` | ✅ 存在 | 字符串 "100 g" → Weight 对象 | ⚠️ 需解析单位 |
+| collections | `collections__slug` | `collections` | ✅ 存在 | slug 列表 → ID 列表 | ⚠️ 需查询+拆分 |
+| product media | `media__image` | `media` | ✅ 存在 | URL 字符串 → MediaInput | ⚠️ 需构造对象 |
+| variant id | `variants__id` | `variants[].id` | - | - | 导入时不提供 |
+| variant sku | `variants__sku` | `variants[].sku` | ✅ 存在 | 字符串 → 字符串 | ✅ 直接对应 |
+| variant weight | `variant_weight` | `variants[].weight` | ✅ 存在 | 字符串 "100 g" → Weight 对象 | ⚠️ 需解析单位 |
+| **variant media** | `variants__media__image` | **`variants[].media` (❌ 不存在)** | ❌ 不存在 | - | **见下方替代方案** |
+
+### 2.5 Variant Media 字段：不存在时的处理方式与替代映射（代码证据）
+
+#### 关键发现：Variant Media 在导入侧**没有直接字段**
+
+**代码证据**：
+| 验证项 | 代码位置 | 事实 |
+|--------|---------|------|
+| ProductVariantInput 定义 | `saleor/graphql/product/mutations/product_variant/product_variant_create.py:48-83` | `ProductVariantInput` 包含 `attributes`, `sku`, `name`, `weight`, `preorder` 等，但**没有 `media` 字段** |
+| ProductVariantBulkCreateInput 定义 | `saleor/graphql/product/bulk_mutations/product_variant_bulk_create.py:195-215` | 继承自 `ProductVariantInput`，新增 `stocks`, `channel_listings`，但**仍然没有 `media` 字段** |
+| ProductBulkCreate 的 variants 字段 | `saleor/graphql/product/bulk_mutations/product_bulk_create.py:195-215` | `variants` 是 `NonNullList(ProductVariantBulkCreateInput)`，继承了同样的字段限制 |
+| VariantMedia 分配方式 | `saleor/graphql/product/mutations/product_variant/variant_media_assign.py:17-74` | 需要单独调用 `variantMediaAssign` mutation，传入 `media_id` 和 `variant_id` |
+
+#### Variant Media 的替代映射方案（两步走）
+
+**方案：先创建 Product + Media，再单独分配给 Variant**
+
+```
+步骤 1: 在 productBulkCreate 中创建 Product 和 ProductMedia（共享媒体池）
+    ├─ products[].media[] = [
+    │     {"media_url": "https://example.com/img1.jpg", "alt": "Image 1"},
+    │     {"media_url": "https://example.com/img2.jpg", "alt": "Image 2"}
+    │   ]
+    └─ 返回: products[].media[].id (如 "UHJvZHVjdE1lZGlhOjE=")
+
+步骤 2: 调用 variantMediaAssign mutation 分配给特定 Variant
+    mutation {
+      variantMediaAssign(
+        mediaId: "UHJvZHVjdE1lZGlhOjE=",  # 步骤 1 返回的 media ID
+        variantId: "UHJvZHVjdFZhcmlhbnQ6MQ=="  # 步骤 1 返回的 variant ID
+      ) {
+        productVariant { id }
+        media { id }
+      }
+    }
+```
+
+**注意**：
+- 媒体必须先属于产品（通过 `product.media` 创建），才能分配给变体
+- 可以批量创建产品后，再循环调用 `variantMediaAssign` 为每个变体分配媒体
+- 如果媒体已分配给变体，会报错 "This media is already assigned"
 
 **关键不匹配点总结**（代码证据）：
 1. **slug/名称 vs ID**：导出的是人类可读的 slug 或名称，导入需要数据库 ID
@@ -229,6 +270,116 @@ class ProductBulkCreateInput(ProductCreateInput):
 
 3. **纯文本 vs EditorJS JSON**：导出是纯文本，导入需要 `JSONString` 类型的 EditorJS 格式
    - 代码证据：导出用 `Cast("description", CharField())`，导入用 `JSONString(description=...)`
+
+4. **Variant Media 无直接导入字段**：导出有 `variants__media__image`，导入 `ProductVariantBulkCreateInput` 没有 media 字段
+   - 代码证据：`ProductVariantInput` 定义中没有 `media` 字段，需通过 `variantMediaAssign` 单独分配
+
+---
+
+### 2.6 从导出 CSV 到 productBulkCreate 输入的最小转换规则
+
+#### 前置准备（必须先做）
+
+1. **建立 ID 映射表**：
+   - 查询所有 Category: `{ slug: "electronics", id: "Q2F0ZWdvcnk6MQ==" }`
+   - 查询所有 ProductType: `{ name: "Physical", id: "UHJvZHVjdFR5cGU6MQ==" }`
+   - 查询所有 Collection: `{ slug: "summer", id: "Q29sbGVjdGlvbjox" }`
+   - 查询所有 Channel: `{ slug: "default", id: "Q2hhbm5lbDox" }`
+   - 查询所有 Warehouse: `{ slug: "main", id: "V2FyZWhvdXNlOjE=" }`
+
+2. **解析 CSV 行**：注意导出是**每变体一行**（同一产品可能有多行，每个变体一行）
+
+#### 最小转换规则表（可落地代码）
+
+| CSV 列名 | 转换规则 | 示例输入 → 输出 |
+|---------|---------|----------------|
+| **必填字段** | | |
+| name | 直接使用 | `"T-Shirt"` → `"T-Shirt"` |
+| product type | 用 name → product_type_id 映射表查询 | `"Physical"` → `"UHJvZHVjdFR5cGU6MQ=="` |
+| variants[].sku | 直接使用 | `"TS-001-S"` → `"TS-001-S"` |
+| variants[].attributes | 从属性列（如 "size (variant attribute)"）解析 | "S" → `[{"id": "QXR0cmlidXRlOjE=", "values": [{"name": "S"}]}]` |
+| **推荐字段** | | |
+| slug | 自动生成或留空（会自动从 name 生成） | `"t-shirt"` → `"t-shirt"` |
+| category | 用 slug → category_id 映射表查询 | `"apparel"` → `"Q2F0ZWdvcnk6MQ=="` |
+| product weight | 正则解析 `"(\d+) (\w+)"` → 构造 Weight 对象 | `"100 g"` → `{"unit": "g", "value": 100}` |
+| collections | 按逗号拆分 slug → 查映射表得 ID 列表 | `"summer,sale"` → `["Q29sbGVjdGlvbjox", "Q29sbGVjdGlvbjoy"]` |
+| media | 按逗号拆分 URL → 构造 MediaInput 数组 | `"https://a.jpg,https://b.jpg"` → `[{"media_url": "https://a.jpg", "alt": ""}, ...]` |
+| description | 包装成 EditorJS 格式 | `"A great t-shirt"` → `'{"blocks": [{"type": "paragraph", "data": {"text": "A great t-shirt"}}]}'` |
+| **变体字段** | | |
+| variants[].weight | 正则解析 → Weight 对象 | `"50 g"` → `{"unit": "g", "value": 50}` |
+| **variant media（特殊处理）** | | |
+| variant media | 第一步：先放到 product.media 共享池<br>第二步：创建成功后调用 variantMediaAssign | 见下方示例 |
+| **渠道字段** | | |
+| channel_listings | 从渠道列解析 → 构造 channel_listing 对象 | (见下方示例) |
+| variant channel_listings | 从变体渠道列解析 → 构造价格对象 | (见下方示例) |
+| **库存字段** | | |
+| variants[].stocks | 从仓库列解析 → 构造 stock 对象 | "main: 100" → `[{"warehouse": "V2FyZWhvdXNlOjE=", "quantity": 100}]` |
+
+#### 最小可工作的转换示例
+
+**CSV 输入行**：
+```csv
+name,product type,category,product weight,variant sku,variant weight,size (variant attribute)
+T-Shirt,Physical,apparel,100 g,TS-001-S,50 g,S
+```
+
+**转换后的 GraphQL 输入**：
+```graphql
+mutation {
+  productBulkCreate(
+    products: [{
+      name: "T-Shirt",
+      productType: "UHJvZHVjdFR5cGU6MQ==",  # "Physical" 对应的 ID
+      category: "Q2F0ZWdvcnk6MQ==",           # "apparel" 对应的 ID
+      weight: { unit: "g", value: 100 },
+      variants: [{
+        sku: "TS-001-S",
+        weight: { unit: "g", value: 50 },
+        attributes: [{
+          id: "QXR0cmlidXRlOjE=",            # "size" 属性的 ID
+          values: [{ name: "S" }]
+        }]
+      }]
+    }],
+    errorPolicy: REJECT_FAILED_ROWS
+  ) {
+    count
+    results {
+      product { id }
+      errors { path message code }
+    }
+  }
+}
+```
+
+#### Variant Media 完整转换流程
+
+**CSV 输入**：
+```csv
+name,variant sku,product media,variant media
+T-Shirt,TS-001,"https://a.jpg","https://a.jpg,https://b.jpg"
+```
+
+**转换步骤**：
+```
+步骤 1: 收集所有媒体到 product.media（去重）
+  product.media = [
+    { media_url: "https://a.jpg", alt: "Product image" },
+    { media_url: "https://b.jpg", alt: "Variant image" }
+  ]
+
+步骤 2: 执行 productBulkCreate，记录返回的 media ID 和 variant ID
+  返回:
+    product.media[0].id = "UHJvZHVjdE1lZGlhOjE="  (a.jpg)
+    product.media[1].id = "UHJvZHVjdE1lZGlhOjI="  (b.jpg)
+    product.variants[0].id = "UHJvZHVjdFZhcmlhbnQ6MQ=="  (TS-001)
+
+步骤 3: 为变体分配媒体（循环调用 variantMediaAssign）
+  为 TS-001 分配 a.jpg:
+    mutation { variantMediaAssign(mediaId: "UHJvZHVjdE1lZGlhOjE=", variantId: "UHJvZHVjdFZhcmlhbnQ6MQ==") { ... } }
+  为 TS-001 分配 b.jpg:
+    mutation { variantMediaAssign(mediaId: "UHJvZHVjdE1lZGlhOjI=", variantId: "UHJvZHVjdFZhcmlhbnQ6MQ==") { ... } }
+```
 
 ---
 

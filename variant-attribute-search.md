@@ -1175,78 +1175,130 @@ if search_vectors:
 #### 问题背景
 搜索索引采用"脏标标记 + 定时刷新"的异步更新模式，这种模式在不同场景下对查询时效性有不同影响。
 
-#### 配置参数澄清（关键修正）
+---
 
-**⚠️ 重要发现：实际调度间隔是60秒，不是20秒**
+#### 🔍 is_due 判定逻辑深度分析
 
-| 参数 | 实际用途 | 默认值 | 代码位置 |
-|-----|---------|-------|---------|
-| `initial_timedelta=60` | **实际调度间隔** - 每60秒检查一次脏数据 | 60秒 | `saleor/core/schedules.py:259` |
-| `BEAT_UPDATE_SEARCH_FREQUENCY` | 仅用于设置`expires`（任务过期时间），不控制调度频率 | 20秒 | `saleor/settings.py:651` |
-| `PRODUCTS_BATCH_SIZE` | 每次定时任务处理的Product数量 | 300 | `saleor/product/tasks.py:55` |
+##### 判定流程拆解
 
-**代码证据1 - 实际调度间隔定义**：
-`saleor/core/schedules.py:258-275`
-```python
-class product_search_update_schedule(TimeBaseSchedule):
-    def __init__(self, initial_timedelta=60, nowfun=None, app=None):  # ← 默认60秒
-        # initial_timedelta defaults to 60 seconds, as referencing settings.py variables
-        # would require rebuilding the schedule. settings depends on this class instance,
-        # leading to a circular import if accessed directly.
-        import_path = "saleor.core.schedules.initiated_product_search_update_schedule"
-        super().__init__(import_path, initial_timedelta, nowfun, app)
-
-    def are_dirty(self) -> bool:
-        from django.conf import settings
-        from ..product.models import Product
-        return (
-            Product.objects.using(settings.DATABASE_CONNECTION_REPLICA_NAME)
-            .filter(search_index_dirty=True)
-            .exists()
-        )
-```
-
-**代码证据2 - TimeBaseSchedule调度逻辑**：
+**代码证据 - is_due 核心判定**：
 `saleor/core/schedules.py:171-185`
 ```python
 def is_due(self, last_run_at):
     last_run_at = self.maybe_make_aware(last_run_at)
-    rem_delta = self.remaining_estimate(last_run_at)
+    rem_delta = self.remaining_estimate(last_run_at)  # Step 1: 计算剩余时间
     remaining_s = max(rem_delta.total_seconds(), 0)
     if remaining_s == 0:
-        remaining_s = self.initial_timedelta.total_seconds()  # ← 60秒
+        remaining_s = self.initial_timedelta.total_seconds()  # Step 2: 重置为60秒
 
-    are_marked_as_dirty = self.are_dirty()
-    # 只有当时间到了 AND 有脏数据时才执行
-    return schedstate(is_due=are_marked_as_dirty, next=remaining_s)
+    are_marked_as_dirty = self.are_dirty()  # Step 3: 检查是否有脏数据
+    return schedstate(is_due=are_marked_as_dirty, next=remaining_s)  # Step 4: 返回结果
 ```
 
-**代码证据3 - BEAT_UPDATE_SEARCH_FREQUENCY仅用于expires**：
+**关键分支逻辑**：
+
+| 分支 | 条件 | is_due结果 | 下次检查时间 |
+|-----|------|-----------|-------------|
+| 分支1 | 剩余时间 > 0 | False | 剩余秒数 |
+| 分支2 | 剩余时间 == 0 AND 无脏数据 | False | 60秒 |
+| 分支3 | 剩余时间 == 0 AND 有脏数据 | **True** | 60秒 |
+
+**判定流程图**：
+```
+Celery Beat 调用 is_due(last_run_at)
+        ↓
+Step 1: 计算 remaining_s = 上次执行时间 + 60秒 - 当前时间
+        ↓
+        ├─ 若 remaining_s > 0 → 返回 (False, remaining_s) → 等 remaining_s 秒后再查
+        │
+        └─ 若 remaining_s == 0（时间到了）
+                ↓
+                Step 2: 调用 are_dirty() 查询是否有脏数据
+                        ↓
+                        ├─ 若 False → 返回 (False, 60) → 等60秒后再查
+                        │
+                        └─ 若 True → 返回 (True, 60) → 执行任务，60秒后再查
+```
+
+**代码证据 - are_dirty() 脏数据检查**：
+`saleor/core/schedules.py:266-275`
+```python
+def are_dirty(self) -> bool:
+    from django.conf import settings
+    from ..product.models import Product
+    return (
+        Product.objects.using(settings.DATABASE_CONNECTION_REPLICA_NAME)
+        .filter(search_index_dirty=True)
+        .exists()  # ← 只要有一个脏Product就返回True
+    )
+```
+
+⚠️ **重要发现**：只要有**至少1个**Product的`search_index_dirty=True`，就会触发任务执行。
+
+---
+
+#### ⚙️ Beat 调度间隔与任务过期参数关联分析
+
+##### 参数定义与用途
+
+| 参数 | 定义位置 | 实际用途 | 默认值 | 控制对象 |
+|-----|---------|---------|-------|---------|
+| `initial_timedelta=60` | `saleor/core/schedules.py:259` | **Beat检查频率** - 每60秒检查一次是否需要执行任务 | 60秒 | Celery Beat |
+| `BEAT_UPDATE_SEARCH_FREQUENCY` | `saleor/settings.py:651` | **任务过期时间** - 任务在队列中超过此时间就丢弃 | 20秒 | Celery Worker |
+| `PRODUCTS_BATCH_SIZE` | `saleor/product/tasks.py:55` | **单次处理数量** - 每次任务最多处理多少Product | 300 | 任务执行逻辑 |
+
+**代码证据 - 任务过期配置**：
 `saleor/product/tasks.py:348-350`
 ```python
 @app.task(
     queue=settings.UPDATE_SEARCH_VECTOR_INDEX_QUEUE_NAME,
-    expires=settings.BEAT_UPDATE_SEARCH_EXPIRE_AFTER_SEC,  # ← 仅用于过期时间
+    expires=settings.BEAT_UPDATE_SEARCH_EXPIRE_AFTER_SEC,  # ← 20秒过期
 )
 def update_products_search_vector_task():
 ```
 
-**代码证据4 - CELERY_BEAT_SCHEDULE配置**：
+**代码证据 - Beat调度配置**：
 `saleor/settings.py:707-712`
 ```python
 "update-products-search-vectors": {
     "task": "saleor.product.tasks.update_products_search_vector_task",
     # Scheduled task that runs every 60 seconds to check for products
     # requiring a search index rebuild.
-    "schedule": initiated_product_search_update_schedule,  # ← 使用60秒间隔的schedule
+    "schedule": initiated_product_search_update_schedule,  # ← 60秒检查一次
 },
 ```
 
+##### 三参数协同工作机制
+
+```
+时间线：
+T=0s:    Beat 调用 is_due() → 时间未到 → 返回 (False, 60)
+         ↓ Beat 等待 60 秒
+T=60s:   Beat 调用 is_due() → 时间到，检查脏数据
+         ├─ 若无脏数据 → 返回 (False, 60) → 继续等待
+         └─ 若有脏数据 → 返回 (True, 60) → 发送任务到队列
+                ↓
+T=60s:   任务进入队列，设置 expires=20秒
+         ↓ Worker 在 20 秒内必须开始执行，否则任务过期丢弃
+T=61s:   Worker 开始执行任务，处理最多 300 个脏Product
+T=61.5s: 任务完成，search_vector 更新
+         ↓ Beat 继续等待 60 秒
+T=120s:  Beat 再次调用 is_due() 检查
+```
+
+**参数关联风险**：
+| 风险场景 | 条件 | 后果 |
+|---------|------|------|
+| 任务执行超过20秒 | 大量脏数据 + 处理慢 | 下一轮任务可能过期 |
+| 队列积压超过20秒 | Worker负载高 | 任务被丢弃，脏数据继续积压 |
+| 60秒检查 + 20秒过期 | 正常场景 | 安全，任务会被执行 |
+
 ---
 
-#### 脏标聚合机制
+#### 📊 脏标聚合机制
 
-**聚合场景1：多次修改同一Product**
+##### 聚合场景1：多次修改同一Product
+
 ```
 T0: Product.search_index_dirty = False
 T1: Variant创建 → search_index_dirty = True（第1次标记）
@@ -1270,7 +1322,8 @@ def mark_products_search_vector_as_dirty(product_ids: list[int]):
 - 由于是布尔字段，多次UPDATE为True不会产生额外效果
 - `select_for_update`确保并发标记时不会丢失更新
 
-**聚合场景2：属性值更新影响大量Product**
+##### 聚合场景2：属性值更新影响大量Product
+
 ```
 T0: AttributeValue.name = "红色"
 T1: 更新AttributeValue.name = "中国红"
@@ -1293,99 +1346,125 @@ def mark_products_search_vector_as_dirty_in_batches(product_ids: list[int]):
 
 ---
 
-#### 时效性分析（修正后）
+#### ⏱️ 时效性分析（按关键分支重画时间线）
 
-**场景1：单个Variant创建/更新**
+##### 分支A：脏数据在检查前产生
+
+```
+时间线（最佳情况）：
+T=0s:     Beat 检查完成，无脏数据，设置下次检查 T=60s
+T=30s:    标记 ProductA.search_index_dirty = True
+T=59s:    用户搜索 → 命中旧的 search_vector
+T=60s:    Beat 检查，发现脏数据，发送任务
+T=60.5s:  Worker 执行任务，更新 ProductA 的 search_vector
+T=61s:    用户搜索 → 命中新的 search_vector
+
+时效性：延迟约 30-60 秒
+```
+
+##### 分支B：脏数据在检查后产生
+
+```
+时间线（最差情况）：
+T=0s:     Beat 检查完成，无脏数据，设置下次检查 T=60s
+T=1s:     标记 ProductA.search_index_dirty = True
+T=59s:    用户搜索 → 命中旧的 search_vector
+T=60s:    Beat 检查，发现脏数据，发送任务
+T=60.5s:  Worker 执行任务，更新 ProductA 的 search_vector
+T=61s:    用户搜索 → 命中新的 search_vector
+
+时效性：延迟约 60-61 秒
+```
+
+##### 分支C：多轮处理场景（1500个Product）
+
 ```
 时间线：
-T=0s:    标记search_index_dirty=True（快速返回，<100ms）
-T=1s:    用户搜索 → 命中旧的search_vector（不包含新Variant）
-T=60s:   定时任务检查（第1次）
-         ↓ 如果刚好在检查后才标记，需要等下一轮
-T=120s:  定时任务检查（第2次），发现脏数据，处理300个
-T=120.5s: search_vector更新完成
-T=121s:  用户搜索 → 命中新的search_vector（包含新Variant）
+T=0s:     标记 1500 个 Product 为脏标
+T=60s:    Beat 检查，发送任务，处理前 300 个
+T=61s:    前 300 个 Product 的 search_vector 更新完成
+T=120s:   Beat 检查，发送任务，处理下 300 个（累计 600）
+T=180s:   Beat 检查，发送任务，处理下 300 个（累计 900）
+T=240s:   Beat 检查，发送任务，处理下 300 个（累计 1200）
+T=300s:   Beat 检查，发送任务，处理最后 300 个（累计 1500）
 
-时效性：延迟约60-120秒（取决于定时任务检查时机）
+时效性分布：
+- 前 300 个：延迟约 60-61 秒
+- 中间 600 个：延迟约 120-181 秒
+- 最后 300 个：延迟约 240-301 秒
 ```
 
-**场景2：批量创建100个Variant（不同Product）**
-```
-时间线：
-T=0s:    批量操作，标记100个Product为脏标
-T=60s:   定时任务检查，发现脏数据，处理这100个Product
-T=60.2s: 全部更新完成（因为100 < 300，1轮处理完）
+##### 分支D：高并发积压场景
 
-时效性：延迟约60-120秒
-```
-
-**场景3：属性值更新影响1500个Product**
 ```
 时间线：
-T=0s:     属性值更新，分批标记1500个Product为脏标
-T=60s:    定时任务触发，处理前300个
-T=120s:   定时任务触发，处理300个（累计600）
-T=180s:   定时任务触发，处理300个（累计900）
-T=240s:   定时任务触发，处理300个（累计1200）
-T=300s:   定时任务触发，处理300个（累计1500，全部完成）
-
-时效性：延迟约60-300秒（取决于Product在批次中的位置）
-```
-
-**场景4：高并发，积压超过300个**
-```
-时间线：
-T=0s:     积压500个脏Product
-T=60s:    定时任务触发，处理前300个（按updated_at排序）
-T=120s:   定时任务触发，处理剩余200个 + 新增的300个中的前100个
-T=180s:   定时任务触发，处理剩余200个
+T=0s:     积压 1000 个脏 Product
+T=60s:    Beat 检查，处理前 300 个，剩余 700 个
+         ↓ 期间新增 200 个脏 Product → 总积压 900 个
+T=120s:   Beat 检查，处理下 300 个，剩余 600 个
+         ↓ 期间新增 200 个脏 Product → 总积压 800 个
+T=180s:   Beat 检查，处理下 300 个，剩余 500 个
 ...
 
-时效性：延迟时间 = 积压数量 / 300 * 60秒
+平均延迟：约 120-180 秒（随积压增长线性增加）
 ```
 
 ---
 
-#### 时效性影响矩阵（修正后）
+#### 📈 时效性影响矩阵
 
-| 操作类型 | 影响Product数 | 最佳延迟 | 最差延迟 | 备注 |
-|---------|--------------|---------|---------|------|
-| 单个Variant创建 | 1 | ~60s | ~120s | 正常场景 |
-| 批量创建Variant | 100 | ~60s | ~120s | 1轮处理完 |
-| 属性值更新 | 1500 | ~60s | ~300s | 需5轮处理 |
+| 场景 | 脏数据数量 | 最佳延迟 | 最差延迟 | 关键因素 |
+|-----|-----------|---------|---------|---------|
+| 单个Variant创建 | 1 | ~30s | ~61s | 检查时机 |
+| 批量创建100个 | 100 | ~30s | ~61s | 1轮处理完 |
+| 属性值更新 | 1500 | ~60s | ~301s | 需5轮处理 |
 | 高并发积压 | 10000 | ~60s | ~2000s | 持续积压 |
 
 ---
 
-#### 与属性过滤的对比
-| 查询方式 | 时效性 | 一致性 |
-|---------|-------|-------|
-| 全文搜索（search_vector） | 最终一致（60s+延迟） | 异步更新，可能短暂不一致 |
-| 属性过滤（直接联表） | 强一致（实时） | 实时查询，总是一致 |
+#### 🆚 与属性过滤的对比
+
+| 查询方式 | 时效性 | 一致性 | 实现方式 |
+|---------|-------|-------|---------|
+| 全文搜索（search_vector） | 最终一致（30s+延迟） | 异步更新，可能短暂不一致 | tsvector + GIN索引 |
+| 属性过滤（直接联表） | 强一致（实时） | 实时查询，总是一致 | Exists子查询 |
 
 ---
 
-#### 优化建议（修正后）
+#### ⚠️ 风险评估
 
-1. **缩短刷新间隔（需要修改代码）**：
-   - 当前间隔硬编码在 `saleor/core/schedules.py:259` 的 `initial_timedelta=60`
-   - 改为 `initial_timedelta=10` 或 `initial_timedelta=30`
-   - ⚠️ 注意：`BEAT_UPDATE_SEARCH_FREQUENCY` 环境变量**不影响**调度频率
+| 风险 | 触发条件 | 影响 | 严重程度 |
+|-----|---------|------|---------|
+| 批量删除不一致 | 删除非default_variant | search_vector 包含已删除 Variant 的信息 | 🔴 高 |
+| 任务过期 | 队列积压 > 20秒 | 脏数据持续积压 | 🟠 中 |
+| 检查间隔过长 | 硬编码60秒 | 时效性差 | 🟠 中 |
+| sku/name全空 | 所有Variant无sku/name | 属性静默丢失 | 🟡 低 |
+| 只读副本延迟 | 主从延迟 > 60秒 | are_dirty() 查询不到脏数据 | 🟡 低 |
 
-2. **增加批次大小**：
-   - 将`PRODUCTS_BATCH_SIZE`从300增加到500-1000（需评估内存使用）
+---
 
-3. **批量删除补全**：
-   - 在批量删除非default_variant时，也应标记`search_index_dirty=True`
-   - 当前只有删除default_variant时才同步更新search_vector
+#### 💡 优化建议
 
-4. **sku/name空值处理**：
-   - 在属性归集前，应确保至少有一个可搜索字段，或单独处理属性归集
+1. **缩短检查间隔（需修改代码）**：
+   - 修改 `saleor/core/schedules.py:259`，将 `initial_timedelta=60` 改为 `initial_timedelta=10` 或 `30`
+   - ⚠️ `BEAT_UPDATE_SEARCH_FREQUENCY` 环境变量**不控制**调度频率，只控制任务过期
 
-5. **监控积压**：
-   - 监控`search_index_dirty=True`的Product数量，设置告警阈值
-   - 超过阈值时考虑临时增加处理批次或频率
+2. **修复批量删除一致性**：
+   - 在 `product_variant_bulk_delete.py` 中，对所有受影响的Product标记 `search_index_dirty=True`
+   - 当前只有删除default_variant时才同步更新
 
-6. **让调度间隔可配置**：
-   - 修改`product_search_update_schedule`类，支持从环境变量读取间隔
-   - 避免硬编码60秒
+3. **让间隔可配置**：
+   ```python
+   # 建议修改方案：支持环境变量
+   def __init__(self, initial_timedelta=None, nowfun=None, app=None):
+       if initial_timedelta is None:
+           initial_timedelta = int(os.environ.get("SEARCH_UPDATE_INTERVAL", "60"))
+   ```
+
+4. **增加批次大小**：
+   - 将 `PRODUCTS_BATCH_SIZE` 从300增加到500-1000（需评估内存）
+
+5. **监控关键指标**：
+   - `search_index_dirty=True` 的Product数量
+   - 任务队列长度和等待时间
+   - 任务过期丢弃次数

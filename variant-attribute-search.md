@@ -1043,3 +1043,274 @@ Step 1: GraphQL Mutation (productVariantBulkDelete)
 4. **合理批次大小**：100（索引更新）、1000（脏标记）平衡内存和性能
 5. **Exists子查询**：属性过滤使用多层Exists而非JOIN，提高查询效率
 6. **行锁保护**：避免并发标记导致的更新丢失
+
+---
+
+## 七、搜索索引一致性边界问题分析
+
+### 7.1 default_variant为空时批量删除同步更新search_vector的条件
+
+#### 问题背景
+批量删除Variant时有一个特殊的同步更新逻辑，但只有在特定条件下才会触发。
+
+#### 条件分析
+**触发同步更新的条件**：`default_variant__isnull=True`
+
+**代码证据**：
+`saleor/graphql/product/bulk_mutations/product_variant_bulk_delete.py:141-156`
+```python
+# set new product default variant if any has been removed
+products = models.Product.objects.order_by("pk").filter(
+    pk__in=product_pks, default_variant__isnull=True  # ← 关键条件
+)
+for product in products:
+    product.search_vector = FlatConcatSearchVector(
+        *prepare_product_search_vector_value(product)
+    )
+    product.default_variant = product.variants.first()
+    product.save(
+        update_fields=[
+            "default_variant",
+            "search_vector",
+            "updated_at",
+        ]
+    )
+```
+
+**条件解读**：
+1. 只有当被删除的Variant是该Product的`default_variant`时，`default_variant__isnull`才会为True
+2. 如果删除的不是default_variant，**不会触发同步更新**，也**不会标记search_index_dirty**
+3. 这意味着批量删除非default_variant时，`search_vector`不会被更新
+
+**对比单个删除的处理**：
+`saleor/graphql/product/mutations/product_variant/product_variant_delete.py:52-58`
+```python
+product = models.Product.objects.get(id=instance.product_id)
+product.search_index_dirty = True  # ← 单个删除总是标记脏标
+product.save(update_fields=["search_index_dirty"])
+# if the product default variant has been removed set the new one
+if not product.default_variant:
+    product.default_variant = product.variants.first()
+    product.save(update_fields=["default_variant", "updated_at"])
+```
+
+**不一致风险分析**：
+| 场景 | 单个删除 | 批量删除 | 一致性风险 |
+|-----|---------|---------|-----------|
+| 删除default_variant | 标记脏标 + 同步设置新default | 同步更新search_vector + 设置新default | 低（批量删除更及时） |
+| 删除非default_variant | 标记脏标（异步更新） | **无任何操作** | **高**（search_vector包含已删除Variant的信息） |
+
+**边界案例**：
+- Product有3个Variant：V1(default)、V2、V3
+- 批量删除V2和V3（都不是default）
+- 结果：search_vector仍然包含V2和V3的sku/name/属性值，直到下次索引刷新
+
+---
+
+### 7.2 sku或name为空时变体属性归集的分支行为
+
+#### 问题背景
+变体的属性归集逻辑中存在一个条件分支，当sku和name都为空时会产生特殊行为。
+
+#### 代码证据
+`saleor/product/search.py:99-118`
+```python
+def generate_variants_search_vector_value(product: "Product"):
+    variants = list(product.variants.all()[: settings.PRODUCT_MAX_INDEXED_VARIANTS])
+    
+    search_vectors = [
+        NoValidationSearchVector(
+            Value(variant.sku), Value(variant.name), config="simple", weight="A"
+        )
+        if variant.sku
+        else NoValidationSearchVector(Value(variant.name), config="simple", weight="A")
+        for variant in variants
+        if variant.sku or variant.name  # ← 条件1：过滤掉sku和name都为空的variant
+    ]
+    if search_vectors:  # ← 条件2：只有当search_vectors非空时才归集属性
+        for variant in variants:  # ← 遍历所有variant（包括sku/name为空的）
+            search_vectors += generate_attributes_search_vector_value_with_assignment(
+                variant.attributes.all()[: settings.PRODUCT_MAX_INDEXED_ATTRIBUTES]
+            )
+    return search_vectors
+```
+
+#### 分支行为分析
+
+**分支1：variant.sku 或 variant.name 非空**
+- 该variant会被加入`search_vectors`列表（包含sku和name的搜索向量）
+- 由于`search_vectors`非空，会进入属性归集循环
+- **所有variant**的属性都会被归集（包括sku/name为空的variant）
+
+**分支2：variant.sku 和 variant.name 都为空**
+- 该variant会被`if variant.sku or variant.name`过滤掉
+- 但如果有其他variant满足条件1，该variant的**属性仍然会被归集**
+- 只有当**所有variant**的sku和name都为空时，`search_vectors`为空，才不会归集任何属性
+
+**边界案例矩阵**：
+
+| 案例 | V1 | V2 | V3 | 结果 |
+|-----|----|----|----|------|
+| 案例1 | sku="A" | sku="B" | sku="C" | 所有V的sku/name和属性都被归集 |
+| 案例2 | sku="A" | (空) | (空) | V1的sku被归集，**所有V的属性都被归集** |
+| 案例3 | (空) | (空) | (空) | **无任何数据被归集**（包括所有V的属性） |
+
+**代码行为溯源**：
+```python
+# 注意：属性归集循环遍历的是 variants（原始列表），不是过滤后的列表
+if search_vectors:
+    for variant in variants:  # ← 遍历原始列表，包含sku/name为空的variant
+        search_vectors += generate_attributes_search_vector_value_with_assignment(...)
+```
+
+#### 潜在问题
+1. **一致性问题**：案例2中，V2和V3的属性被归集，但它们的sku/name没有被归集
+2. **静默丢失**：案例3中，所有属性都静默丢失，没有任何警告或错误
+3. **业务影响**：如果业务允许sku和name为空，那么这些Variant的属性无法被搜索到
+
+---
+
+### 7.3 脏标聚合与定时刷新对查询时效性的影响
+
+#### 问题背景
+搜索索引采用"脏标标记 + 定时刷新"的异步更新模式，这种模式在不同场景下对查询时效性有不同影响。
+
+#### 配置参数
+`saleor/settings.py:650-653`
+```python
+BEAT_UPDATE_SEARCH_SEC = parse(
+    os.environ.get("BEAT_UPDATE_SEARCH_FREQUENCY", "20 seconds")
+)
+BEAT_UPDATE_SEARCH_EXPIRE_AFTER_SEC = BEAT_UPDATE_SEARCH_SEC
+```
+
+`saleor/product/tasks.py:352-360`
+```python
+def update_products_search_vector_task():
+    products = (
+        Product.objects.using(settings.DATABASE_CONNECTION_REPLICA_NAME)
+        .filter(search_index_dirty=True)
+        .order_by("updated_at")[:PRODUCTS_BATCH_SIZE]  # PRODUCTS_BATCH_SIZE = 300
+        .values_list("id", flat=True)
+    )
+    with allow_writer():
+        update_products_search_vector(products)
+```
+
+#### 脏标聚合机制
+
+**聚合场景1：多次修改同一Product**
+```
+T0: Product.search_index_dirty = False
+T1: Variant创建 → search_index_dirty = True（第1次标记）
+T2: Variant更新 → search_index_dirty = True（第2次标记，值已为True）
+T3: 属性值更新 → search_index_dirty = True（第3次标记，值仍为True）
+T4: 定时任务执行 → search_index_dirty = False，search_vector更新
+
+结果：3次标记只触发1次索引更新
+```
+
+**代码证据 - 幂等标记**：
+`saleor/product/tasks.py:337-345`
+```python
+def mark_products_search_vector_as_dirty(product_ids: list[int]):
+    if not product_ids:
+        return
+    with transaction.atomic():
+        ids = product_qs_select_for_update().filter(pk__in=product_ids).values("id")
+        Product.objects.filter(id__in=ids).update(search_index_dirty=True)
+```
+- 由于是布尔字段，多次UPDATE为True不会产生额外效果
+- `select_for_update`确保并发标记时不会丢失更新
+
+**聚合场景2：属性值更新影响大量Product**
+```
+T0: AttributeValue.name = "红色"
+T1: 更新AttributeValue.name = "中国红"
+T2: 查询所有使用该属性值的Product（可能1000+个）
+T3: 分批标记为脏标（每批1000个）
+T4: 定时任务每次处理300个
+T5: 需要4轮才能处理完所有Product
+```
+
+**代码证据 - 分批标记**：
+`saleor/product/utils/search_helpers.py:7-11`
+```python
+MARK_SEARCH_VECTOR_DIRTY_BATCH_SIZE = 1000
+
+def mark_products_search_vector_as_dirty_in_batches(product_ids: list[int]):
+    for i in range(0, len(product_ids), MARK_SEARCH_VECTOR_DIRTY_BATCH_SIZE):
+        batch_ids = product_ids[i : i + MARK_SEARCH_VECTOR_DIRTY_BATCH_SIZE]
+        mark_products_search_vector_as_dirty.delay(batch_ids)
+```
+
+#### 时效性分析
+
+**场景1：单个Variant创建/更新**
+```
+时间线：
+T=0s:   标记search_index_dirty=True（快速返回，<100ms）
+T=1s:   用户搜索 → 命中旧的search_vector（不包含新Variant）
+T=20s:  定时任务触发，处理300个脏Product
+T=20.5s: search_vector更新完成
+T=21s:  用户搜索 → 命中新的search_vector（包含新Variant）
+
+时效性：延迟约20-40秒（取决于定时任务触发时机）
+```
+
+**场景2：批量创建100个Variant（不同Product）**
+```
+时间线：
+T=0s:   批量操作，标记100个Product为脏标
+T=20s:  定时任务触发，处理这100个Product
+T=20.2s: 全部更新完成（因为100 < 300，1轮处理完）
+
+时效性：延迟约20-40秒
+```
+
+**场景3：属性值更新影响1500个Product**
+```
+时间线：
+T=0s:    属性值更新，分批标记1500个Product为脏标
+T=20s:   定时任务触发，处理300个
+T=40s:   定时任务触发，处理300个（累计600）
+T=60s:   定时任务触发，处理300个（累计900）
+T=80s:   定时任务触发，处理300个（累计1200）
+T=100s:  定时任务触发，处理300个（累计1500，全部完成）
+
+时效性：延迟约20-120秒（取决于Product在批次中的位置）
+```
+
+**场景4：高并发，积压超过300个**
+```
+时间线：
+T=0s:    积压500个脏Product
+T=20s:   定时任务触发，处理前300个（按updated_at排序）
+T=40s:   定时任务触发，处理剩余200个 + 新增的300个中的前100个
+T=60s:   定时任务触发，处理剩余200个
+...
+
+时效性：延迟时间 = 积压数量 / 300 * 20秒
+```
+
+#### 时效性影响矩阵
+
+| 操作类型 | 影响Product数 | 最佳延迟 | 最差延迟 | 备注 |
+|---------|--------------|---------|---------|------|
+| 单个Variant创建 | 1 | ~20s | ~40s | 正常场景 |
+| 批量创建Variant | 100 | ~20s | ~40s | 1轮处理完 |
+| 属性值更新 | 1500 | ~20s | ~120s | 需5轮处理 |
+| 高并发积压 | 10000 | ~20s | ~660s | 持续积压 |
+
+#### 与属性过滤的对比
+| 查询方式 | 时效性 | 一致性 |
+|---------|-------|-------|
+| 全文搜索（search_vector） | 最终一致（20s+延迟） | 异步更新，可能短暂不一致 |
+| 属性过滤（直接联表） | 强一致（实时） | 实时查询，总是一致 |
+
+#### 优化建议
+1. **缩短刷新间隔**：将`BEAT_UPDATE_SEARCH_FREQUENCY`从20秒改为5-10秒（需评估数据库压力）
+2. **增加批次大小**：将`PRODUCTS_BATCH_SIZE`从300增加到500-1000（需评估内存使用）
+3. **批量删除补全**：在批量删除非default_variant时，也应标记`search_index_dirty=True`
+4. **sku/name空值处理**：在属性归集前，应确保至少有一个可搜索字段，或单独处理属性归集
+5. **监控积压**：监控`search_index_dirty=True`的Product数量，设置告警阈值

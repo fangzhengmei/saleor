@@ -435,7 +435,8 @@ def is_method_in_valid_methods(self, checkout_info) -> bool:
 
 | 文件 | 职责 |
 |------|------|
-| `saleor/account/i18n.py` | 地址规范化表单与 I18nMixin |
+| `saleor/account/i18n.py` | 业务层：地址规范化表单（CountryAwareAddressForm）、表单构造 |
+| `saleor/graphql/account/i18n.py` | GraphQL 层：I18nMixin、validate_address() 类方法、跳过校验权限 |
 | `saleor/account/forms.py` | 地址表单工厂 |
 | `saleor/shipping/models.py` | 配送区/方法数据模型 + QuerySet 匹配逻辑 |
 | `saleor/shipping/postal_codes.py` | 邮编区间匹配算法 |
@@ -563,21 +564,41 @@ sequenceDiagram
         Mutation-->>Client: 返回权限错误
     else 权限通过
         Permission-->>I18nMixin: 验证通过
-        Note over I18nMixin: format_check = False
+        Note over I18nMixin: format_check = False<br/>required_check = True（保持默认）
     end
     
     Note over I18nMixin: 第二步：表单验证
     I18nMixin->>I18nMixin: _validate_address_form()
-    Note over I18nMixin: 即使 is_valid() 返回 False<br/>因 format_check=False 不抛出异常
+    Note over I18nMixin: 遍历 errors_dict<br/>• 格式错误 → 因 format_check=False 跳过<br/>• 必填错误 → 因 required_check=True 仍然抛出
     
-    Note over I18nMixin: 第三步：标记状态
-    I18nMixin->>I18nMixin: cleaned_data["validation_skipped"] = True
-    
-    Note over I18nMixin: 第四步：持久化标记
-    I18nMixin-->>Mutation: 返回 Address 实例<br/>(validation_skipped=True)
-    
-    Mutation->>DB: 保存 Address，validation_skipped 字段写入数据库
-    Mutation-->>Client: 返回成功响应
+    alt 存在必填错误（如 postal_code/city 为空）
+        I18nMixin-->>Mutation: 抛出 ValidationError（code="required"）
+        Mutation-->>Client: 返回必填字段错误
+    else 仅格式错误或无错误
+        Note over I18nMixin: 第三步：标记状态
+        I18nMixin->>I18nMixin: cleaned_data["validation_skipped"] = True
+        
+        Note over I18nMixin: 第四步：持久化标记
+        I18nMixin-->>Mutation: 返回 Address 实例<br/>(validation_skipped=True)
+        
+        Mutation->>DB: 保存 Address，validation_skipped 字段写入数据库
+        Mutation-->>Client: 返回成功响应
+    end
+```
+
+**时序图代码验证说明**：
+
+```python
+# graphql/account/i18n.py:176-178
+if address_data.get("skip_validation"):
+    cls.can_skip_address_validation(info)
+    format_check = False  # ← 只修改 format_check
+    # required_check 保持默认 True，未被修改！
+
+# graphql/account/i18n.py:145-150
+# 错误过滤逻辑：
+# • error.code != "required": if values_check (即 format_check)
+# • error.code == "required": if required_check (始终为 True)
 ```
 
 #### 8.4.2.1 skip_validation 与 required_check 的行为界限（关键澄清）

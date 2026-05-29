@@ -286,6 +286,7 @@ class ProductBulkCreateInput(ProductCreateInput):
    - 查询所有 Collection: `{ slug: "summer", id: "Q29sbGVjdGlvbjox" }`
    - 查询所有 Channel: `{ slug: "default", id: "Q2hhbm5lbDox" }`
    - 查询所有 Warehouse: `{ slug: "main", id: "V2FyZWhvdXNlOjE=" }`
+   - 查询所有 Attribute: `{ slug: "size", id: "QXR0cmlidXRlOjE=", input_type: "dropdown" }`
 
 2. **解析 CSV 行**：注意导出是**每变体一行**（同一产品可能有多行，每个变体一行）
 
@@ -297,89 +298,328 @@ class ProductBulkCreateInput(ProductCreateInput):
 | name | 直接使用 | `"T-Shirt"` → `"T-Shirt"` |
 | product type | 用 name → product_type_id 映射表查询 | `"Physical"` → `"UHJvZHVjdFR5cGU6MQ=="` |
 | variants[].sku | 直接使用 | `"TS-001-S"` → `"TS-001-S"` |
-| variants[].attributes | 从属性列（如 "size (variant attribute)"）解析 | "S" → `[{"id": "QXR0cmlidXRlOjE=", "values": [{"name": "S"}]}]` |
+| variants[].attributes | **按 input_type 分发，见 2.7 节** | - |
 | **推荐字段** | | |
 | slug | 自动生成或留空（会自动从 name 生成） | `"t-shirt"` → `"t-shirt"` |
 | category | 用 slug → category_id 映射表查询 | `"apparel"` → `"Q2F0ZWdvcnk6MQ=="` |
-| product weight | 正则解析 `"(\d+) (\w+)"` → 构造 Weight 对象 | `"100 g"` → `{"unit": "g", "value": 100}` |
+| product weight | 正则解析 `"(\d+(?:\.\d+)?) (\w+)"` → 构造 Weight 对象 | `"100 g"` → `{"unit": "g", "value": 100}` |
 | collections | 按逗号拆分 slug → 查映射表得 ID 列表 | `"summer,sale"` → `["Q29sbGVjdGlvbjox", "Q29sbGVjdGlvbjoy"]` |
-| media | 按逗号拆分 URL → 构造 MediaInput 数组 | `"https://a.jpg,https://b.jpg"` → `[{"media_url": "https://a.jpg", "alt": ""}, ...]` |
+| media | 按逗号拆分 URL → 构造 MediaInput 数组 | `"https://a.jpg,https://b.jpg"` → `[{"mediaUrl": "https://a.jpg", "alt": ""}, ...]` |
 | description | 包装成 EditorJS 格式 | `"A great t-shirt"` → `'{"blocks": [{"type": "paragraph", "data": {"text": "A great t-shirt"}}]}'` |
 | **变体字段** | | |
 | variants[].weight | 正则解析 → Weight 对象 | `"50 g"` → `{"unit": "g", "value": 50}` |
 | **variant media（特殊处理）** | | |
-| variant media | 第一步：先放到 product.media 共享池<br>第二步：创建成功后调用 variantMediaAssign | 见下方示例 |
+| variant media | 第一步：先放到 product.media 共享池<br>第二步：创建成功后调用 variantMediaAssign | 见 2.8 节 |
 | **渠道字段** | | |
 | channel_listings | 从渠道列解析 → 构造 channel_listing 对象 | (见下方示例) |
 | variant channel_listings | 从变体渠道列解析 → 构造价格对象 | (见下方示例) |
 | **库存字段** | | |
 | variants[].stocks | 从仓库列解析 → 构造 stock 对象 | "main: 100" → `[{"warehouse": "V2FyZWhvdXNlOjE=", "quantity": 100}]` |
 
-#### 最小可工作的转换示例
+### 2.7 BulkAttributeValueInput 合法字段与按 input_type 分发规则（代码证据）
+
+#### BulkAttributeValueInput 完整字段定义
+
+**文件**: `saleor/graphql/product/bulk_mutations/product_variant_bulk_create.py:121-189`
+
+```python
+class BulkAttributeValueInput(BaseInputObjectType):
+    id = graphene.ID(required=False)                  # 属性的 Global ID（与 external_reference 二选一）
+    external_reference = graphene.String(required=False) # 属性的外部引用（与 id 二选一）
+    values = NonNullList(graphene.String, required=False) # ⚠️ 已废弃，但仍可用
+    dropdown = AttributeValueSelectableTypeInput(required=False)
+    swatch = AttributeValueSelectableTypeInput(required=False)
+    multiselect = NonNullList(AttributeValueSelectableTypeInput, required=False)
+    numeric = graphene.String(required=False)
+    file = graphene.String(required=False)
+    content_type = graphene.String(required=False)
+    reference = graphene.ID(required=False)
+    references = NonNullList(graphene.ID, required=False)
+    rich_text = JSONString(required=False)
+    plain_text = graphene.String(required=False)
+    boolean = graphene.Boolean(required=False)
+    date = Date(required=False)
+    date_time = DateTime(required=False)
+```
+
+#### AttributeValueSelectableTypeInput 字段定义
+
+**文件**: `saleor/graphql/attribute/types.py:614-638`
+
+```python
+class AttributeValueSelectableTypeInput(BaseInputObjectType):
+    id = graphene.ID(required=False)                  # 属性值的 Global ID
+    external_reference = graphene.String(required=False) # 属性值的外部引用
+    value = graphene.String(required=False)            # 属性值的名称或 slug（不存在则自动创建）
+```
+
+#### 按 input_type 分发规则（代码证据）
+
+**文件**: `saleor/graphql/attribute/utils/attribute_assignment.py:54-67,211-222`
+
+```python
+HANDLER_MAPPING = {
+    AttributeInputType.DROPDOWN: SelectableAttributeHandler,
+    AttributeInputType.SWATCH: SelectableAttributeHandler,
+    AttributeInputType.MULTISELECT: MultiSelectableAttributeHandler,
+    AttributeInputType.FILE: FileAttributeHandler,
+    AttributeInputType.REFERENCE: ReferenceAttributeHandler,
+    AttributeInputType.SINGLE_REFERENCE: ReferenceAttributeHandler,
+    AttributeInputType.RICH_TEXT: RichTextAttributeHandler,
+    AttributeInputType.PLAIN_TEXT: PlainTextAttributeHandler,
+    AttributeInputType.NUMERIC: NumericAttributeHandler,
+    AttributeInputType.DATE: DateTimeAttributeHandler,
+    AttributeInputType.DATE_TIME: DateTimeAttributeHandler,
+    AttributeInputType.BOOLEAN: BooleanAttributeHandler,
+}
+```
+
+**分发逻辑** (`attribute_assignment.py:211-222`)：
+```python
+is_legacy_path = values_input.values and attribute.input_type in {
+    AttributeInputType.DROPDOWN,
+    AttributeInputType.MULTISELECT,
+    AttributeInputType.SWATCH,
+    AttributeInputType.NUMERIC,
+}
+if is_legacy_path:
+    handler_class = LegacyValuesHandler  # 使用废弃的 values 字段
+else:
+    handler_class = cls.HANDLER_MAPPING[attribute.input_type]  # 使用新字段
+```
+
+#### 各 input_type 对应的合法输入字段
+
+| input_type | 推荐字段（新） | 废弃字段（仍可用） | Handler | 约束 |
+|-----------|--------------|------------------|---------|------|
+| **DROPDOWN** | `dropdown: { id, value, externalReference }` | `values: ["S"]` | SelectableAttributeHandler | 只能选一个值 |
+| **SWATCH** | `swatch: { id, value, externalReference }` | `values: ["red"]` | SelectableAttributeHandler | 只能选一个值 |
+| **MULTISELECT** | `multiselect: [{ id, value, externalReference }, ...]` | `values: ["S", "M"]` | MultiSelectableAttributeHandler | 可选多个值 |
+| **NUMERIC** | `numeric: "42"` | `values: ["42"]` | NumericAttributeHandler | 只能选一个值 |
+| **RICH_TEXT** | `richText: '{"blocks": [...]}'` | - | RichTextAttributeHandler | EditorJS JSON |
+| **PLAIN_TEXT** | `plainText: "some text"` | - | PlainTextAttributeHandler | 纯文本 |
+| **BOOLEAN** | `boolean: true` | - | BooleanAttributeHandler | 布尔值 |
+| **FILE** | `file: "path/to/file", contentType: "image/png"` | - | FileAttributeHandler | 文件路径（默认存储内路径） |
+| **REFERENCE** | `references: ["UHJvZHVjdDox"]` | - | ReferenceAttributeHandler | 被引用实体的 ID 列表 |
+| **SINGLE_REFERENCE** | `reference: "UHJvZHVjdDox"` | - | ReferenceAttributeHandler | 被引用实体的单个 ID |
+| **DATE** | `date: "2024-01-01"` | - | DateTimeAttributeHandler | 日期 |
+| **DATE_TIME** | `dateTime: "2024-01-01T00:00:00"` | - | DateTimeAttributeHandler | 日期时间 |
+
+**重要约束**（代码证据 `type_handlers.py:784-788`）：
+- DROPDOWN / SWATCH / NUMERIC：`values` 数组最多 1 个元素，否则报 `MORE_THAN_ONE_VALUE` 错误
+- MULTISELECT：`values` 数组可以有多个元素
+- `dropdown` / `swatch` 中的 `value` 字段：如果值不存在，会**自动创建**
+
+#### CSV 属性列名格式与 input_type 的对应关系
+
+CSV 导出的属性列表头格式为 `"slug-value (variant attribute)"` 或 `"slug-value (product attribute)"`。
+转换时需要：
+1. 解析表头中的 slug → 查询 Attribute 表获取 `id` 和 `input_type`
+2. 根据 `input_type` 选择对应的输入字段（dropdown / multiselect / numeric 等）
+3. 填入值
+
+### 2.8 最小可工作的转换示例（能过 schema 校验）
 
 **CSV 输入行**：
 ```csv
-name,product type,category,product weight,variant sku,variant weight,size (variant attribute)
-T-Shirt,Physical,apparel,100 g,TS-001-S,50 g,S
+name,product type,category,product weight,variant sku,variant weight,size (variant attribute),color (variant attribute)
+T-Shirt,Physical,apparel,100 g,TS-001-S,50 g,S,red
 ```
 
-**转换后的 GraphQL 输入**：
+**前置查询**：
+```graphql
+# 查询 size 属性的 input_type 和 id
+{ attributes(first: 100, filter: { search: "size" }) {
+    edges { node { id slug inputType } }
+  }
+}
+# 结果: size → id="QXR0cmlidXRlOjE=", inputType=DROPDOWN
+# 结果: color → id="QXR0cmlidXRlOjI=", inputType=SWATCH
+```
+
+**转换后的 GraphQL 输入（按 input_type 使用 dropdown/swatch，不使用废弃的 values）**：
 ```graphql
 mutation {
   productBulkCreate(
     products: [{
       name: "T-Shirt",
-      productType: "UHJvZHVjdFR5cGU6MQ==",  # "Physical" 对应的 ID
-      category: "Q2F0ZWdvcnk6MQ==",           # "apparel" 对应的 ID
+      productType: "UHJvZHVjdFR5cGU6MQ==",
+      category: "Q2F0ZWdvcnk6MQ==",
       weight: { unit: "g", value: 100 },
       variants: [{
         sku: "TS-001-S",
         weight: { unit: "g", value: 50 },
-        attributes: [{
-          id: "QXR0cmlidXRlOjE=",            # "size" 属性的 ID
-          values: [{ name: "S" }]
-        }]
+        attributes: [
+          {
+            id: "QXR0cmlidXRlOjE="
+            dropdown: { value: "S" }
+          },
+          {
+            id: "QXR0cmlidXRlOjI="
+            swatch: { value: "red" }
+          }
+        ]
       }]
     }],
     errorPolicy: REJECT_FAILED_ROWS
   ) {
     count
     results {
-      product { id }
+      product { id name }
       errors { path message code }
     }
   }
 }
 ```
 
-#### Variant Media 完整转换流程
+**若属性为 multiselect（如 "materials"），CSV 值为 "cotton,polyester"**：
+```graphql
+attributes: [
+  {
+    id: "QXR0cmlidXRlOjM="
+    multiselect: [{ value: "cotton" }, { value: "polyester" }]
+  }
+]
+```
 
-**CSV 输入**：
-```csv
+**若属性为 numeric（如 "length"），CSV 值为 "42"**：
+```graphql
+attributes: [
+  {
+    id: "QXR0cmlidXRlOjQ="
+    numeric: "42"
+  }
+]
+```
+
+**若属性为 boolean（如 "is_featured"），CSV 值为 "true"**：
+```graphql
+attributes: [
+  {
+    id: "QXR0cmlidXRlOjU="
+    boolean: true
+  }
+]
+```
+
+**若使用废弃的 values 字段（仍可通过校验，但已标记为 deprecated）**：
+```graphql
+attributes: [
+  { id: "QXR0cmlidXRlOjE=", values: ["S"] }
+]
+```
+注意：使用 `values` 时，DROPDOWN/SWATCH/NUMERIC 只能传 1 个值，MULTISELECT 可传多个。
+
+### 2.9 Variant Media 二步分配的实际调用约束（代码证据）
+
+#### 约束 1：媒体必须属于同一产品
+
+**文件**: `saleor/graphql/product/mutations/product_variant/variant_media_assign.py:46-70`
+
+```python
+# 代码证据：variantMediaAssign 会检查 media 是否属于 variant 的 product
+media_belongs_to_product = variant.product.media.filter(pk=media.pk).first()
+if media_belongs_to_product:
+    _, created = media.variant_media.get_or_create(variant=variant)
+    if not created:
+        raise ValidationError("This media is already assigned")  # 重复分配报错
+else:
+    raise ValidationError(
+        "This media doesn't belong to that product.",
+        code=ProductErrorCode.NOT_PRODUCTS_IMAGE.value,  # 非本产品媒体报错
+    )
+```
+
+**这意味着**：
+- ❌ 不能分配属于其他产品的媒体
+- ❌ 不能分配尚未创建的媒体（必须先通过 `productBulkCreate.media` 创建）
+- ❌ 不能重复分配同一媒体给同一变体
+
+#### 约束 2：获取 media_id 的查询方式
+
+`productBulkCreate` 的返回值中**不直接包含 media ID**。需要额外查询：
+
+```graphql
+# 步骤 1: 执行 productBulkCreate
+mutation { productBulkCreate(products: [...]) { count results { product { id } } } }
+
+# 步骤 2: 查询产品的媒体 ID
+query {
+  product(id: "UHJvZHVjdDox") {
+    media {
+      id          # 这个 ID 传给 variantMediaAssign 的 mediaId
+      url         # 用于匹配 CSV 中的 URL
+      alt
+    }
+    variants {
+      id          # 这个 ID 传给 variantMediaAssign 的 variantId
+      sku         # 用于匹配 CSV 中的 SKU
+    }
+  }
+}
+
+# 步骤 3: 按 URL 匹配后分配
+mutation {
+  variantMediaAssign(
+    mediaId: "UHJvZHVjdE1lZGlhOjE="       # 步骤 2 查询到的
+    variantId: "UHJvZHVjdFZhcmlhbnQ6MQ=="  # 步骤 2 查询到的
+  ) {
+    productVariant { id }
+    media { id }
+  }
+}
+```
+
+#### 约束 3：完整的二步分配流程（可落地代码）
+
+```
+CSV 输入:
 name,variant sku,product media,variant media
-T-Shirt,TS-001,"https://a.jpg","https://a.jpg,https://b.jpg"
-```
+T-Shirt,TS-001,"https://a.jpg,https://b.jpg","https://a.jpg"
+T-Shirt,TS-002,"https://a.jpg,https://b.jpg","https://b.jpg"
 
-**转换步骤**：
-```
-步骤 1: 收集所有媒体到 product.media（去重）
+───────────────────────────────────────────────────────────────
+
+步骤 1: 合并所有 media URL 到 product.media（去重）
   product.media = [
-    { media_url: "https://a.jpg", alt: "Product image" },
-    { media_url: "https://b.jpg", alt: "Variant image" }
+    { mediaUrl: "https://a.jpg", alt: "" },
+    { mediaUrl: "https://b.jpg", alt: "" }
   ]
 
-步骤 2: 执行 productBulkCreate，记录返回的 media ID 和 variant ID
-  返回:
-    product.media[0].id = "UHJvZHVjdE1lZGlhOjE="  (a.jpg)
-    product.media[1].id = "UHJvZHVjdE1lZGlhOjI="  (b.jpg)
-    product.variants[0].id = "UHJvZHVjdFZhcmlhbnQ6MQ=="  (TS-001)
+步骤 2: 构建 variant media 映射表（从 CSV 解析）
+  variant_media_map = {
+    "TS-001": ["https://a.jpg"],
+    "TS-002": ["https://b.jpg"]
+  }
 
-步骤 3: 为变体分配媒体（循环调用 variantMediaAssign）
-  为 TS-001 分配 a.jpg:
-    mutation { variantMediaAssign(mediaId: "UHJvZHVjdE1lZGlhOjE=", variantId: "UHJvZHVjdFZhcmlhbnQ6MQ==") { ... } }
-  为 TS-001 分配 b.jpg:
-    mutation { variantMediaAssign(mediaId: "UHJvZHVjdE1lZGlhOjI=", variantId: "UHJvZHVjdFZhcmlhbnQ6MQ==") { ... } }
+步骤 3: 执行 productBulkCreate（不含 variant media 分配）
+  → 返回 product.id
+
+步骤 4: 查询 product 的 media 和 variants
+  query { product(id: $productId) { media { id url } variants { id sku } } }
+  → 得到:
+    media: [{ id: "UHJvZHVjdE1lZGlhOjE=", url: "https://a.jpg" },
+            { id: "UHJvZHVjdE1lZGlhOjI=", url: "https://b.jpg" }]
+    variants: [{ id: "UHJvZHVjdFZhcmlhbnQ6MQ==", sku: "TS-001" },
+               { id: "UHJvZHVjdFZhcmlhbnQ6Mg==", sku: "TS-002" }]
+
+步骤 5: 按 URL 匹配，循环调用 variantMediaAssign
+  对于 TS-001 + https://a.jpg:
+    variantMediaAssign(
+      mediaId: "UHJvZHVjdE1lZGlhOjE=",
+      variantId: "UHJvZHVjdFZhcmlhbnQ6MQ=="
+    )
+  对于 TS-002 + https://b.jpg:
+    variantMediaAssign(
+      mediaId: "UHJvZHVjdE1lZGlhOjI=",
+      variantId: "UHJvZHVjdFZhcmlhbnQ6Mg=="
+    )
 ```
+
+**批量场景下的注意事项**：
+- 每次调用 `variantMediaAssign` 是独立的 HTTP 请求，大量变体+媒体时调用次数 = N(变体) × M(每变体媒体数)
+- 同一媒体可以被分配给同一产品的多个变体
+- 同一媒体不能重复分配给同一变体（会报 `MEDIA_ALREADY_ASSIGNED`）
 
 ---
 
@@ -1101,7 +1341,11 @@ GraphQL Mutation: ProductBulkCreate.perform_mutation()
 | 导出事件记录 | `saleor/csv/events.py` | 导出生命周期事件审计 |
 | 导出通知 | `saleor/csv/notifications.py` | 成功/失败邮件 + Webhook |
 | 导入核心逻辑 | `saleor/graphql/product/bulk_mutations/product_bulk_create.py` | 批量创建 mutation |
-| 变体批量导入 | `saleor/graphql/product/bulk_mutations/product_variant_bulk_create.py` | 变体批量创建 |
+| 变体批量导入 | `saleor/graphql/product/bulk_mutations/product_variant_bulk_create.py` | 变体批量创建、`BulkAttributeValueInput` 定义 |
+| 属性输入定义 | `saleor/graphql/attribute/types.py` | `AttributeValueInput`, `AttributeValueSelectableTypeInput` |
+| 属性分发处理 | `saleor/graphql/attribute/utils/attribute_assignment.py` | `AttributeAssignmentMixin` 按 input_type 分发 handler |
+| 属性类型处理 | `saleor/graphql/attribute/utils/type_handlers.py` | 各 input_type 的 Handler 实现 |
+| 变体媒体分配 | `saleor/graphql/product/mutations/product_variant/variant_media_assign.py` | `VariantMediaAssign` mutation |
 | 重量标量 | `saleor/graphql/core/scalars.py` | `WeightScalar` 解析和序列化 |
 | 批次工具 | `saleor/core/utils/batches.py` | `queryset_in_batches` 游标分页 |
 | 导出错误码 | `saleor/csv/error_codes.py` | `ExportErrorCode` 枚举 |

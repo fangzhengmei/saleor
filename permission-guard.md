@@ -248,24 +248,175 @@ def get_user_or_app_from_context(context: "SaleorContext") -> App | User | None:
 
 ## 五、查询守卫中的拦截分支详解
 
-### 5.1 四类拦截分支
+### 5.1 三类拦截分支
 
-查询守卫在 `_get_result_of_permissions_checks` 中会遇到四种情况，每种情况的拦截逻辑不同：
+查询守卫在权限校验过程中会遇到三类请求者情况，每种情况的拦截逻辑不同：
 
 ```
-get_user_or_app_from_context(context)
+one_of_permissions_or_auth_filter_required(context, permissions)
           │
-          ├─► 情况1：requestor is None（未认证用户）
-          │       └─► 返回空列表 → any([]) = False → 拦截
+          ├─► 第一步：分离权限类型
+          │     ├─► 常规权限：非 AuthorizationFilters 实例
+          │     └─► 授权过滤器：AuthorizationFilters 实例
           │
-          ├─► 情况2：requestor 是 User（已认证用户）
-          │       └─► 调用 user.has_perm(perm) 逐个检查
+          ├─► 第二步：常规权限检查（_get_result_of_permissions_checks）
+          │     │
+          │     └─► get_user_or_app_from_context(context)
+          │           │
+          │           ├─► 情况1：requestor is None（未认证用户）
+          │           │       └─► 返回空列表 → any([]) = False → 常规权限不通过
+          │           │
+          │           ├─► 情况2：requestor 是 User（已认证用户）
+          │           │       └─► 调用 user.has_perm(perm) 逐个检查
+          │           │
+          │           └─► 情况3：requestor 是 App（应用请求）
+          │                   ├─► 检查 app.is_active
+          │                   ├─► 调用 app.has_perm(perm) 逐个检查
+          │                   └─► 特殊限制：某些操作直接拒绝 App
           │
-          └─► 情况3：requestor 是 App（应用请求）
-                  ├─► 检查 app.is_active
-                  ├─► 调用 app.has_perm(perm) 逐个检查
-                  └─► 特殊限制：某些操作（如创建权限组）直接拒绝 App
+          └─► 第三步：授权过滤器检查（_get_result_of_authorization_filters_checks）
+                │
+                ├─► AuthorizationFilters.AUTHENTICATED_APP → is_app(context)
+                ├─► AuthorizationFilters.AUTHENTICATED_STAFF_USER → is_staff_user(context)
+                ├─► AuthorizationFilters.AUTHENTICATED_USER → is_user(context)
+                └─► AuthorizationFilters.OWNER → 无内置函数，需业务逻辑层处理
 ```
+
+### 5.1.1 AuthorizationFilters 枚举与映射
+
+**文件位置：** `saleor/permission/auth_filters.py:17-41`
+
+```python
+class AuthorizationFilters(BasePermissionEnum):
+    # 任何已认证的 App 都可以访问
+    AUTHENTICATED_APP = "authorization_filters.authenticated_app"
+    # 任何已认证的 staff 用户都可以访问
+    AUTHENTICATED_STAFF_USER = "authorization_filters.authenticated_staff_user"
+    # 任何已认证的用户都可以访问
+    AUTHENTICATED_USER = "authorization_filters.authenticated_user"
+    # 资源所有者可以访问，需业务逻辑层自行判断
+    OWNER = "authorization_filters.owner"
+
+# 🔑 授权过滤器到检查函数的映射
+AUTHORIZATION_FILTER_MAP = {
+    AuthorizationFilters.AUTHENTICATED_APP: is_app,
+    AuthorizationFilters.AUTHENTICATED_USER: is_user,
+    AuthorizationFilters.AUTHENTICATED_STAFF_USER: is_staff_user,
+}
+
+def is_app(context):
+    return bool(context.app)
+
+def is_user(context):
+    user = context.user
+    return user and user.is_active
+
+def is_staff_user(context):
+    return is_user(context) and context.user.is_staff
+
+def resolve_authorization_filter_fn(perm):
+    return AUTHORIZATION_FILTER_MAP.get(perm)
+```
+
+### 5.1.2 两种核心校验函数的组合逻辑
+
+#### 组合逻辑 1：one_of_permissions_or_auth_filter_required（OR 逻辑）
+
+**文件位置：** `saleor/permission/utils.py:32-46`
+
+```python
+def one_of_permissions_or_auth_filter_required(
+    context, permissions: Iterable[BasePermissionEnum]
+) -> bool:
+    if not permissions:
+        return True
+
+    # 1. 分离并检查常规权限
+    perm_results = _get_result_of_permissions_checks(context, permissions)
+    
+    # 2. 分离并检查授权过滤器
+    auth_filters_results = _get_result_of_authorization_filters_checks(
+        context, permissions
+    )
+    
+    # 🎯 OR 逻辑：常规权限任一通过 OR 授权过滤器任一通过
+    return any(perm_results) or any(auth_filters_results)
+```
+
+**执行流程示例（permissions = [MANAGE_USERS, OWNER]）：**
+```
+1. 分离权限：
+   perm_results = [user.has_perm(MANAGE_USERS)]
+   auth_filters_results = []  # OWNER 无映射函数，跳过
+   
+2. 结果计算：
+   any([True]) or any([]) = True  → 常规权限通过
+   any([False]) or any([]) = False → 都不通过，拦截
+```
+
+#### 组合逻辑 2：all_permissions_required（AND + OR 混合逻辑）
+
+**文件位置：** `saleor/permission/utils.py:12-29`
+
+```python
+def all_permissions_required(context, permissions: Iterable[BasePermissionEnum]):
+    if not permissions:
+        return True
+
+    perm_results = _get_result_of_permissions_checks(context, permissions)
+    auth_filters_results = _get_result_of_authorization_filters_checks(
+        context, permissions
+    )
+    
+    # 🎯 混合逻辑：(所有常规权限都通过) AND (任一授权过滤器通过)
+    if auth_filters_results:
+        return all(perm_results) and any(auth_filters_results)
+    return all(perm_results)
+```
+
+**执行流程示例（permissions = [MANAGE_APPS, AUTHENTICATED_APP]）：**
+```
+1. 分离权限：
+   perm_results = [app.has_perm(MANAGE_APPS)]
+   auth_filters_results = [is_app(context)]
+   
+2. 结果计算：
+   all([True]) and any([True]) = True  → 全部通过
+   all([True]) and any([False]) = False → 授权过滤器不通过，拦截
+   all([False]) and any([True]) = False → 常规权限不通过，拦截
+```
+
+### 5.1.3 _get_result_of_authorization_filters_checks 实现
+
+**文件位置：** `saleor/permission/utils.py:65-79`
+
+```python
+def _get_result_of_authorization_filters_checks(
+    context, permissions: Iterable[BasePermissionEnum]
+) -> Iterable[bool]:
+    # 🔑 只提取 AuthorizationFilters 类型的权限
+    authorization_filters = [
+        p for p in permissions if isinstance(p, AuthorizationFilters)
+    ]
+    auth_filters_results = []
+    if authorization_filters:
+        for p in authorization_filters:
+            # 查找对应的检查函数
+            perm_fn = resolve_authorization_filter_fn(p)
+            if perm_fn:
+                # 执行检查函数
+                res = perm_fn(context)
+                auth_filters_results.append(bool(res))
+            # ⚠️  OWNER 没有映射函数，所以不会被加入结果列表！
+
+    return auth_filters_results
+```
+
+**关键注意点：**
+- `AuthorizationFilters.OWNER` 在 `AUTHORIZATION_FILTER_MAP` 中没有对应函数
+- 因此 `resolve_authorization_filter_fn(OWNER)` 返回 `None`
+- 不会被加入 `auth_filters_results`，即 `any(auth_filters_results)` 对 OWNER 永远是 `False`
+- OWNER 权限必须在**业务逻辑层**通过 `is_owner_or_has_one_of_perms()` 显式检查
 
 ### 5.2 分支 1：未认证用户拦截
 
@@ -396,7 +547,65 @@ def check_permissions(
     return super().check_permissions(context, permissions)
 ```
 
-### 5.5 PermissionDenied 异常类
+### 5.5 OWNER 权限的特殊处理方式
+
+#### 5.5.1 OWNER 权限为何不在查询守卫层处理
+
+如 5.1.3 所述，`AuthorizationFilters.OWNER` 没有内置的检查函数，这是因为：
+- 所有权判断依赖于具体业务对象（如订单所有者、用户资料所有者）
+- 查询守卫层无法知道当前 resolver 正在访问哪个对象的所有者
+- 必须由业务逻辑层显式判断 `requestor == owner`
+
+#### 5.5.2 is_owner_or_has_one_of_perms 实现
+
+**文件位置：** `saleor/graphql/account/utils.py:364-376`
+
+```python
+def is_owner_or_has_one_of_perms(
+    requestor: Union["User", "App", None], owner: Union["User", "App"] | None, *perms
+) -> bool:
+    """Check if requestor can access data.
+    
+    :param requestor: Requestor user or app.
+    :param owner: Data owner.
+    :param perms:
+        Permissions which can give the access to the data.
+        Requestor needs to have at least one of given permissions
+        to get access to protected resource.
+    """
+    # 🎯 OR 逻辑：是所有者 OR 拥有任一权限
+    return requestor == owner or has_one_of_permissions(requestor, perms)
+```
+
+#### 5.5.3 check_is_owner_or_has_one_of_perms 拒绝触发
+
+**文件位置：** `saleor/graphql/account/utils.py:379-394`
+
+```python
+def check_is_owner_or_has_one_of_perms(
+    requestor: Union["User", "App", None], owner: Optional["User"], *perms
+) -> None:
+    """Confirm that requestor can access data, raise `PermissionDenied` otherwise."""
+    if not is_owner_or_has_one_of_perms(requestor, owner, *perms):
+        # 🔴 拒绝时，权限列表包含常规权限 + OWNER
+        raise PermissionDenied(permissions=list(perms) + [AuthorizationFilters.OWNER])
+```
+
+#### 5.5.4 OWNER 权限使用示例
+
+**文件位置：** `saleor/graphql/app/types.py:84-89`
+
+```python
+def has_required_permission(app: models.App, context: SaleorContext):
+    requester = get_user_or_app_from_context(context)
+    if not is_owner_or_has_one_of_perms(requester, app, AppPermission.MANAGE_APPS):
+        raise PermissionDenied(
+            # 🔑 权限列表同时包含常规权限和 OWNER
+            permissions=[AppPermission.MANAGE_APPS, AuthorizationFilters.OWNER]
+        )
+```
+
+### 5.6 PermissionDenied 异常类与拒绝返回
 
 **文件位置：** `saleor/core/exceptions.py:72-84`
 
@@ -405,6 +614,7 @@ class PermissionDenied(Exception):
     def __init__(self, message=None, *, permissions: Iterable[Enum] | None = None):
         if not message:
             if permissions:
+                # 🔑 枚举的 .name 属性会被用于构建错误消息
                 permission_list = ", ".join(p.name for p in permissions)
                 message = (
                     "To access this path, you need one of the "
@@ -414,6 +624,145 @@ class PermissionDenied(Exception):
                 message = "You do not have permission to perform this action"
         super().__init__(message)
         self.permissions = permissions
+```
+
+### 5.7 各类拒绝场景的返回结果汇总
+
+#### 场景 1：仅常规权限检查失败
+
+**触发条件：** `permissions = [MANAGE_STAFF]`，用户无此权限
+
+**返回结果：**
+```json
+{
+  "errors": [
+    {
+      "message": "To access this path, you need one of the following permissions: MANAGE_STAFF",
+      "locations": [{"line": 2, "column": 3}],
+      "path": ["permissionGroups"],
+      "extensions": {
+        "exception": {
+          "code": "PermissionDenied"
+        }
+      }
+    }
+  ],
+  "data": {
+    "permissionGroups": null
+  }
+}
+```
+
+#### 场景 2：常规权限 + 授权过滤器检查失败
+
+**触发条件：** `permissions = [MANAGE_APPS, AUTHENTICATED_APP]`，请求来自未认证的 App
+
+**内部逻辑：**
+```python
+perm_results = [False]  # App 无 MANAGE_APPS 权限
+auth_filters_results = [False]  # is_app(context) 返回 False
+any([False]) or any([False]) = False
+```
+
+**返回结果：**
+```json
+{
+  "errors": [
+    {
+      "message": "To access this path, you need one of the following permissions: MANAGE_APPS, AUTHENTICATED_APP",
+      "path": ["app"],
+      "extensions": {
+        "exception": {
+          "code": "PermissionDenied"
+        }
+      }
+    }
+  ],
+  "data": {
+    "app": null
+  }
+}
+```
+
+#### 场景 3：常规权限 + OWNER 检查失败（业务逻辑层）
+
+**触发条件：** `check_is_owner_or_has_one_of_perms(requestor, owner, MANAGE_APPS)`，请求者既不是所有者也没有 MANAGE_APPS 权限
+
+**拒绝触发点：** `saleor/graphql/account/utils.py:394`
+
+**返回结果：**
+```json
+{
+  "errors": [
+    {
+      "message": "To access this path, you need one of the following permissions: MANAGE_APPS, OWNER",
+      "path": ["app", "privateMeta"],
+      "extensions": {
+        "exception": {
+          "code": "PermissionDenied"
+        }
+      }
+    }
+  ],
+  "data": {
+    "app": {
+      "privateMeta": null
+    }
+  }
+}
+```
+
+#### 场景 4：all_permissions_required 检查失败
+
+**触发条件：** `permissions = [MANAGE_APPS, AUTHENTICATED_APP]`，App 有 MANAGE_APPS 权限但请求来自用户
+
+**内部逻辑：**
+```python
+perm_results = [True]  # 用户有 MANAGE_APPS 权限
+auth_filters_results = [False]  # is_app(context) 返回 False
+all([True]) and any([False]) = False  # AND 逻辑，授权过滤器必须通过
+```
+
+**返回结果：**
+```json
+{
+  "errors": [
+    {
+      "message": "To access this path, you need one of the following permissions: MANAGE_APPS, AUTHENTICATED_APP",
+      "extensions": {
+        "exception": {
+          "code": "PermissionDenied"
+        }
+      }
+    }
+  ],
+  "data": null
+}
+```
+
+#### 场景 5：App 特殊限制拦截
+
+**触发条件：** App 调用 `PermissionGroupCreate` mutation
+
+**拒绝触发点：** `saleor/graphql/account/mutations/permission_group/permission_group_create.py:145-147`
+
+**返回结果：**
+```json
+{
+  "errors": [
+    {
+      "message": "Apps are not allowed to perform this mutation.",
+      "extensions": {
+        "exception": {
+          "code": "PermissionDenied"
+        }
+      }
+    }
+  ],
+  "data": {
+    "permissionGroupCreate": null
+  }
+}
 ```
 
 ---
@@ -589,16 +938,66 @@ def has_perms(self, perm_list, obj=None):
 
 ### 7.1 拒绝触发点一览
 
-| 层级 | 触发点 | 代码位置 | 异常类型 |
-|------|--------|---------|---------|
-| 字段级 | `one_of_permissions_required` 装饰器 | `saleor/graphql/decorators.py:84-89` | `PermissionDenied` |
-| Mutation 级 | `BaseMutation.check_permissions` | `saleor/graphql/core/mutations.py` | `PermissionDenied` |
-| App 限制 | `PermissionGroupCreate.check_permissions` | `saleor/graphql/account/mutations/permission_group/permission_group_create.py:140-148` | `PermissionDenied` |
-| 业务逻辑 | `ensure_requestor_can_manage_group` | `saleor/graphql/account/mutations/permission_group/permission_group_update.py:120-136` | `ValidationError` |
-| 业务逻辑 | `ensure_can_manage_permissions` | `saleor/graphql/account/mutations/permission_group/permission_group_create.py:150-168` | `ValidationError` |
-| 字段级 | `CustomerEvent.resolve_user` | `saleor/graphql/account/types.py:240-256` | `PermissionDenied` |
+| 层级 | 触发点 | 代码位置 | 异常类型 | 涉及权限类型 |
+|------|--------|---------|---------|-------------|
+| 字段级 | `one_of_permissions_required` 装饰器 | `saleor/graphql/decorators.py:84-89` | `PermissionDenied` | 常规权限 + AuthorizationFilters |
+| Mutation 级 | `BaseMutation.check_permissions` | `saleor/graphql/core/mutations.py` | `PermissionDenied` | 常规权限 + AuthorizationFilters |
+| 授权过滤器 | `_get_result_of_authorization_filters_checks` | `saleor/permission/utils.py:74-77` | 间接（返回 False） | `AUTHENTICATED_APP` / `AUTHENTICATED_USER` / `AUTHENTICATED_STAFF_USER` |
+| 业务逻辑 | `check_is_owner_or_has_one_of_perms` | `saleor/graphql/account/utils.py:389-394` | `PermissionDenied` | 常规权限 + `OWNER` |
+| 业务逻辑 | `has_required_permission` | `saleor/graphql/app/types.py:86-89` | `PermissionDenied` | 常规权限 + `OWNER` |
+| App 限制 | `PermissionGroupCreate.check_permissions` | `saleor/graphql/account/mutations/permission_group/permission_group_create.py:140-148` | `PermissionDenied` | 自定义消息 |
+| 业务逻辑 | `ensure_requestor_can_manage_group` | `saleor/graphql/account/mutations/permission_group/permission_group_update.py:120-136` | `ValidationError` | 权限范围校验 |
+| 业务逻辑 | `ensure_can_manage_permissions` | `saleor/graphql/account/mutations/permission_group/permission_group_create.py:150-168` | `ValidationError` | 权限范围校验 |
+| 字段级 | `CustomerEvent.resolve_user` | `saleor/graphql/account/types.py:240-256` | `PermissionDenied` | 常规权限 |
 
-### 7.2 PermissionDenied 返回格式
+### 7.2 AuthorizationFilters 拒绝触发路径详解
+
+#### 7.2.1 AUTHENTICATED_APP 拒绝路径
+
+**触发条件：** 请求来自未认证的 App 或用户，`permissions = [AUTHENTICATED_APP]`
+
+```python
+# 1. 装饰器调用
+one_of_permissions_required([AUTHENTICATED_APP])
+    ↓
+# 2. 核心校验
+one_of_permissions_or_auth_filter_required(context, [AUTHENTICATED_APP])
+    ├─► perm_results = []  # 过滤后无常规权限
+    └─► auth_filters_results
+          └─► _get_result_of_authorization_filters_checks
+                ├─► resolve_authorization_filter_fn(AUTHENTICATED_APP) → is_app
+                └─► is_app(context) → False
+    ↓
+# 3. 结果计算
+any([]) or any([False]) = False
+    ↓
+# 4. 抛出异常
+raise PermissionDenied(permissions=[AUTHENTICATED_APP])
+```
+
+**返回消息：** `"To access this path, you need one of the following permissions: AUTHENTICATED_APP"`
+
+#### 7.2.2 OWNER 拒绝路径
+
+**触发条件：** 请求者既不是资源所有者，也没有所需的常规权限
+
+```python
+# 业务逻辑层显式调用
+check_is_owner_or_has_one_of_perms(requestor, owner, MANAGE_APPS)
+    ↓
+# 1. 检查所有权
+requestor == owner → False
+    ↓
+# 2. 检查常规权限
+has_one_of_permissions(requestor, (MANAGE_APPS,)) → False
+    ↓
+# 3. 抛出异常（注意权限列表包含 OWNER）
+raise PermissionDenied(permissions=[MANAGE_APPS, OWNER])
+```
+
+**返回消息：** `"To access this path, you need one of the following permissions: MANAGE_APPS, OWNER"`
+
+### 7.3 PermissionDenied 返回格式
 
 ```json
 {
@@ -620,7 +1019,7 @@ def has_perms(self, perm_list, obj=None):
 }
 ```
 
-### 7.3 ValidationError（业务逻辑校验失败）返回格式
+### 7.4 ValidationError（业务逻辑校验失败）返回格式
 
 ```json
 {
@@ -1011,3 +1410,26 @@ save() 执行
 2. 组与权限通过 `group_permissions` 中间表关联
 3. `effective_permissions` 使用 `EXISTS` 子查询合并用户直接权限和组权限
 4. 最终转换为 `{"app_label.codename", ...}` 字符串集合进行快速查找
+
+### Q: AuthorizationFilters.OWNER 为什么在查询守卫层不生效？
+
+**A:**
+- `OWNER` 在 `AUTHORIZATION_FILTER_MAP` 中没有对应的检查函数
+- 因为所有权判断依赖于具体的业务对象（如订单、用户资料），查询守卫层不知道当前访问的是哪个对象
+- 必须在业务逻辑层通过 `check_is_owner_or_has_one_of_perms(requestor, owner, *perms)` 显式调用
+- 拒绝时权限列表会同时包含常规权限和 `OWNER`，例如 `[MANAGE_APPS, OWNER]`
+
+### Q: one_of_permissions_or_auth_filter_required 和 all_permissions_required 有什么区别？
+
+**A:**
+- `one_of_permissions_or_auth_filter_required`：**OR 逻辑**，常规权限任一通过 OR 授权过滤器任一通过
+- `all_permissions_required`：**AND + OR 混合逻辑**，所有常规权限都通过 AND 任一授权过滤器通过
+- 前者用于"只要满足一个条件即可"的场景，后者用于"必须满足特定身份 + 所有权限"的场景
+
+### Q: 当 permissions 同时包含常规权限和 AuthorizationFilters 时，错误消息怎么显示？
+
+**A:**
+- `PermissionDenied` 会遍历所有传入的权限枚举，调用 `.name` 属性拼接
+- 例如 `permissions = [MANAGE_APPS, OWNER]` 会显示：
+  `"To access this path, you need one of the following permissions: MANAGE_APPS, OWNER"`
+- 枚举的 `.name` 是大写的，如 `OWNER`、`AUTHENTICATED_APP`，而不是枚举值字符串

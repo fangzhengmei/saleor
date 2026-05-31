@@ -537,11 +537,72 @@ AssignNavigation 无 post_save_action，无 Webhook 事件
 - 不触发 `SHOP_METADATA_UPDATED`（不修改元数据）
 - 不存在其他站点设置变更事件
 
-**通知策略建议**:
+### MENU_UPDATED 事件语义可判定性分析
 
-1. **短期无解决方案**: 不存在可订阅的替代事件。`SHOP_METADATA_UPDATED` 仅在元数据变更时触发，与导航分配无关。
-2. **正确修复**: 为 `AssignNavigation` 添加 `post_save_action`，触发 `MENU_UPDATED` 事件（因导航分配变更本质上是菜单内容变更）。
-3. **权限修正**: 如确实要求双权限，应覆写 `check_permissions` 并传入 `require_all_permissions=True`（参照 `ChannelUpdate` 的实现模式）。
+**MENU_UPDATED 事件 payload 结构** (`plugins/webhook/plugin.py:809-814`):
+```json
+{
+  "id": "TWVudTox",
+  "slug": "main-navigation",
+  "meta": { ... }
+}
+```
+
+**语义不足问题**:
+如果为 `AssignNavigation` 添加 `post_save_action` 并直接触发 `MENU_UPDATED`:
+1. **无法识别变更类型**: 接收者无法区分「Menu 对象本身更新了」和「Menu 被分配到某个导航位置了」
+2. **无法识别导航位置**: payload 中没有 `navigationType` (MAIN/SECONDARY) 字段，无法知道是主导航还是次导航变更
+3. **无法识别旧值/新值**: payload 中没有变更前后的菜单对比，无法识别"从菜单A切换到菜单B"的场景
+4. **无法判断是分配还是取消**: 无法识别"取消导航分配"（`menu=None`）的操作
+
+**Shop 类型的查询限制**:
+`Shop` GraphQL 类型不包含 `topMenu` / `bottomMenu` 字段（见 `graphql/shop/types.py`），即使使用 Subscription 查询系统也无法直接查询导航分配状态。接收者收到 `MENU_UPDATED` 后，需要分别查询:
+1. `menu(id: "...")` 确认菜单存在
+2. 但仍然无法知道该菜单是否被分配到某个导航位置
+
+---
+
+### 通知策略建议（与现有事件能力对齐）
+
+#### 方案 A：新增 NAVIGATION_ASSIGNED 事件（推荐，语义清晰）
+
+**实现方式**:
+1. 在 `WebhookEventAsyncType` 中新增 `NAVIGATION_ASSIGNED` 事件
+2. `AssignNavigation.post_save_action` 触发 `manager.navigation_assigned(navigation_type, old_menu, new_menu)`
+3. 事件 payload 包含:
+   ```json
+   {
+     "navigationType": "MAIN",
+     "oldMenu": { "id": "...", "slug": "..." } | null,
+     "newMenu": { "id": "...", "slug": "..." } | null,
+     "meta": { ... }
+   }
+   ```
+**优点**: 语义完整、可判定性强、接收者无需额外查询
+**缺点**: 需要新增事件类型、修改 payload 生成器
+
+#### 方案 B：复用 MENU_UPDATED + 文档约定（快速实现，但语义模糊）
+
+**实现方式**:
+1. `AssignNavigation.post_save_action` 触发 `manager.menu_updated(new_menu)`（如为取消操作则不触发）
+2. 在文档中明确约定：「收到 MENU_UPDATED 但无法从 payload 中识别具体变更时，接收者应轮询或重新加载当前导航配置」
+3. 接收者通过 `menu(id="...")` + `site` 查询关联判断
+
+**缺点**: 约定驱动、不可判定、增加接收者实现复杂度
+**对比现有事件**: 这种"通知 + 轮询"模式在 Saleor 中没有先例，其他事件如 `ORDER_UPDATED` 均包含完整语义
+
+#### 方案 C：扩展 SHOP_METADATA_UPDATED 语义（不推荐）
+
+**不推荐原因**:
+- 导航分配变更不属于"元数据变更"语义范畴
+- `SHOP_METADATA_UPDATED` payload 仅包含 metadata 字段，不包含外键变更信息
+- 会混淆"元数据变更"与"配置变更"的语义边界
+
+---
+
+### 权限修正建议
+
+如确实要求 `MANAGE_MENUS` 和 `MANAGE_SETTINGS` 双权限，应覆写 `check_permissions` 并传入 `require_all_permissions=True`（参照 `ChannelUpdate` 的实现模式）。
 
 ### 5.5 菜单项关联内容的读取权限
 
@@ -789,12 +850,14 @@ GraphQL 菜单查询
 | 编号 | 问题 | 影响 | 位置 |
 |------|------|------|------|
 | P1 | `AssignNavigation` 权限为 OR 语义（任一即通过）且无 Webhook 事件 | 仅持 `MANAGE_SETTINGS` 的用户可静默变更前台导航，且无事件通知 | `assign_navigation.py:27` + `mutations.py:498-514` |
+| P1-1 | MENU_UPDATED payload 语义不足，无法表达导航分配变更 | 即使触发 MENU_UPDATED，接收者也无法识别是菜单本身变更还是导航位置变更 | `webhook/plugin.py:809-814` |
 | P2 | `Menu.name` 不可翻译 | 多语言站点需为同一导航创建多个 Menu | `menu/models.py` |
 | P3 | `MenuItem.category` 无可见性/权限检查 | 未发布分类可通过菜单暴露 | `menu/types.py:126-129` |
 | P4 | MenuItemTranslate 不触发菜单缓存失效事件 | 翻译变更后订阅菜单事件的系统不知道刷新 | `translations/mutations/utils.py:157-160` |
 | P5 | MenuItemMove 是唯一清除 DataLoader 缓存的 mutation | 其他 mutation 依赖请求级过期，跨请求场景下可能有短暂不一致 | `menu_item_move.py:200` |
 | P6 | AppExtension mount 字段已放开为自由字符串 | 第三方可注册 Dashboard 未知的 mount 点，前端需容错处理 | `app/migrations/0037` |
 | P7 | `test_assign_navigation` 仅测试双权限场景，未验证 OR 行为 | 权限 OR 语义缺乏测试覆盖，可能掩盖意外授权 | `menu/tests/mutations/test_assign_navigation.py:34-35` |
+| P8 | Shop 类型不暴露 topMenu/bottomMenu 字段 | 无法通过 GraphQL 查询当前导航分配状态，接收 Webhook 后无法验证 | `graphql/shop/types.py` |
 
 ---
 
@@ -845,6 +908,7 @@ GraphQL 菜单查询
 | 上下文 | `saleor/graphql/core/context.py` | ChannelContext, ChannelQsContext, SaleorContext |
 | 上下文 | `saleor/graphql/core/types/context.py` | ChannelContextType, resolve_translation |
 | 站点 | `saleor/site/context_processors.py` | 站点上下文处理器 |
+| Shop | `saleor/graphql/shop/types.py` | Shop 类型定义（不暴露 topMenu/bottomMenu） |
 | Webhook | `saleor/webhook/event_types.py` | 6 种菜单事件、`SHOP_METADATA_UPDATED` 事件定义 |
 | Webhook | `saleor/plugins/webhook/plugin.py` | WebhookPlugin 菜单事件实现与 payload 结构 |
 | Webhook | `saleor/graphql/shop/mutations/shop_settings_update.py` | ShopSettingsUpdate 触发 `shop_metadata_updated`（仅元数据变更时） |

@@ -402,27 +402,135 @@ DataLoader 的缓存绑定在 `SaleorContext.dataloaders` 字典上 (`saleor/gra
 
 ## 5. 权限系统——一致性核实
 
-### 5.1 权限分配一致性矩阵
+### 5.1 BaseMutation 权限组合的求值逻辑
 
-| 操作 | 声明权限 (Meta.permissions) | Webhook 接收权限 |
-|------|---------------------------|-----------------|
-| MenuCreate | `MANAGE_MENUS` | `MANAGE_MENUS` |
-| MenuUpdate | `MANAGE_MENUS` | `MANAGE_MENUS` |
-| MenuDelete | `MANAGE_MENUS` | `MANAGE_MENUS` |
-| MenuBulkDelete | `MANAGE_MENUS` | `MANAGE_MENUS` |
-| MenuItemCreate | `MANAGE_MENUS` | `MANAGE_MENUS` |
-| MenuItemUpdate | `MANAGE_MENUS` | `MANAGE_MENUS` |
-| MenuItemDelete | `MANAGE_MENUS` | `MANAGE_MENUS` |
-| MenuItemBulkDelete | `MANAGE_MENUS` | `MANAGE_MENUS` |
-| MenuItemMove | `MANAGE_MENUS` | `MANAGE_MENUS` |
-| **AssignNavigation** | **`MANAGE_MENUS` + `MANAGE_SETTINGS`** | **无事件** |
-| **MenuItemTranslate** | **`MANAGE_TRANSLATIONS`** | **`MANAGE_TRANSLATIONS`**（translations 事件） |
+**文件位置**: `saleor/graphql/core/mutations.py:498-514`
 
-**发现 1**: AssignNavigation 同时需要 `MANAGE_MENUS` 和 `MANAGE_SETTINGS`，但变更后不广播菜单事件。这是一个**权限覆盖但不通知**的缺口——拥有 `MANAGE_SETTINGS` 但没有 `MANAGE_MENUS` 的用户可以改变导航分配，但无法通过 Webhook 被通知。
+```python
+@classmethod
+def check_permissions(
+    cls, context, permissions=None, require_all_permissions=False, **data
+):
+    all_permissions = permissions or cls._meta.permissions
+    if not all_permissions:
+        return True
+    if require_all_permissions:
+        return all_permissions_required(context, all_permissions)
+    return one_of_permissions_or_auth_filter_required(context, all_permissions)
+```
 
-**发现 2**: MenuItemTranslate 使用 `MANAGE_TRANSLATIONS` 权限而非 `MANAGE_MENUS`，触发的也是 `TRANSLATION_CREATED`/`TRANSLATION_UPDATED` 事件而非菜单事件。翻译变更不会触发菜单内容的缓存失效通知。
+**关键**: `require_all_permissions` 默认为 **`False`**，因此当 `Meta.permissions` 元组包含多个权限时，默认使用 `one_of_permissions_or_auth_filter_required`——即**任一权限满足即通过**（OR 语义），而非全部满足（AND 语义）。
 
-### 5.2 菜单项关联内容的读取权限
+**文件位置**: `saleor/permission/utils.py:32-46`
+
+```python
+def one_of_permissions_or_auth_filter_required(
+    context, permissions: Iterable[BasePermissionEnum]
+) -> bool:
+    perm_results = _get_result_of_permissions_checks(context, permissions)
+    auth_filters_results = _get_result_of_authorization_filters_checks(
+        context, permissions
+    )
+    return any(perm_results) or any(auth_filters_results)
+```
+
+只有显式传入 `require_all_permissions=True` 时，才会调用 `all_permissions_required`（AND 语义）。目前代码中仅 `ChannelUpdate` 在特定条件下使用了 `require_all_permissions=True`。
+
+### 5.2 权限分配一致性矩阵
+
+| 操作 | 声明权限 (Meta.permissions) | 实际求值逻辑 | Webhook 接收权限 |
+|------|---------------------------|-------------|-----------------|
+| MenuCreate | `MANAGE_MENUS` | 单权限 | `MANAGE_MENUS` |
+| MenuUpdate | `MANAGE_MENUS` | 单权限 | `MANAGE_MENUS` |
+| MenuDelete | `MANAGE_MENUS` | 单权限 | `MANAGE_MENUS` |
+| MenuBulkDelete | `MANAGE_MENUS` | 单权限 | `MANAGE_MENUS` |
+| MenuItemCreate | `MANAGE_MENUS` | 单权限 | `MANAGE_MENUS` |
+| MenuItemUpdate | `MANAGE_MENUS` | 单权限 | `MANAGE_MENUS` |
+| MenuItemDelete | `MANAGE_MENUS` | 单权限 | `MANAGE_MENUS` |
+| MenuItemBulkDelete | `MANAGE_MENUS` | 单权限 | `MANAGE_MENUS` |
+| MenuItemMove | `MANAGE_MENUS` | 单权限 | `MANAGE_MENUS` |
+| **AssignNavigation** | `MANAGE_MENUS`, `MANAGE_SETTINGS` | **OR：任一即通过** | **无事件** |
+| **MenuItemTranslate** | `MANAGE_TRANSLATIONS` | 单权限 | `MANAGE_TRANSLATIONS`（translations 事件） |
+
+### 5.3 AssignNavigation 权限纠正——OR 而非 AND
+
+**~~错误描述~~**: ~~AssignNavigation 同时需要 `MANAGE_MENUS` 和 `MANAGE_SETTINGS`~~
+
+**正确描述**: AssignNavigation 声明了 `permissions = (MenuPermissions.MANAGE_MENUS, SitePermissions.MANAGE_SETTINGS)`，由于 `BaseMutation.check_permissions` 默认 `require_all_permissions=False`，实际执行 **OR 语义**——用户只要拥有 `MANAGE_MENUS` **或** `MANAGE_SETTINGS` 其一即可执行此 mutation。
+
+**代码证明链**:
+
+1. `AssignNavigation.Meta.permissions` 声明两个权限 (`assign_navigation.py:27`)
+2. `BaseMutation.mutate()` 调用 `check_permissions(info.context, data=data)` 未传 `require_all_permissions` (`mutations.py:522`)
+3. `check_permissions` 默认 `require_all_permissions=False` → 走 `one_of_permissions_or_auth_filter_required` 分支 (`mutations.py:514`)
+4. `one_of_permissions_or_auth_filter_required` 返回 `any(perm_results) or any(auth_filters_results)` (`permission/utils.py:46`)
+5. `SitePermissions.MANAGE_SETTINGS` 是 `BasePermissionEnum` 而非 `AuthorizationFilters`，因此进入 `perm_results`
+6. 最终判定: `any([has_perm(MANAGE_MENUS), has_perm(MANAGE_SETTINGS)])` → **OR**
+
+**测试代码的局限**: `test_assign_navigation.py:34-35` 同时添加了两个权限，未测试仅持有单一权限的 OR 场景，因此测试没有揭示这一行为。
+
+### 5.4 AssignNavigation OR 权限 + 无事件广播的安全与通知影响
+
+#### 安全评估影响
+
+| 角色场景 | 能否执行 AssignNavigation | 安全风险 |
+|---------|------------------------|---------|
+| 仅持有 `MANAGE_MENUS` | ✅ 可以 | 符合预期——菜单管理者可分配导航 |
+| 仅持有 `MANAGE_SETTINGS` | ✅ 可以 | **超出预期**——站点设置管理者可改变整个前台导航，但其权限描述暗示只管理站点配置参数 |
+| 两者均持有 | ✅ 可以 | 符合预期 |
+| 两者均无 | ❌ 不可以 | 符合预期 |
+
+**风险 1: 权限边界模糊**
+
+`MANAGE_SETTINGS` 的语义是管理站点配置（如站点名称、描述、头部文本等），而非导航结构。但由于 OR 语义，仅持有 `MANAGE_SETTINGS` 的用户可以：
+- 将任意菜单分配到主导航/次导航位置
+- 通过传 `menu=None` 完全移除前台导航
+
+这在安全审计中可能被误判——审计者看到 `permissions = (MANAGE_MENUS, MANAGE_SETTINGS)` 可能误以为需要**同时**持有两个权限，而实际上只需其一。
+
+**风险 2: 最小权限原则违反**
+
+如果 `MANAGE_SETTINGS` 角色的本意仅是修改站点元数据（header_text、description 等），则其不应具有变更前台导航结构的能力。OR 语义导致权限过度授予。
+
+**风险 3: 与 Webhook 通知策略的交互盲区**
+
+```
+安全事件链:
+
+仅持 MANAGE_SETTINGS 的用户
+       ↓
+执行 AssignNavigation（权限通过: OR 语义）
+       ↓
+变更 site.settings.top_menu / bottom_menu
+       ↓
+AssignNavigation 无 post_save_action，无 Webhook 事件
+       ↓
+订阅了 MENU_UPDATED 的监控系统 → 无法感知此变更
+订阅了 MENU_ITEM_UPDATED 的监控系统 → 无法感知此变更
+仅订阅 MANAGE_MENUS 作用域事件的系统 → 永远不知道发生了什么
+```
+
+这意味着：
+1. **操作不可追踪**: 一个仅持有站点设置权限的用户可以静默改变整个前台导航，且不在任何 Webhook 事件日志中留下记录
+2. **安全告警缺失**: 如果安全策略要求「导航变更必须通知」，此路径完全绕过通知机制
+3. **审计盲区**: Webhook 日志中不会有任何 `menu_updated` 事件与此操作关联，事后审计难以追溯
+
+#### 通知策略影响
+
+| 变更方式 | 是否触发 Webhook | 订阅 MANAGE_MENUS 事件的系统能否感知 | CDN 缓存能否主动失效 |
+|---------|----------------|-----------------------------------|-------------------|
+| MenuUpdate | ✅ MENU_UPDATED | ✅ 能 | ✅ 能 |
+| MenuItemUpdate | ✅ MENU_ITEM_UPDATED | ✅ 能 | ✅ 能 |
+| AssignNavigation | ❌ 无事件 | ❌ 不能 | ❌ 不能 |
+| MenuItemTranslate | ✅ TRANSLATION_UPDATED | ❌ 不同事件通道 | ❌ 不能 |
+
+**通知策略建议**:
+
+1. **短期缓解**: 订阅 `SITE_SETTINGS_UPDATED` 事件（如果存在），在处理器中检查 `top_menu`/`bottom_menu` 是否变更
+2. **正确修复**: 为 `AssignNavigation` 添加 `post_save_action`，触发 `MENU_UPDATED` 事件
+3. **权限修正**: 如确实要求双权限，应覆写 `check_permissions` 并传入 `require_all_permissions=True`（参照 `ChannelUpdate` 的实现模式）
+
+### 5.5 菜单项关联内容的读取权限
 
 | 关联字段 | 权限检查 | 无权限时的行为 |
 |---------|---------|--------------|
@@ -432,7 +540,7 @@ DataLoader 的缓存绑定在 `SaleorContext.dataloaders` 字典上 (`saleor/gra
 
 **不一致性**: `category` 无任何权限/可见性检查，而 `collection` 和 `page` 均有。这意味着未发布的 Category 可以通过菜单项被暴露。
 
-### 5.3 AppExtension 权限约束
+### 5.6 AppExtension 权限约束
 
 **文件位置**: `saleor/app/manifest_validations.py:173-193`
 
@@ -628,7 +736,7 @@ WebhookPlugin._trigger_menu_event():
 ```
 
 **例外**:
-- `AssignNavigation`: 不触发任何事件
+- `AssignNavigation`: 不触发任何事件（且权限为 OR 语义，仅持 `MANAGE_SETTINGS` 即可执行）
 - `MenuItemTranslate`: 触发 `translations_created`/`translations_updated`
 - `MenuItemMove`: 仅在 sort_order 或 parent_changed 时触发
 - `MenuItemMove`: 唯一清除 DataLoader 缓存的 mutation
@@ -667,12 +775,13 @@ GraphQL 菜单查询
 
 | 编号 | 问题 | 影响 | 位置 |
 |------|------|------|------|
-| P1 | `AssignNavigation` 变更后无 Webhook 事件 | 前端/CDN 无法通过事件感知导航分配变更 | `assign_navigation.py` |
+| P1 | `AssignNavigation` 权限为 OR 语义（任一即通过）且无 Webhook 事件 | 仅持 `MANAGE_SETTINGS` 的用户可静默变更前台导航，且无事件通知 | `assign_navigation.py:27` + `mutations.py:498-514` |
 | P2 | `Menu.name` 不可翻译 | 多语言站点需为同一导航创建多个 Menu | `menu/models.py` |
 | P3 | `MenuItem.category` 无可见性/权限检查 | 未发布分类可通过菜单暴露 | `menu/types.py:126-129` |
 | P4 | MenuItemTranslate 不触发菜单缓存失效事件 | 翻译变更后订阅菜单事件的系统不知道刷新 | `translations/mutations/utils.py:157-160` |
 | P5 | MenuItemMove 是唯一清除 DataLoader 缓存的 mutation | 其他 mutation 依赖请求级过期，跨请求场景下可能有短暂不一致 | `menu_item_move.py:200` |
 | P6 | AppExtension mount 字段已放开为自由字符串 | 第三方可注册 Dashboard 未知的 mount 点，前端需容错处理 | `app/migrations/0037` |
+| P7 | `test_assign_navigation` 仅测试双权限场景，未验证 OR 行为 | 权限 OR 语义缺乏测试覆盖，可能掩盖意外授权 | `menu/tests/mutations/test_assign_navigation.py:34-35` |
 
 ---
 
@@ -687,6 +796,8 @@ GraphQL 菜单查询
 | **call_event + on_commit** | 菜单 mutations | 确保事务提交后才广播事件 |
 | **Manifest 声明式** | App 扩展 | 插件通过声明式配置注册导航扩展 |
 | **PermissionsField** | GraphQL 字段 | 字段级别的权限控制 |
+| **OR 权限组合** | AssignNavigation | 多权限元组默认 OR 求值（`require_all_permissions=False`） |
+| **AND 权限组合（显式）** | ChannelUpdate | 覆写 `check_permissions` 传入 `require_all_permissions=True` |
 | **Translation 模型** | MenuItemTranslation | 多语言支持的标准实现 |
 | **CacheDict (LRU)** | DataLoader 内部 | 内存缓存，容量控制 |
 | **枚举→自由字符串演进** | AppExtension.mount | 从受限枚举到开放字符串的架构演进 |
@@ -722,6 +833,11 @@ GraphQL 菜单查询
 | 上下文 | `saleor/graphql/core/types/context.py` | ChannelContextType, resolve_translation |
 | 站点 | `saleor/site/context_processors.py` | 站点上下文处理器 |
 | 权限 | `saleor/permission/enums.py` | MenuPermissions, SitePermissions 枚举 |
+| 权限 | `saleor/permission/utils.py` | `one_of_permissions_or_auth_filter_required` / `all_permissions_required` |
+| 权限 | `saleor/permission/auth_filters.py` | AuthorizationFilters 枚举与解析 |
+| 权限 | `saleor/graphql/core/mutations.py` | `check_permissions` 默认 OR 求值逻辑 |
+| 权限 | `saleor/graphql/channel/mutations/channel_update.py` | AND 权限组合参考实现 (`require_all_permissions=True`) |
+| 测试 | `saleor/graphql/menu/tests/mutations/test_assign_navigation.py` | AssignNavigation 测试（仅覆盖双权限场景） |
 | 翻译 | `saleor/graphql/translations/mutations/menu_item_translate.py` | 菜单项翻译 Mutation |
 | 翻译 | `saleor/graphql/translations/mutations/utils.py` | BaseTranslateMutation, 翻译事件广播 |
 | 翻译 | `saleor/graphql/translations/schema.py` | TranslatableKinds.MENU_ITEM, TYPES_TRANSLATIONS_MAP |

@@ -524,11 +524,24 @@ AssignNavigation 无 post_save_action，无 Webhook 事件
 | AssignNavigation | ❌ 无事件 | ❌ 不能 | ❌ 不能 |
 | MenuItemTranslate | ✅ TRANSLATION_UPDATED | ❌ 不同事件通道 | ❌ 不能 |
 
+**站点相关 Webhook 事件核实**:
+
+代码中**唯一**与站点设置相关的 Webhook 事件是 `SHOP_METADATA_UPDATED`（不存在 `SITE_SETTINGS_UPDATED` 事件）:
+
+| 事件类型 | 触发条件 | 权限范围 | 能否感知导航分配变更 |
+|---------|---------|---------|-------------------|
+| `SHOP_METADATA_UPDATED` | 仅在 `SiteSettings.metadata` 或 `private_metadata` 实际变更时触发 | `MANAGE_SETTINGS` | ❌ 不能 —— `AssignNavigation` 仅修改 `top_menu`/`bottom_menu` 字段，不涉及元数据 |
+
+**关键结论**: `AssignNavigation` 执行时，**没有任何 Webhook 事件被触发**。
+- 不触发 `MENU_UPDATED`/`MENU_ITEM_UPDATED`（无 `post_save_action`）
+- 不触发 `SHOP_METADATA_UPDATED`（不修改元数据）
+- 不存在其他站点设置变更事件
+
 **通知策略建议**:
 
-1. **短期缓解**: 订阅 `SITE_SETTINGS_UPDATED` 事件（如果存在），在处理器中检查 `top_menu`/`bottom_menu` 是否变更
-2. **正确修复**: 为 `AssignNavigation` 添加 `post_save_action`，触发 `MENU_UPDATED` 事件
-3. **权限修正**: 如确实要求双权限，应覆写 `check_permissions` 并传入 `require_all_permissions=True`（参照 `ChannelUpdate` 的实现模式）
+1. **短期无解决方案**: 不存在可订阅的替代事件。`SHOP_METADATA_UPDATED` 仅在元数据变更时触发，与导航分配无关。
+2. **正确修复**: 为 `AssignNavigation` 添加 `post_save_action`，触发 `MENU_UPDATED` 事件（因导航分配变更本质上是菜单内容变更）。
+3. **权限修正**: 如确实要求双权限，应覆写 `check_permissions` 并传入 `require_all_permissions=True`（参照 `ChannelUpdate` 的实现模式）。
 
 ### 5.5 菜单项关联内容的读取权限
 
@@ -832,6 +845,9 @@ GraphQL 菜单查询
 | 上下文 | `saleor/graphql/core/context.py` | ChannelContext, ChannelQsContext, SaleorContext |
 | 上下文 | `saleor/graphql/core/types/context.py` | ChannelContextType, resolve_translation |
 | 站点 | `saleor/site/context_processors.py` | 站点上下文处理器 |
+| Webhook | `saleor/webhook/event_types.py` | 6 种菜单事件、`SHOP_METADATA_UPDATED` 事件定义 |
+| Webhook | `saleor/plugins/webhook/plugin.py` | WebhookPlugin 菜单事件实现与 payload 结构 |
+| Webhook | `saleor/graphql/shop/mutations/shop_settings_update.py` | ShopSettingsUpdate 触发 `shop_metadata_updated`（仅元数据变更时） |
 | 权限 | `saleor/permission/enums.py` | MenuPermissions, SitePermissions 枚举 |
 | 权限 | `saleor/permission/utils.py` | `one_of_permissions_or_auth_filter_required` / `all_permissions_required` |
 | 权限 | `saleor/permission/auth_filters.py` | AuthorizationFilters 枚举与解析 |
